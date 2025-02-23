@@ -7,7 +7,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})  # Tüm istemcilerden gelen istekleri kabul et
 
 # Load the SentenceTransformer model for encoding text into vectors (using CPU)
-model = SentenceTransformer('all-MiniLM-L6-v2')
+model = SentenceTransformer("sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
 
 
 @app.route('/', methods=['GET'])
