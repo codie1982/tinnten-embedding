@@ -1,13 +1,20 @@
+# Python base image
 FROM python:3.10
 
+# Çalışma dizini
 WORKDIR /app
 
+# Bağımlılık dosyasını kopyala
 COPY requirements.txt ./
 
-RUN pip install -r requirements.txt
+# Bağımlılıkları yükle
+RUN pip install --no-cache-dir -r requirements.txt
 
+# Uygulama dosyalarını kopyala
 COPY . .
 
-EXPOSE 5000
+# Uygulamanın dışa açılacağı port
+EXPOSE 5003
 
-CMD ["python", "embedding.py"]
+# Production: Gunicorn ile başlat
+CMD ["gunicorn", "--workers", "4", "--bind", "0.0.0.0:5003", "embedding:app"]
