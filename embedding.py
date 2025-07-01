@@ -1,13 +1,25 @@
 from flask import Flask, request, jsonify
-from sentence_transformers import SentenceTransformer
 from flask_cors import CORS
+from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+import os
 
-# Create the Flask app
+# .env dosyasını yükle
+load_dotenv()
+
+# Flask uygulamasını oluştur
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})  # Tüm istemcilerden gelen istekleri kabul et
 
-# Load the SentenceTransformer model for encoding text into vectors (using CPU)
-model = SentenceTransformer("sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
+# Ortam değişkeninden model adı oku (bulamazsa default)
+MODEL_NAME = os.getenv(
+    "MODEL_NAME",
+    "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+)
+
+# SentenceTransformer modelini yükle
+model = SentenceTransformer(MODEL_NAME)
+
 
 
 @app.route('/', methods=['GET'])
@@ -46,7 +58,17 @@ def generate_vector():
         return jsonify({"error": f"An error occurred: {str(e)}"}), 500
 
 
-# Run the Flask app, listening on all available IP addresses (host) at port 5003 with multithreading enabled
-if __name__ == '__main__':
-    # Enable multithreading and debug mode for concurrent request handling and easier troubleshooting
-    app.run(host='0.0.0.0', port=5003, debug=True, threaded=True)
+if __name__ == "__main__":
+    # Ortam değişkenlerinden konfigürasyon al
+    env = os.getenv("FLASK_ENV", "production")
+    port = int(os.getenv("FLASK_PORT", "5003"))
+    debug = os.getenv("FLASK_DEBUG", "False").lower() == "true"
+
+    # Yalnızca development ortamında Flask dev server başlat
+    if env == "development":
+        app.run(
+            host="0.0.0.0",
+            port=port,
+            debug=debug,
+            threaded=True
+        )
