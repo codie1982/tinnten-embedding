@@ -1,6 +1,6 @@
 flask==2.3.3
 flask-cors==4.0.0
-sentence-transformers==2.6.1
+sentence-transformers==3.0.1  # Upgrade to a newer version
 transformers==4.41.2
 huggingface_hub==0.23.0
 torch==2.3.0
@@ -8,3 +8,4 @@ scipy==1.13.0
 numpy==1.26.4
 gunicorn==21.2.0
 python-dotenv==1.0.1
+crawl4ai==0.2.62  # Added for AsyncWebCrawler dependency
