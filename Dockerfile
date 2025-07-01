@@ -17,4 +17,4 @@ COPY . .
 EXPOSE 5003
 
 # Production: Gunicorn ile başlat
-CMD ["gunicorn", "--workers", "4", "--bind", "0.0.0.0:5003", "embedding:app"]
+CMD ["python", "embedding.py"]
