@@ -128,7 +128,7 @@ async def extract_content_from_url(url):
             "data": result.extracted_content,
             "images": result.media.get("images", []),
             "metadata": result.metadata,
-            "markdown_v2": result.markdown_v2.raw_markdown if result.markdown_v2 else ""
+            "markdown": result.markdown.raw_markdown if result.markdown else ""
         }
         return product_info
 
