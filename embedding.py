@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from sentence_transformers import SentenceTransformer
-from flask_cors import CORS
 from crawl4ai import AsyncWebCrawler, CacheMode, BrowserConfig, CrawlerRunConfig, CacheMode
 import asyncio
 from crawl4ai.extraction_strategy import JsonCssExtractionStrategy, JsonXPathExtractionStrategy
@@ -136,10 +135,6 @@ async def extract_content_from_url(url):
 
   
 # Run the Flask app, listening on all available IP addresses (host) at port 5003 with multithreading enabled
-if __name__ == '__main__':
-    # Enable multithreading and debug mode for concurrent request handling and easier troubleshooting
-    app.run(host='0.0.0.0', port=5003, debug=True, threaded=True)
-
 
 if __name__ == "__main__":
     # Ortam değişkenlerinden konfigürasyon al
