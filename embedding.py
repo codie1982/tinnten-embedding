@@ -71,15 +71,15 @@ def generate_vector():
 def run_scraper():
     try:
         data = request.get_json()
-        url  = data.get('url', '').strip()
+        url = data.get('url', '').strip()
+
+        print("➡️ Scraper isteği alındı. URL:", url)
 
         if not url:
             return jsonify({"error": "No valid URL provided."}), 400
 
-        # Async fonksiyonu çalıştır
         result = asyncio.run(extract_content_from_url(url))
 
-        # Başarısızsa, kullanıcıya hata mesajı dön
         if result.get("success") is False:
             return jsonify({
                 "error": result.get("message", "Unknown error"),
