@@ -1,4 +1,3 @@
-# Python base image
 FROM python:3.11
 
 # Çalışma dizini
@@ -8,7 +7,7 @@ WORKDIR /app
 COPY requirements.txt ./
 
 # Bağımlılıkları yükle
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Uygulama dosyalarını kopyala
 COPY . .
@@ -17,4 +16,4 @@ COPY . .
 EXPOSE 5003
 
 # Production: Gunicorn ile başlat
-CMD ["python", "embedding.py"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5003", "--workers=2", "embedding:app"]
