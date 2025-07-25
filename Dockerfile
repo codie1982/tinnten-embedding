@@ -8,10 +8,14 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Bağımlılık dosyası
-COPY requirements.txt ./
+# 1. Requirements dosyasını önce kopyala (değişmedikçe cache’lenir)
+COPY requirements.txt .
 
-# Python bağımlılıklarını kur
-RUN pip install --no-cache-dir -r requirements.txt
+# 2. Install (bu layer cache'lenir)
+RUN pip install -r requirements.txt
+
+# Uygulama dosyalarını kopyala
+COPY . .
 
 # Crawl4AI kurulumunu yap
 RUN crawl4ai-setup
@@ -21,9 +25,6 @@ RUN playwright install chromium
 
 # Opsiyonel: Kurulum doğrulama
 RUN crawl4ai-doctor
-
-# Uygulama dosyalarını kopyala
-COPY . .
 
 EXPOSE 5003
 

@@ -13,7 +13,12 @@ nest_asyncio.apply()
 # Create the Flask app
 from dotenv import load_dotenv
 import os
+import re
 
+URL_REGEX = re.compile(
+    r'^(?:http|https)://'  # http:// veya https://
+    r'(?:\S+)'             # en az bir karakter
+)
 # .env dosyasını yükle
 load_dotenv()
 
@@ -74,6 +79,8 @@ def run_scraper():
         url = data.get('url', '').strip()
 
         print("➡️ Scraper isteği alındı. URL:", url)
+        if not url or not re.match(URL_REGEX, url):
+            return jsonify({"error": "Invalid URL format provided."}), 400
 
         if not url:
             return jsonify({"error": "No valid URL provided."}), 400
