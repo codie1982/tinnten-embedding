@@ -425,7 +425,7 @@ async def extract_content_from_url(url):
             "images": result.media.get("images", []),
             "metadata": result.metadata,
             "markdown": result.markdown.raw_markdown if result.markdown else "",
-            "clean_markdown": clean_markdown(result.markdown.raw_markdown) if result.markdown else ""
+            "clean_markdown": clean_markdown(result.markdown.raw_markdown) if result.markdown else "",
             "markdown": result.markdown if result.markdown else "",
             "internal_links" : result.links.get("internal", []),
             "external_links" : result.links.get("external", [])
