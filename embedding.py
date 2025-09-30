@@ -119,7 +119,6 @@ async def extract_content_from_url(url):
 
     async with AsyncWebCrawler(config=browser_cfg, verbose=True) as crawler:
         result = await crawler.arun(url=url, config=config)
-
         if not result.success:
             print(f"❌ CRAWL FAILED for {result.url}: {result.status_code} - {result.error_message}")
             return {
@@ -128,14 +127,17 @@ async def extract_content_from_url(url):
                 "status_code": result.status_code,
                 "message": result.error_message or "Crawling failed"
             }
-
+        
+        
         product_info = {
             "success": True,
             "url": result.url,
             "data": result.extracted_content,
             "images": result.media.get("images", []),
             "metadata": result.metadata,
-            "markdown": result.markdown.raw_markdown if result.markdown else ""
+            "markdown": result.markdown if result.markdown else "",
+            "internal_links" : result.links.get("internal", []),
+            "external_links" : result.links.get("external", [])
         }
         return product_info
 
