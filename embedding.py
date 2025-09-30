@@ -1,3 +1,4 @@
+import hashlib
 import os,re, json, threading, uuid
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -5,6 +6,8 @@ from sentence_transformers import SentenceTransformer
 from crawl4ai import AsyncWebCrawler, CacheMode, BrowserConfig, CrawlerRunConfig
 import asyncio
 from crawl4ai.extraction_strategy import JsonCssExtractionStrategy, JsonXPathExtractionStrategy
+from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+
 from crawl4ai.async_dispatcher import MemoryAdaptiveDispatcher
 from crawl4ai import CrawlerMonitor, DisplayMode, RateLimiter
 import nest_asyncio
@@ -403,7 +406,9 @@ async def extract_content_from_url(url):
     config = CrawlerRunConfig(
         verbose=True,
         cache_mode=CacheMode.BYPASS,
-        check_robots_txt=True
+        check_robots_txt=True,
+        markdown_generator=DefaultMarkdownGenerator()
+
     )
 
     async with AsyncWebCrawler(config=browser_cfg, verbose=True) as crawler:
@@ -424,9 +429,8 @@ async def extract_content_from_url(url):
             "data": result.extracted_content,
             "images": result.media.get("images", []),
             "metadata": result.metadata,
-            "markdown": result.markdown.raw_markdown if result.markdown else "",
-            "clean_markdown": clean_markdown(result.markdown.raw_markdown) if result.markdown else "",
             "markdown": result.markdown if result.markdown else "",
+            "clean_markdown": clean_markdown(result.markdown) if result.markdown else "",
             "internal_links" : result.links.get("internal", []),
             "external_links" : result.links.get("external", [])
         }
