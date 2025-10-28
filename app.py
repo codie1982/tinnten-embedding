@@ -3,7 +3,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 
-from embedding_index import EmbeddingIndex
+from vector_store import EmbeddingIndex
 
 load_dotenv()
 
@@ -23,11 +23,18 @@ store = EmbeddingIndex(
 
 @app.route("/", methods=["GET"])
 def root():
+    """Health check: returns basic status text and current FAISS index size."""
     size = int(store.index.ntotal) if store.index is not None else 0
     return jsonify({"message": "tinnten-embedding up", "index_size": size})
 
 @app.route("/api/v10/llm/vector", methods=["POST"])
 def generate_vector():
+    """
+    Encode raw text into an embedding vector.
+
+    JSON body:
+        text (str, required): Content to vectorize.
+    """
     try:
         data = request.get_json() or {}
         text = data.get("text")
@@ -38,6 +45,16 @@ def generate_vector():
 
 @app.route("/api/v10/vector/upsert", methods=["POST"])
 def upsert_vector():
+    """
+    Insert or update a single vector in FAISS.
+
+    JSON body:
+        text (str, optional): Will be encoded if vector not provided.
+        vector (list[float], optional): Raw vector to upsert.
+        external_id (str, optional): Reference identifier to store with metadata.
+        metadata (dict, optional): Arbitrary metadata payload.
+        id (int, optional): Existing FAISS ID to overwrite; auto-assigned otherwise.
+    """
     try:
         p = request.get_json() or {}
         text = p.get("text")
@@ -52,6 +69,15 @@ def upsert_vector():
 
 @app.route("/api/v10/vector/search", methods=["POST"])
 def search_vector():
+    """
+    Run a similarity search against the FAISS index.
+
+    JSON body:
+        text (str, optional): Query text to encode if vector omitted.
+        vector (list[float], optional): Pre-computed query vector.
+        k (int, optional): Number of results to return (default 5).
+        filter (dict, optional): Metadata filters applied to stored entries.
+    """
     try:
         p = request.get_json() or {}
         text = p.get("text")
@@ -65,6 +91,17 @@ def search_vector():
 
 @app.route("/api/v10/ingest/markdown", methods=["POST"])
 def ingest_markdown():
+    """
+    Ingest markdown content by chunking and embedding it into FAISS.
+
+    JSON body:
+        url (str, required): Source URL of the markdown.
+        raw_markdown (str, required): Markdown document content.
+        options (dict, optional):
+            doc_type (str): Logical grouping label (default 'service').
+            target_chars (int): Desired chunk size (default 1100).
+            overlap_chars (int): Character overlap between chunks (default 180).
+    """
     try:
         data = request.get_json() or {}
         url = (data.get("url") or "").strip()
