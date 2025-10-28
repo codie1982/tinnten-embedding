@@ -4,6 +4,13 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 
 from vector_store import EmbeddingIndex
+from services import (
+    DocumentLoader,
+    DocumentDownloadError,
+    DocumentParseError,
+    UploadStore,
+    UploadNotFoundError,
+)
 
 load_dotenv()
 
@@ -20,6 +27,36 @@ store = EmbeddingIndex(
     index_path=INDEX_PATH,
     meta_path=META_PATH,
 )
+upload_store = UploadStore()
+document_loader = DocumentLoader()
+
+
+def _resolve_upload_s3_location(upload_doc, file_doc):
+    bucket_default = os.getenv("AWS_S3_BUCKET")
+    candidates = []
+    if isinstance(upload_doc, dict):
+        candidates.append(upload_doc.get("file") or {})
+        candidates.append(upload_doc.get("data") or {})
+    if isinstance(file_doc, dict):
+        candidates.append(file_doc)
+
+    for blob in candidates:
+        if not isinstance(blob, dict):
+            continue
+        bucket = (
+            blob.get("bucket")
+            or blob.get("Bucket")
+            or blob.get("bucket_name")
+            or bucket_default
+        )
+        key = blob.get("key") or blob.get("Key") or blob.get("path") or blob.get("s3Key")
+        if key:
+            filename = blob.get("filename") or blob.get("originalname") or os.path.basename(key)
+            return bucket, key, filename
+
+    if not bucket_default:
+        raise RuntimeError("Unable to determine S3 bucket and AWS_S3_BUCKET is not set.")
+    raise RuntimeError("Unable to resolve S3 object key for upload.")
 
 @app.route("/", methods=["GET"])
 def root():
@@ -121,6 +158,45 @@ def ingest_markdown():
         return jsonify(result)
     except Exception as e:
         return jsonify({"success": False, "error": f"ingest failed: {str(e)}"}), 400
+
+
+@app.route("/api/v10/uploads/<upload_id>/text", methods=["GET"])
+def get_upload_text(upload_id):
+    """
+    Fetch plain text extracted from the uploaded document on S3.
+
+    Path params:
+        upload_id (str): Unique identifier for the upload record.
+    """
+    try:
+        upload_doc = upload_store.get_upload_by_id(upload_id)
+    except UploadNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+
+    file_doc = upload_store.get_file_by_upload_id(upload_id)
+    try:
+        bucket, key, filename = _resolve_upload_s3_location(upload_doc, file_doc)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    try:
+        document = document_loader.fetch_text(key, bucket=bucket)
+    except DocumentDownloadError as exc:
+        return jsonify({"error": f"download failed: {exc}"}), 502
+    except DocumentParseError as exc:
+        return jsonify({"error": f"parse failed: {exc}"}), 422
+    except Exception as exc:
+        return jsonify({"error": f"unexpected error: {exc}"}), 500
+
+    payload = {
+        "upload_id": upload_id,
+        "bucket": document.bucket,
+        "key": document.key,
+        "filename": document.filename or filename,
+        "content_type": document.content_type,
+        "text": document.text,
+    }
+    return jsonify(payload)
 
 if __name__ == "__main__":
     port = int(os.getenv("EMBED_PORT", "5003"))
