@@ -7,16 +7,19 @@ import json
 import os
 import signal
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pika
+import requests
 import uuid
 
 from init.rabbit_connection import connect_rabbit_with_retry
 from services.chunker import chunk_text
 from services.embedding_engine import EmbeddingEngine
 from services.mongo_store import MongoStore
+from services.content_store import ContentDocumentStore, normalize_index_options
 from services.document_loader import (
     DocumentLoader,
     DocumentDownloadError,
@@ -25,7 +28,8 @@ from services.document_loader import (
 from services.upload_store import UploadStore, UploadNotFoundError
 
 
-DEFAULT_QUEUE_NAME = "embedding.ingest"
+DEFAULT_PRIMARY_QUEUE_NAME = "content_indexing_queue"
+LEGACY_QUEUE_NAME = "embedding.ingest"
 DEFAULT_CHUNK_SIZE = 1200
 DEFAULT_CHUNK_OVERLAP = 200
 DEFAULT_BATCH_SIZE = 32
@@ -35,9 +39,44 @@ def log(msg: str) -> None:
     print(f"[ingest-worker] {msg}", flush=True)
 
 
+@dataclass(slots=True)
+class DocumentJobContext:
+    company_id: str
+    document_id: str
+    job_id: str
+    user_id: Optional[str]
+    trigger: Optional[str]
+    options: Dict[str, Any]
+
+
+UPDATE_UNSET = object()
+
+
 class IngestWorker:
     def __init__(self) -> None:
-        self.queue_name = (os.getenv("EMBED_QUEUE_NAME") or DEFAULT_QUEUE_NAME).strip()
+        queue_env = (os.getenv("CONTENT_INDEX_QUEUE_NAME") or os.getenv("EMBED_QUEUE_NAME") or "").strip()
+        if queue_env:
+            queues = [q.strip() for q in queue_env.split(",") if q.strip()]
+        else:
+            queues = [DEFAULT_PRIMARY_QUEUE_NAME]
+
+        # Optional legacy queue support for backward compatibility.
+        legacy_flag = (os.getenv("ENABLE_LEGACY_EMBED_QUEUE") or "").strip().lower()
+        legacy_enabled = legacy_flag in {"1", "true", "yes"}
+        if legacy_enabled and LEGACY_QUEUE_NAME not in queues:
+            queues.append(LEGACY_QUEUE_NAME)
+
+        # Ensure the list is not empty and deduplicated.
+        if not queues:
+            queues = [DEFAULT_PRIMARY_QUEUE_NAME]
+        seen = set()
+        self.queue_names: List[str] = []
+        for name in queues:
+            if name not in seen:
+                seen.add(name)
+                self.queue_names.append(name)
+        self.primary_queue = self.queue_names[0]
+
         self.chunk_size = int(os.getenv("EMBED_CHUNK_SIZE") or DEFAULT_CHUNK_SIZE)
         self.chunk_overlap = int(os.getenv("EMBED_CHUNK_OVERLAP") or DEFAULT_CHUNK_OVERLAP)
         self.batch_size = int(os.getenv("EMBED_BATCH_SIZE") or DEFAULT_BATCH_SIZE)
@@ -48,6 +87,7 @@ class IngestWorker:
         index_path = os.getenv("FAISS_INDEX_PATH", "faiss.index")
 
         self.store = MongoStore()
+        self.content_store = ContentDocumentStore()
         self.upload_store = UploadStore()
         self.loader = DocumentLoader()
         self.engine = EmbeddingEngine(model_name=model_name, index_path=index_path)
@@ -60,10 +100,11 @@ class IngestWorker:
         log("Starting ingest worker...")
         self.connection = connect_rabbit_with_retry()
         self.channel = self.connection.channel()
-        self.channel.queue_declare(queue=self.queue_name, durable=True, auto_delete=False, exclusive=False)
         self.channel.basic_qos(prefetch_count=1)
-        self.channel.basic_consume(queue=self.queue_name, on_message_callback=self._handle_message, auto_ack=False)
-        log(f"Awaiting messages on queue '{self.queue_name}'")
+        for queue_name in self.queue_names:
+            self.channel.queue_declare(queue=queue_name, durable=True, auto_delete=False, exclusive=False)
+            self.channel.basic_consume(queue=queue_name, on_message_callback=self._handle_message, auto_ack=False)
+        log(f"Awaiting messages on queues: {', '.join(self.queue_names)}")
         try:
             self.channel.start_consuming()
         except KeyboardInterrupt:
@@ -99,16 +140,391 @@ class IngestWorker:
             channel.basic_ack(delivery_tag=delivery_tag)
         except Exception as exc:  # noqa: BLE001
             log(f"Error processing message: {exc}")
-            # attempt to mark document as failed if info available
+            # attempt to mark document(s) as failed if possible
             try:
-                doc_id = payload.get("doc_id") if isinstance(payload, dict) else None
-                if doc_id:
-                    self.store.update_document_status(doc_id, status="failed", error=str(exc))
+                if isinstance(payload, dict):
+                    doc_id = payload.get("doc_id")
+                    if doc_id:
+                        self.store.update_document_status(doc_id, status="failed", error=str(exc))
+                    else:
+                        document_ids = self._coalesce(payload, "documentIds", "document_ids", "documentids")
+                        company_id = self._coalesce(payload, "companyId", "company_id", "companyid")
+                        if company_id and document_ids:
+                            ids = document_ids if isinstance(document_ids, Sequence) else [document_ids]
+                            for document_id in ids:
+                                self._safe_update_index_state(
+                                    DocumentJobContext(
+                                        company_id=company_id,
+                                        document_id=str(document_id),
+                                        job_id=str(payload.get("jobId") or payload.get("job_id") or uuid.uuid4()),
+                                        user_id=self._coalesce(payload, "userId", "userid", "user_id"),
+                                        trigger=self._coalesce(payload, "trigger"),
+                                        options={},
+                                    ),
+                                    state="failed",
+                                    error=str(exc),
+                                )
             except Exception:
                 pass
             channel.basic_nack(delivery_tag=delivery_tag, requeue=False)
 
+    # ------------------------------------------------------------------
     def _process_payload(self, payload: Dict[str, Any]) -> None:
+        if self._is_content_index_message(payload):
+            self._process_content_index_message(payload)
+        else:
+            self._process_legacy_payload(payload)
+
+    def _is_content_index_message(self, payload: Dict[str, Any]) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        return any(key in payload for key in ("documentIds", "document_ids", "documentids"))
+
+    def _process_content_index_message(self, payload: Dict[str, Any]) -> None:
+        company_id = self._coalesce(payload, "companyId", "company_id", "companyid")
+        if not company_id:
+            raise ValueError("payload missing companyId")
+
+        document_ids_raw = self._coalesce(payload, "documentIds", "document_ids", "documentids")
+        if document_ids_raw is None:
+            raise ValueError("payload missing documentIds")
+
+        if isinstance(document_ids_raw, str):
+            document_ids = [document_ids_raw]
+        elif isinstance(document_ids_raw, Sequence):
+            document_ids = [str(doc_id) for doc_id in document_ids_raw]
+        else:
+            raise TypeError("documentIds must be a list of identifiers")
+
+        user_id = self._coalesce(payload, "userId", "user_id", "userid")
+        job_id = self._coalesce(payload, "jobId", "job_id")
+        trigger = self._coalesce(payload, "trigger") or "manual"
+        options_override = payload.get("options") or {}
+
+        documents = self.content_store.get_documents(company_id, document_ids)
+        missing_docs = [doc_id for doc_id in document_ids if doc_id not in documents]
+        if missing_docs:
+            for doc_id in missing_docs:
+                ctx = DocumentJobContext(
+                    company_id=company_id,
+                    document_id=doc_id,
+                    job_id=job_id or str(uuid.uuid4()),
+                    user_id=user_id,
+                    trigger=trigger,
+                    options={},
+                )
+                msg = f"Document {doc_id} not found in contentdocuments collection."
+                log(msg)
+                self._log_document_event(ctx, level="error", message=msg, state="failed")
+                self._safe_update_index_state(ctx, state="failed", error="document not found")
+
+        for doc_id, document in documents.items():
+            doc_index = document.get("index") if isinstance(document, dict) else None
+            doc_job_id = (
+                self._coalesce(doc_index or {}, "jobId", "job_id")
+                or job_id
+                or str(uuid.uuid4())
+            )
+            combined_options = {}
+            if isinstance(doc_index, dict) and isinstance(doc_index.get("options"), dict):
+                combined_options.update(doc_index["options"])
+            combined_options.update(options_override)
+            normalised_options = normalize_index_options(
+                combined_options,
+                default_chunk_size=self.chunk_size,
+                default_chunk_overlap=self.chunk_overlap,
+            )
+            context = DocumentJobContext(
+                company_id=company_id,
+                document_id=doc_id,
+                job_id=str(doc_job_id),
+                user_id=user_id,
+                trigger=trigger,
+                options=normalised_options,
+            )
+            try:
+                self._process_single_document(document, context)
+            except Exception as exc:  # noqa: BLE001
+                log(f"Failed to process document {doc_id}: {exc}")
+
+    # ------------------------------------------------------------------
+    def _process_single_document(self, document: Dict[str, Any], context: DocumentJobContext) -> None:
+        started_at = datetime.now(timezone.utc)
+        options = context.options
+        base_stats = self._initial_stats(options)
+        self._safe_update_index_state(
+            context,
+            state="processing",
+            stats=base_stats,
+            error=None,
+            extra={"index.startedAt": started_at},
+        )
+        self._log_document_event(
+            context,
+            level="info",
+            message="Indexing job started.",
+            state="processing",
+            details={"options": options},
+        )
+
+        resolved_source = self._resolve_document_source(document, options)
+        try:
+            text, metadata = self._load_document_content(document, resolved_source, context)
+        except Exception as exc:  # noqa: BLE001
+            finished_at = datetime.now(timezone.utc)
+            error_msg = f"Failed to load document content: {exc}"
+            self._safe_update_index_state(
+                context,
+                state="failed",
+                stats=base_stats,
+                error=error_msg,
+                extra={"index.finishedAt": finished_at},
+            )
+            self._log_document_event(context, level="error", message=error_msg, state="failed")
+            raise
+
+        self._log_document_event(
+            context,
+            level="info",
+            message="Document content loaded.",
+            state="processing",
+            details={"source": resolved_source.get("source"), "metadataKeys": list(metadata.keys())},
+        )
+
+        if options.get("cleanup"):
+            text = self._cleanup_text(text)
+
+        if options.get("langDetect"):
+            detected_lang = self._detect_language(text)
+            if detected_lang:
+                metadata = dict(metadata)
+                metadata.setdefault("language", detected_lang)
+
+        try:
+            stats = self._chunk_and_embed(
+                doc_id=context.document_id,
+                company_id=context.company_id,
+                doc_type=resolved_source["doc_type"],
+                source=resolved_source["source"],
+                metadata=metadata,
+                text=text,
+                options=options,
+            )
+        except Exception as exc:  # noqa: BLE001
+            finished_at = datetime.now(timezone.utc)
+            error_msg = f"Embedding failed: {exc}"
+            self._safe_update_index_state(
+                context,
+                state="failed",
+                stats=base_stats,
+                error=error_msg,
+                extra={"index.finishedAt": finished_at},
+            )
+            self._log_document_event(context, level="error", message=error_msg, state="failed")
+            raise
+
+        finished_at = datetime.now(timezone.utc)
+        self._log_document_event(
+            context,
+            level="info",
+            message=f"Embedding completed with {stats['chunkCount']} chunks.",
+            state="processing",
+            details={"chunks": stats["chunkCount"], "tokenCount": stats["tokenCount"], "charCount": stats["charCount"]},
+        )
+        stats_with_flags = dict(stats)
+        stats_with_flags.update(
+            {
+                "cleanup": bool(options.get("cleanup")),
+                "ocr": bool(options.get("ocr")),
+                "langDetect": bool(options.get("langDetect")),
+                "scope": options.get("scope"),
+                "minChars": options.get("minChars"),
+            }
+        )
+        self._safe_update_index_state(
+            context,
+            state="completed",
+            stats=stats_with_flags,
+            error=None,
+            extra={"index.finishedAt": finished_at},
+        )
+        self._log_document_event(
+            context,
+            level="info",
+            message="Indexing job completed.",
+            state="completed",
+            details={"stats": stats_with_flags},
+        )
+
+    # ------------------------------------------------------------------
+    def _load_document_content(
+        self,
+        document: Dict[str, Any],
+        resolved_source: Dict[str, Any],
+        context: DocumentJobContext,
+    ) -> Tuple[str, Dict[str, Any]]:
+        metadata = dict(resolved_source.get("metadata") or {})
+        metadata.setdefault("documentId", context.document_id)
+        metadata.setdefault("companyId", context.company_id)
+        metadata.setdefault("source", resolved_source["source"])
+        metadata.setdefault("jobId", context.job_id)
+        if context.trigger:
+            metadata.setdefault("trigger", context.trigger)
+        if context.user_id:
+            metadata.setdefault("userId", context.user_id)
+
+        source_type = resolved_source["source"]
+        if source_type == "upload":
+            upload_id = resolved_source.get("upload_id")
+            if not upload_id:
+                raise ValueError("upload source missing upload_id")
+            return self._load_upload_text(upload_id, metadata, context)
+
+        if source_type in {"import_url", "url", "web"}:
+            url = resolved_source.get("url")
+            if not url:
+                raise ValueError("url source missing url")
+            text, content_type = self._fetch_url_text(url)
+            metadata.setdefault("url", url)
+            if content_type:
+                metadata.setdefault("contentType", content_type)
+            return text, metadata
+
+        text = resolved_source.get("text")
+        if not text:
+            raise ValueError("text source missing content")
+        return str(text), metadata
+
+    def _load_upload_text(
+        self,
+        upload_id: str,
+        metadata: Dict[str, Any],
+        context: DocumentJobContext,
+    ) -> Tuple[str, Dict[str, Any]]:
+        try:
+            upload_doc = self.upload_store.get_upload_by_id(upload_id)
+        except UploadNotFoundError as exc:
+            raise RuntimeError(f"upload record not found for uploadId={upload_id}") from exc
+
+        file_doc = self.upload_store.get_file_by_upload_id(upload_id)
+        bucket, key, filename = self._resolve_s3_location(upload_doc, file_doc)
+
+        self.upload_store.update_upload_status(
+            upload_id,
+            index_status="in_progress",
+            is_file_opened=False,
+            file_open_error=None,
+            embedding_doc_id=context.document_id,
+        )
+
+        try:
+            document = self.loader.fetch_text(key, bucket=bucket)
+        except (DocumentDownloadError, DocumentParseError) as exc:
+            self.upload_store.update_upload_status(
+                upload_id,
+                index_status="failed",
+                is_file_opened=False,
+                file_open_error=str(exc),
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.upload_store.update_upload_status(
+                upload_id,
+                index_status="failed",
+                is_file_opened=False,
+                file_open_error=str(exc),
+            )
+            raise
+
+        combined_metadata = dict(metadata)
+        combined_metadata.setdefault("uploadId", upload_id)
+        combined_metadata.setdefault("bucket", document.bucket)
+        combined_metadata.setdefault("key", document.key)
+        combined_metadata.setdefault("filename", document.filename or filename)
+        if document.content_type:
+            combined_metadata.setdefault("contentType", document.content_type)
+
+        self.upload_store.update_upload_status(
+            upload_id,
+            index_status="completed",
+            is_file_opened=True,
+            file_open_error=None,
+        )
+        return document.text, combined_metadata
+
+    # ------------------------------------------------------------------
+    def _chunk_and_embed(
+        self,
+        *,
+        doc_id: str,
+        company_id: str,
+        doc_type: str,
+        source: str,
+        metadata: Dict[str, Any],
+        text: str,
+        options: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        chunk_size = int(options.get("chunkSize") or self.chunk_size)
+        chunk_overlap = int(options.get("chunkOverlap") or self.chunk_overlap)
+        min_chars = int(options.get("minChars") or 80)
+
+        chunks = chunk_text(
+            text,
+            chunk_size=chunk_size,
+            overlap=chunk_overlap,
+            min_chars=min_chars,
+        )
+        if not chunks:
+            return {
+                "chunkCount": 0,
+                "tokenCount": 0,
+                "charCount": 0,
+                "chunkSize": chunk_size,
+                "chunkOverlap": chunk_overlap,
+                "minChars": min_chars,
+            }
+
+        faiss_ids = self.store.reserve_faiss_ids(len(chunks))
+        embeddings = self.engine.encode([chunk.text for chunk in chunks], batch_size=self.batch_size)
+        self.engine.add_embeddings(embeddings, faiss_ids)
+
+        now = datetime.now(timezone.utc)
+        chunk_docs: List[Dict[str, Any]] = []
+        total_chars = 0
+        total_tokens = 0
+        for chunk, faiss_id in zip(chunks, faiss_ids):
+            total_chars += len(chunk.text)
+            total_tokens += self._estimate_token_count(chunk.text)
+            chunk_metadata = dict(metadata)
+            chunk_docs.append(
+                {
+                    "chunk_id": str(uuid.uuid4()),
+                    "doc_id": doc_id,
+                    "company_id": company_id,
+                    "chunk_index": chunk.index,
+                    "faiss_id": int(faiss_id),
+                    "text": chunk.text,
+                    "char_start": chunk.char_start,
+                    "char_end": chunk.char_end,
+                    "doc_type": doc_type,
+                    "source": source,
+                    "metadata": chunk_metadata,
+                    "options": dict(options),
+                    "created_at": now,
+                }
+            )
+        self.store.insert_chunks(chunk_docs)
+        return {
+            "chunkCount": len(chunk_docs),
+            "tokenCount": total_tokens,
+            "charCount": total_chars,
+            "chunkSize": chunk_size,
+            "chunkOverlap": chunk_overlap,
+            "minChars": min_chars,
+        }
+
+    # ------------------------------------------------------------------
+    def _process_legacy_payload(self, payload: Dict[str, Any]) -> None:
         doc_id = payload.get("doc_id")
         if not doc_id:
             raise ValueError("payload missing 'doc_id'")
@@ -123,7 +539,7 @@ class IngestWorker:
             if not upload_id:
                 raise ValueError("payload missing 'upload_id'")
             metadata = payload.get("metadata") or {}
-            self._process_upload_ingest(
+            self._process_upload_ingest_legacy(
                 doc_id=doc_id,
                 upload_id=upload_id,
                 metadata=metadata,
@@ -138,7 +554,7 @@ class IngestWorker:
             doc_type = (payload.get("doc_type") or "web").lower()
             source = payload.get("source") or "web"
             metadata = payload.get("metadata") or {}
-            self._ingest_text(
+            self._ingest_text_legacy(
                 doc_id=doc_id,
                 doc_type=doc_type,
                 source=source,
@@ -149,8 +565,7 @@ class IngestWorker:
                 min_chars=min_chars,
             )
 
-    # ------------------------------------------------------------------
-    def _ingest_text(
+    def _ingest_text_legacy(
         self,
         *,
         doc_id: str,
@@ -200,7 +615,7 @@ class IngestWorker:
         self.store.update_document_status(doc_id, status="ready", chunk_count=len(chunk_docs))
         log(f"Processed doc_id={doc_id} chunks={len(chunk_docs)}")
 
-    def _process_upload_ingest(
+    def _process_upload_ingest_legacy(
         self,
         *,
         doc_id: str,
@@ -248,7 +663,7 @@ class IngestWorker:
             combined_metadata.setdefault("content_type", document.content_type)
 
         try:
-            self._ingest_text(
+            self._ingest_text_legacy(
                 doc_id=doc_id,
                 doc_type="document",
                 source="upload",
@@ -274,13 +689,214 @@ class IngestWorker:
             file_open_error=None,
         )
 
+    # ------------------------------------------------------------------
+    def _resolve_document_source(self, document: Dict[str, Any], options: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = self._extract_metadata(document)
+
+        source_info: Dict[str, Any] = {}
+        for key in ("source", "ingest", "payload"):
+            value = document.get(key)
+            if isinstance(value, dict):
+                source_info.update(value)
+        # allow index.source to override
+        index = document.get("index")
+        if isinstance(index, dict) and isinstance(index.get("source"), dict):
+            source_info.update(index["source"])
+
+        source_type = (
+            source_info.get("type")
+            or source_info.get("source")
+            or document.get("source")
+            or options.get("source")
+            or "text"
+        )
+        source_type = str(source_type).lower()
+
+        doc_type = (
+            document.get("docType")
+            or document.get("type")
+            or source_info.get("docType")
+            or options.get("scope")
+            or "document"
+        )
+        doc_type = str(doc_type).lower()
+
+        upload_id = (
+            source_info.get("uploadId")
+            or source_info.get("upload_id")
+            or document.get("uploadId")
+            or document.get("upload_id")
+            or metadata.get("uploadId")
+            or metadata.get("upload_id")
+        )
+
+        payload_section = document.get("payload") if isinstance(document.get("payload"), dict) else {}
+
+        url = (
+            source_info.get("url")
+            or payload_section.get("url")
+            or document.get("url")
+            or metadata.get("url")
+        )
+
+        text = (
+            source_info.get("text")
+            or payload_section.get("text")
+            or document.get("text")
+            or document.get("rawText")
+            or document.get("body")
+            or document.get("content")
+            or metadata.get("text")
+        )
+        if isinstance(text, dict):
+            text = text.get("value") or text.get("data")
+
+        resolved: Dict[str, Any] = {
+            "source": source_type,
+            "doc_type": doc_type,
+            "metadata": metadata,
+        }
+        if upload_id:
+            resolved["upload_id"] = upload_id
+        if url:
+            resolved["url"] = url
+        if text:
+            resolved["text"] = text
+        return resolved
+
+    @staticmethod
+    def _extract_metadata(document: Dict[str, Any]) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {}
+        for key in ("metadata", "meta", "attributes", "details"):
+            value = document.get(key)
+            if isinstance(value, dict):
+                metadata.update(value)
+        if "title" in document:
+            metadata.setdefault("title", document.get("title"))
+        metadata.setdefault("companyId", document.get("companyId"))
+        metadata.setdefault("documentId", document.get("documentId"))
+        return metadata
+
+    @staticmethod
+    def _estimate_token_count(text: str) -> int:
+        # Simple whitespace token estimate to avoid pulling in heavy tokenizers.
+        if not text:
+            return 0
+        return len(text.split())
+
+    @staticmethod
+    def _cleanup_text(text: str) -> str:
+        lines = [line.strip() for line in text.splitlines()]
+        compact = "\n".join(line for line in lines if line)
+        return compact.strip()
+
+    @staticmethod
+    def _detect_language(text: str) -> Optional[str]:
+        try:
+            from langdetect import detect  # type: ignore
+        except ImportError:
+            return None
+        try:
+            return detect(text)
+        except Exception:
+            return None
+
+    def _fetch_url_text(self, url: str) -> Tuple[str, Optional[str]]:
+        try:
+            response = requests.get(url, timeout=(10, 30))
+            response.raise_for_status()
+        except requests.RequestException as exc:  # noqa: BLE001
+            raise RuntimeError(f"Failed to fetch URL {url}: {exc}") from exc
+        content_type = response.headers.get("Content-Type") or response.headers.get("content-type")
+        return response.text, content_type
+
+    def _initial_stats(self, options: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "chunkCount": 0,
+            "tokenCount": 0,
+            "charCount": 0,
+            "chunkSize": int(options.get("chunkSize") or self.chunk_size),
+            "chunkOverlap": int(options.get("chunkOverlap") or self.chunk_overlap),
+            "minChars": int(options.get("minChars") or 80),
+        }
+
+    def _log_document_event(
+        self,
+        context: DocumentJobContext,
+        *,
+        level: str,
+        message: str,
+        state: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        try:
+            self.content_store.append_log_entry(
+                company_id=context.company_id,
+                document_id=context.document_id,
+                job_id=context.job_id,
+                level=level,
+                message=message,
+                state=state,
+                user_id=context.user_id,
+                trigger=context.trigger,
+                details=details,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log(f"Failed to append document log: {exc}")
+
+    def _safe_update_index_state(
+        self,
+        context: DocumentJobContext,
+        *,
+        state: Optional[str] = None,
+        stats: Any = UPDATE_UNSET,
+        error: Any = UPDATE_UNSET,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        try:
+            update_kwargs: Dict[str, Any] = {
+                "company_id": context.company_id,
+                "document_id": context.document_id,
+                "job_id": context.job_id,
+                "trigger": context.trigger,
+                "options": context.options,
+                "user_id": context.user_id,
+                "extra_updates": extra,
+            }
+            if state is not None:
+                update_kwargs["state"] = state
+            if stats is not UPDATE_UNSET:
+                update_kwargs["stats"] = stats
+            if error is not UPDATE_UNSET:
+                update_kwargs["error"] = error
+            self.content_store.update_index_fields(**update_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            log(f"Failed to update index state for {context.document_id}: {exc}")
+
+    # ------------------------------------------------------------------
+    def _coalesce(self, data: Dict[str, Any], *candidates: str) -> Optional[Any]:
+        if not isinstance(data, dict):
+            return None
+        for key in candidates:
+            if key in data:
+                return data[key]
+        lowered = {k.lower(): v for k, v in data.items()}
+        for key in candidates:
+            lowered_key = key.lower()
+            if lowered_key in lowered:
+                return lowered[lowered_key]
+            stripped = lowered_key.replace("_", "")
+            if stripped in lowered:
+                return lowered[stripped]
+        return None
+
     def _resolve_s3_location(self, upload_doc: Dict[str, Any], file_doc: Optional[Dict[str, Any]]):
         bucket_default = os.getenv("AWS_S3_BUCKET")
-        candidates = []
-        if upload_doc:
+        candidates: List[Dict[str, Any]] = []
+        if isinstance(upload_doc, dict):
             candidates.append(upload_doc.get("file") or {})
             candidates.append(upload_doc.get("data") or {})
-        if file_doc:
+        if isinstance(file_doc, dict):
             candidates.append(file_doc)
 
         for blob in candidates:

@@ -1,4 +1,5 @@
 import os
+import uuid
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -10,13 +11,19 @@ from services import (
     DocumentParseError,
     UploadStore,
     UploadNotFoundError,
+    ContentDocumentStore,
+    normalize_index_options,
 )
+from services.rabbit_publisher import RabbitPublisher
 
 load_dotenv()
 
 INDEX_PATH = os.getenv("INDEX_PATH", "/data/faiss.index")
 META_PATH  = os.getenv("META_PATH",  "/data/meta.json")
 MODEL_NAME = os.getenv("MODEL_NAME", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
+DEFAULT_INDEX_CHUNK_SIZE = int(os.getenv("EMBED_CHUNK_SIZE") or 1200)
+DEFAULT_INDEX_CHUNK_OVERLAP = int(os.getenv("EMBED_CHUNK_OVERLAP") or 200)
+DEFAULT_INDEX_MIN_CHARS = int(os.getenv("EMBED_MIN_CHARS") or 80)
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -29,6 +36,25 @@ store = EmbeddingIndex(
 )
 upload_store = UploadStore()
 document_loader = DocumentLoader()
+content_store = ContentDocumentStore()
+job_publisher = RabbitPublisher()
+
+
+def _get_payload_value(data: dict, *keys: str):
+    if not isinstance(data, dict):
+        return None
+    for key in keys:
+        if key in data:
+            return data[key]
+    lowered = {k.lower(): v for k, v in data.items() if isinstance(k, str)}
+    for key in keys:
+        lowered_key = key.lower()
+        if lowered_key in lowered:
+            return lowered[lowered_key]
+        stripped = lowered_key.replace("_", "")
+        if stripped in lowered:
+            return lowered[stripped]
+    return None
 
 
 def _resolve_upload_s3_location(upload_doc, file_doc):
@@ -126,6 +152,198 @@ def search_vector():
     except Exception as e:
         return jsonify({"error": f"search failed: {str(e)}"}), 400
 
+
+@app.route("/api/v10/content/index", methods=["POST"])
+def queue_content_index():
+    """
+    Queue a content document for indexing.
+
+    JSON body:
+        companyId (str, required)
+        documentId (str, optional - generates UUID if omitted)
+        uploadId (str, optional)
+        text (str, optional)
+        url (str, optional)
+        indexOptions / options (dict, optional)
+        metadata (dict, optional)
+        trigger (str, optional)
+        userId (str, optional)
+    """
+    try:
+        payload = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"error": "invalid JSON payload"}), 400
+
+    company_id = _get_payload_value(payload, "companyId", "company_id", "companyid")
+    if not company_id:
+        return jsonify({"error": "companyId is required"}), 400
+    company_id = str(company_id)
+
+    document_id = _get_payload_value(payload, "documentId", "document_id", "documentid")
+    if document_id:
+        document_id = str(document_id)
+    else:
+        document_id = str(uuid.uuid4())
+
+    user_id = _get_payload_value(payload, "userId", "user_id", "userid")
+    if user_id is not None:
+        user_id = str(user_id)
+
+    trigger = _get_payload_value(payload, "trigger") or "api"
+    job_id = _get_payload_value(payload, "jobId", "job_id")
+    if job_id:
+        job_id = str(job_id)
+    else:
+        job_id = str(uuid.uuid4())
+
+    raw_options = payload.get("indexOptions") or payload.get("options") or {}
+    try:
+        options = normalize_index_options(
+            raw_options,
+            default_chunk_size=DEFAULT_INDEX_CHUNK_SIZE,
+            default_chunk_overlap=DEFAULT_INDEX_CHUNK_OVERLAP,
+            default_min_chars=DEFAULT_INDEX_MIN_CHARS,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"invalid index options: {exc}"}), 400
+
+    metadata_payload = payload.get("metadata") or {}
+    if metadata_payload and not isinstance(metadata_payload, dict):
+        return jsonify({"error": "metadata must be an object"}), 400
+
+    existing_doc = content_store.get_document(company_id, document_id)
+    metadata = {}
+    if isinstance(existing_doc, dict) and isinstance(existing_doc.get("metadata"), dict):
+        metadata.update(existing_doc["metadata"])
+    metadata.update(metadata_payload)
+    metadata.setdefault("companyId", company_id)
+    metadata.setdefault("documentId", document_id)
+
+    upload_id = _get_payload_value(payload, "uploadId", "upload_id", "uploadid")
+    if upload_id:
+        upload_id = str(upload_id)
+        metadata.setdefault("uploadId", upload_id)
+
+    text = payload.get("text")
+    if text is not None and not isinstance(text, str):
+        return jsonify({"error": "text must be a string"}), 400
+    url = payload.get("url")
+    if url is not None and not isinstance(url, str):
+        return jsonify({"error": "url must be a string"}), 400
+
+    source = None
+    if upload_id:
+        source = {"type": "upload", "uploadId": upload_id}
+    elif text:
+        cleaned_text = text.strip()
+        if not cleaned_text:
+            return jsonify({"error": "text cannot be empty"}), 400
+        source = {"type": "text", "text": text}
+        metadata.setdefault("textSize", len(text))
+    elif url:
+        trimmed_url = url.strip()
+        if not trimmed_url:
+            return jsonify({"error": "url cannot be empty"}), 400
+        source = {"type": "import_url", "url": trimmed_url}
+        metadata.setdefault("url", trimmed_url)
+    elif isinstance(existing_doc, dict) and isinstance(existing_doc.get("source"), dict):
+        source = dict(existing_doc["source"])
+    else:
+        return jsonify({"error": "uploadId, text, or url is required for new documents"}), 400
+
+    source_type = source.get("type") or source.get("source")
+    if source_type:
+        source["type"] = str(source_type).lower()
+        source["source"] = source["type"]
+
+    doc_type = options.get("scope")
+    if not doc_type and isinstance(existing_doc, dict):
+        doc_type = existing_doc.get("docType")
+    if doc_type:
+        source.setdefault("docType", doc_type)
+        metadata.setdefault("scope", doc_type)
+
+    title = payload.get("title") or metadata.get("title")
+    if not title and isinstance(existing_doc, dict):
+        title = existing_doc.get("title")
+
+    try:
+        doc = content_store.upsert_document_with_source(
+            company_id=company_id,
+            document_id=document_id,
+            source=source,
+            metadata=metadata,
+            options=options,
+            job_id=job_id,
+            user_id=user_id,
+            trigger=trigger,
+            title=title,
+            doc_type=doc_type,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"failed to prepare document: {exc}"}), 500
+
+    try:
+        content_store.append_log_entry(
+            company_id=company_id,
+            document_id=document_id,
+            job_id=job_id,
+            level="info",
+            message="Index job queued via API.",
+            state="queued",
+            user_id=user_id,
+            trigger=trigger,
+            details={"source": source.get("type"), "options": options},
+        )
+    except Exception:
+        # Logging failure should not block the request; it will be visible in stdout.
+        pass
+
+    message = {
+        "companyId": company_id,
+        "documentIds": [document_id],
+        "options": options,
+        "trigger": trigger,
+        "jobId": job_id,
+    }
+    if user_id:
+        message["userId"] = user_id
+
+    try:
+        job_publisher.publish(message)
+    except Exception as exc:  # noqa: BLE001
+        error_msg = f"failed to enqueue indexing job: {exc}"
+        content_store.update_index_fields(
+            company_id=company_id,
+            document_id=document_id,
+            state="failed",
+            error=error_msg,
+            job_id=job_id,
+            trigger=trigger,
+            options=options,
+            user_id=user_id,
+        )
+        content_store.append_log_entry(
+            company_id=company_id,
+            document_id=document_id,
+            job_id=job_id,
+            level="error",
+            message=error_msg,
+            state="failed",
+            user_id=user_id,
+            trigger=trigger,
+        )
+        return jsonify({"error": error_msg}), 503
+
+    index_state = doc.get("index", {}) if isinstance(doc, dict) else {}
+    response = {
+        "queued": True,
+        "documentId": document_id,
+        "jobId": job_id,
+        "state": index_state.get("state", "queued"),
+        "options": options,
+    }
+    return jsonify(response), 202
 @app.route("/api/v10/ingest/markdown", methods=["POST"])
 def ingest_markdown():
     """

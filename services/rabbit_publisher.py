@@ -12,12 +12,14 @@ import pika
 
 from init.rabbit_connection import get_rabbit_connection
 
-DEFAULT_QUEUE_NAME = "embedding.ingest"
+DEFAULT_QUEUE_NAME = "content_indexing_queue"
 
 
 class RabbitPublisher:
     def __init__(self, queue_name: str | None = None) -> None:
-        self.queue_name = (queue_name or os.getenv("EMBED_QUEUE_NAME") or DEFAULT_QUEUE_NAME).strip()
+        env_queue = (os.getenv("CONTENT_INDEX_QUEUE_NAME") or os.getenv("EMBED_QUEUE_NAME") or "").strip()
+        target_queue = queue_name or env_queue or DEFAULT_QUEUE_NAME
+        self.queue_name = target_queue.strip()
         if not self.queue_name:
             raise ValueError("queue_name cannot be empty")
         self._connection: pika.BlockingConnection | None = None
