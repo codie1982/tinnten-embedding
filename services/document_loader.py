@@ -9,12 +9,11 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-
 from botocore.exceptions import ClientError
 from docx import Document
 from pypdf import PdfReader
 
-from .aws import get_s3_client, get_aws_config
+from init.aws import get_aws_config, get_s3_client
 
 
 SUPPORTED_EXTENSIONS = {
