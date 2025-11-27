@@ -20,7 +20,13 @@ load_dotenv()
 
 INDEX_PATH = os.getenv("INDEX_PATH", "/data/faiss.index")
 META_PATH  = os.getenv("META_PATH",  "/data/meta.json")
+CATEGORY_INDEX_PATH = os.getenv("CATEGORY_INDEX_PATH", "/data/category.index")
+CATEGORY_META_PATH  = os.getenv("CATEGORY_META_PATH",  "/data/category_meta.json")
+ATTRIBUTE_INDEX_PATH = os.getenv("ATTRIBUTE_INDEX_PATH", "/data/attribute.index")
+ATTRIBUTE_META_PATH  = os.getenv("ATTRIBUTE_META_PATH",  "/data/attribute_meta.json")
 MODEL_NAME = os.getenv("MODEL_NAME", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
+CATEGORY_MODEL_NAME = os.getenv("CATEGORY_MODEL_NAME", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+ATTRIBUTE_MODEL_NAME = os.getenv("ATTRIBUTE_MODEL_NAME", CATEGORY_MODEL_NAME)
 DEFAULT_INDEX_CHUNK_SIZE = int(os.getenv("EMBED_CHUNK_SIZE") or 1200)
 DEFAULT_INDEX_CHUNK_OVERLAP = int(os.getenv("EMBED_CHUNK_OVERLAP") or 200)
 DEFAULT_INDEX_MIN_CHARS = int(os.getenv("EMBED_MIN_CHARS") or 80)
@@ -28,11 +34,21 @@ DEFAULT_INDEX_MIN_CHARS = int(os.getenv("EMBED_MIN_CHARS") or 80)
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Tek bir instance yeterli
+# Ana metin, kategori ve attribute için ayrı FAISS + gerekirse farklı modeller
 store = EmbeddingIndex(
     model_name=MODEL_NAME,
     index_path=INDEX_PATH,
     meta_path=META_PATH,
+)
+category_store = EmbeddingIndex(
+    model_name=CATEGORY_MODEL_NAME,
+    index_path=CATEGORY_INDEX_PATH,
+    meta_path=CATEGORY_META_PATH,
+)
+attribute_store = EmbeddingIndex(
+    model_name=ATTRIBUTE_MODEL_NAME,
+    index_path=ATTRIBUTE_INDEX_PATH,
+    meta_path=ATTRIBUTE_META_PATH,
 )
 upload_store = UploadStore()
 document_loader = DocumentLoader()
@@ -84,6 +100,34 @@ def _resolve_upload_s3_location(upload_doc, file_doc):
         raise RuntimeError("Unable to determine S3 bucket and AWS_S3_BUCKET is not set.")
     raise RuntimeError("Unable to resolve S3 object key for upload.")
 
+
+def _vector_upsert_response(target_store, label: str = "upsert"):
+    try:
+        payload = request.get_json() or {}
+        text = payload.get("text")
+        vector = payload.get("vector")
+        external_id = payload.get("external_id")
+        metadata = payload.get("metadata") or {}
+        int_id = payload.get("id")
+        out = target_store.upsert_vector(text, vector, external_id, metadata, int_id)
+        return jsonify(out)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"{label} failed: {exc}"}), 400
+
+
+def _vector_search_response(target_store, label: str = "search"):
+    try:
+        payload = request.get_json() or {}
+        text = payload.get("text")
+        vector = payload.get("vector")
+        k = int(payload.get("k") or 5)
+        filt = payload.get("filter") or {}
+        results = target_store.search(text, vector, k, filt)
+        return jsonify({"results": results})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"{label} failed: {exc}"}), 400
+
+
 @app.route("/", methods=["GET"])
 def root():
     """Health check: returns basic status text and current FAISS index size."""
@@ -118,17 +162,7 @@ def upsert_vector():
         metadata (dict, optional): Arbitrary metadata payload.
         id (int, optional): Existing FAISS ID to overwrite; auto-assigned otherwise.
     """
-    try:
-        p = request.get_json() or {}
-        text = p.get("text")
-        vector = p.get("vector")
-        external_id = p.get("external_id")
-        metadata = p.get("metadata") or {}
-        int_id = p.get("id")
-        out = store.upsert_vector(text, vector, external_id, metadata, int_id)
-        return jsonify(out)
-    except Exception as e:
-        return jsonify({"error": f"upsert failed: {str(e)}"}), 400
+    return _vector_upsert_response(store, label="vector upsert")
 
 @app.route("/api/v10/vector/search", methods=["POST"])
 def search_vector():
@@ -141,16 +175,39 @@ def search_vector():
         k (int, optional): Number of results to return (default 5).
         filter (dict, optional): Metadata filters applied to stored entries.
     """
-    try:
-        p = request.get_json() or {}
-        text = p.get("text")
-        vector = p.get("vector")
-        k = int(p.get("k") or 5)
-        filt = p.get("filter") or {}
-        results = store.search(text, vector, k, filt)
-        return jsonify({"results": results})
-    except Exception as e:
-        return jsonify({"error": f"search failed: {str(e)}"}), 400
+    return _vector_search_response(store, label="vector search")
+
+
+@app.route("/api/v10/categories/upsert", methods=["POST"])
+def upsert_category_vector():
+    """
+    Insert or update a category vector in its dedicated FAISS index.
+    """
+    return _vector_upsert_response(category_store, label="category upsert")
+
+
+@app.route("/api/v10/categories/search", methods=["POST"])
+def search_category_vector():
+    """
+    Run a similarity search on the category FAISS index.
+    """
+    return _vector_search_response(category_store, label="category search")
+
+
+@app.route("/api/v10/attributes/upsert", methods=["POST"])
+def upsert_attribute_vector():
+    """
+    Insert or update an attribute vector in its dedicated FAISS index.
+    """
+    return _vector_upsert_response(attribute_store, label="attribute upsert")
+
+
+@app.route("/api/v10/attributes/search", methods=["POST"])
+def search_attribute_vector():
+    """
+    Run a similarity search on the attribute FAISS index.
+    """
+    return _vector_search_response(attribute_store, label="attribute search")
 
 
 @app.route("/api/v10/content/index", methods=["POST"])

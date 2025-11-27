@@ -5,11 +5,79 @@ import uuid
 import time
 import hashlib
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from pymongo import ASCENDING, UpdateOne
+
+from init.db import get_database
 
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
+
+
+DEFAULT_META_DB_NAME = "tinnten-embedding"
+DEFAULT_META_COLLECTION = "faiss_metadata"
+
+
+class MetaRepository:
+    """
+    Mongo koleksiyonu üzerinde FAISS metalarını saklar.
+    """
+
+    def __init__(self, db_name: Optional[str] = None, collection: Optional[str] = None) -> None:
+        name = (
+            (db_name or os.getenv("EMBED_META_DB_NAME") or "").strip()
+            or (os.getenv("EMBED_DB_NAME") or "").strip()
+            or DEFAULT_META_DB_NAME
+        )
+        coll = (collection or os.getenv("EMBED_META_COLLECTION") or DEFAULT_META_COLLECTION).strip()
+        self.collection = get_database(name)[coll]
+        self._ensure_indexes()
+
+    def _ensure_indexes(self) -> None:
+        self.collection.create_index([("faiss_id", ASCENDING)], unique=True, name="faiss_id_unique")
+
+    def upsert_one(self, faiss_id: int, meta: Dict[str, Any]) -> None:
+        doc = self._normalize_payload(faiss_id, meta)
+        self.collection.update_one({"faiss_id": doc["faiss_id"]}, {"$set": doc}, upsert=True)
+
+    def bulk_upsert(self, metas: Dict[int, Dict[str, Any]]) -> None:
+        if not metas:
+            return
+        ops = []
+        for faiss_id, meta in metas.items():
+            doc = self._normalize_payload(faiss_id, meta)
+            ops.append(UpdateOne({"faiss_id": doc["faiss_id"]}, {"$set": doc}, upsert=True))
+        if ops:
+            self.collection.bulk_write(ops, ordered=False)
+
+    def get_by_ids(self, faiss_ids: Sequence[int]) -> Dict[int, Dict[str, Any]]:
+        if not faiss_ids:
+            return {}
+        cursor = self.collection.find({"faiss_id": {"$in": list(faiss_ids)}})
+        return {int(doc["faiss_id"]): self._extract_meta(doc) for doc in cursor}
+
+    def load_all(self) -> Dict[int, Dict[str, Any]]:
+        cursor = self.collection.find({})
+        return {int(doc["faiss_id"]): self._extract_meta(doc) for doc in cursor}
+
+    @staticmethod
+    def _normalize_payload(faiss_id: int, meta: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "faiss_id": int(faiss_id),
+            "external_id": meta.get("external_id"),
+            "text": meta.get("text"),
+            "metadata": meta.get("metadata") or {},
+        }
+
+    @staticmethod
+    def _extract_meta(doc: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "external_id": doc.get("external_id"),
+            "text": doc.get("text"),
+            "metadata": doc.get("metadata") or {},
+        }
 
 
 class EmbeddingIndex:
@@ -23,10 +91,14 @@ class EmbeddingIndex:
         model_name: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
         index_path: str = "faiss.index",
         meta_path: str = "meta.json",
+        model: Optional[SentenceTransformer] = None,
+        meta_repo: Optional[MetaRepository] = None,
     ) -> None:
         self.model_name = model_name
         self.index_path = index_path
         self.meta_path = meta_path
+        self.model: Optional[SentenceTransformer] = model
+        self._meta_repo = meta_repo or MetaRepository()
 
         # Paylaşımlı kilit; Flask çoklu thread altında güvenli erişim
         self._lock = threading.Lock()
@@ -35,9 +107,6 @@ class EmbeddingIndex:
         self.index: Optional[faiss.IndexIDMap2] = None
         self.meta: Dict[int, Dict[str, Any]] = {}
         self._next_int_id: int = 1
-
-        # Modeli baştan yükle
-        self.model = SentenceTransformer(self.model_name)
 
         # Kalıcı durumu getir
         try:
@@ -52,7 +121,7 @@ class EmbeddingIndex:
         """Metni embed edip Python list olarak döndürür."""
         if not text or not text.strip():
             raise ValueError("No text provided")
-        vec = self.model.encode(text)
+        vec = self._ensure_model().encode(text)
         return vec.tolist()
 
     def upsert_vector(
@@ -70,7 +139,7 @@ class EmbeddingIndex:
         if vector is None:
             if not text or not text.strip():
                 raise ValueError("Provide either 'text' or 'vector'.")
-            v = self.model.encode(text)
+            v = self._ensure_model().encode(text)
         else:
             v = np.array(vector, dtype=np.float32)
 
@@ -96,11 +165,13 @@ class EmbeddingIndex:
                     pass
 
             self.index.add_with_ids(v, np.array([int(int_id)], dtype=np.int64))
-            self.meta[int(int_id)] = {
+            meta_entry = {
                 "external_id": external_id or str(uuid.uuid4()),
                 "text": text if text else self.meta.get(int(int_id), {}).get("text"),
                 "metadata": metadata or {},
             }
+            self.meta[int(int_id)] = meta_entry
+            self._meta_repo.upsert_one(int(int_id), meta_entry)
             self._save_state()
 
         return {"id": int(int_id), "external_id": self.meta[int(int_id)]["external_id"]}
@@ -116,7 +187,7 @@ class EmbeddingIndex:
         if vector is None:
             if not text or not text.strip():
                 return []
-            q = self.model.encode(text)
+            q = self._ensure_model().encode(text)
         else:
             q = np.array(vector, dtype=np.float32)
 
@@ -134,30 +205,37 @@ class EmbeddingIndex:
 
             self._normalize(q)
             scores, ids = self.index.search(q, int(k))
-            ids = ids[0].tolist()
-            scores = scores[0].tolist()
+            id_list = ids[0].tolist()
+            score_list = scores[0].tolist()
+            meta_snapshot = dict(self.meta)
 
-            out = []
-            for i, idx in enumerate(ids):
-                if idx == -1:
-                    continue
-                m = self.meta.get(int(idx))
-                if not m:
-                    continue
+        faiss_ids = [int(idx) for idx in id_list if idx != -1]
+        try:
+            db_meta = self._meta_repo.get_by_ids(faiss_ids)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[vector-store] failed to load meta from Mongo during search: {exc}", flush=True)
+            db_meta = {}
 
-                if simple_filter:
-                    if not self._passes_filter(m, simple_filter):
-                        continue
+        out = []
+        for i, idx in enumerate(id_list):
+            if idx == -1:
+                continue
+            meta = db_meta.get(int(idx)) or meta_snapshot.get(int(idx))
+            if not meta:
+                continue
 
-                out.append(
-                    {
-                        "id": int(idx),
-                        "score": float(scores[i]),
-                        "external_id": m.get("external_id"),
-                        "text": m.get("text"),
-                        "metadata": m.get("metadata", {}),
-                    }
-                )
+            if simple_filter and not self._passes_filter(meta, simple_filter):
+                continue
+
+            out.append(
+                {
+                    "id": int(idx),
+                    "score": float(score_list[i]),
+                    "external_id": meta.get("external_id"),
+                    "text": meta.get("text"),
+                    "metadata": meta.get("metadata", {}),
+                }
+            )
         return out
 
     def ingest_markdown(
@@ -198,7 +276,7 @@ class EmbeddingIndex:
                 }
 
             texts = [c[0] for c in raw_chunks]
-            vecs = self.model.encode(texts)
+            vecs = self._ensure_model().encode(texts)
             vecs = np.array(vecs, dtype=np.float32)
             if vecs.ndim == 1:
                 vecs = vecs.reshape(1, -1)
@@ -212,6 +290,7 @@ class EmbeddingIndex:
             self._next_int_id += vecs.shape[0]
             self.index.add_with_ids(vecs, ids)
 
+            new_meta: Dict[int, Dict[str, Any]] = {}
             for i, (txt, s, e, h_path) in enumerate(raw_chunks):
                 faiss_id = int(ids[i])
                 chunk_id = str(uuid.uuid4())
@@ -220,6 +299,7 @@ class EmbeddingIndex:
                     "text": txt,
                     "metadata": {"doc_type": doc_type.lower(), "url": url, "h_path": h_path},
                 }
+                new_meta[faiss_id] = self.meta[faiss_id]
                 results.append(
                     {
                         "chunk_id": chunk_id,
@@ -233,6 +313,7 @@ class EmbeddingIndex:
                     }
                 )
 
+            self._meta_repo.bulk_upsert(new_meta)
             self._save_state()
 
         page = {"url": url, "title": title, "language": "tr", "content_hash": content_hash}
@@ -375,6 +456,12 @@ class EmbeddingIndex:
         faiss.normalize_L2(a)
         return a
 
+    def _ensure_model(self) -> SentenceTransformer:
+        """Model lazy-load; dışarıdan verilmediyse ilk kullanımda yüklenir."""
+        if self.model is None:
+            self.model = SentenceTransformer(self.model_name)
+        return self.model
+
     def _save_state(self) -> None:
         with open(self.meta_path, "w", encoding="utf-8") as f:
             json.dump({str(k): v for k, v in self.meta.items()}, f, ensure_ascii=False)
@@ -382,16 +469,32 @@ class EmbeddingIndex:
             faiss.write_index(self.index, self.index_path)
 
     def _load_state(self) -> None:
+        file_meta: Dict[int, Dict[str, Any]] = {}
         if os.path.exists(self.meta_path):
             with open(self.meta_path, "r", encoding="utf-8") as f:
-                self.meta = {int(k): v for k, v in json.load(f).items()}
-        else:
-            self.meta = {}
+                file_meta = {int(k): v for k, v in json.load(f).items()}
+
+        try:
+            db_meta = self._meta_repo.load_all()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[vector-store] failed to load meta from Mongo: {exc}", flush=True)
+            db_meta = {}
+
+        merged = dict(file_meta)
+        merged.update(db_meta)
+        self.meta = merged
 
         if os.path.exists(self.index_path):
             self.index = faiss.read_index(self.index_path)
         else:
             self.index = None
+
+        missing_in_db = {fid: meta for fid, meta in merged.items() if fid not in db_meta}
+        if missing_in_db:
+            try:
+                self._meta_repo.bulk_upsert(missing_in_db)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[vector-store] failed to sync meta to Mongo: {exc}", flush=True)
 
         self._next_int_id = (max(self.meta.keys()) + 1) if self.meta else 1
 
