@@ -17,15 +17,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Uygulama dosyalarını kopyala
 COPY . .
 
-# Crawl4AI kurulumunu yap
-RUN crawl4ai-setup
-
-# !!! Asıl eksik kısım chromium install
-RUN playwright install chromium
-
-# Opsiyonel: Kurulum doğrulama
-RUN crawl4ai-doctor
-
 EXPOSE 5003
 
 # Production: Gunicorn ile başlat
