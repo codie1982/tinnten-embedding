@@ -1,4 +1,7 @@
-FROM python:3.11
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
@@ -8,11 +11,8 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Bağımlılık dosyası
-# 1. Requirements dosyasını önce kopyala (değişmedikçe cache’lenir)
 COPY requirements.txt .
-
-# 2. Install (bu layer cache'lenir)
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Uygulama dosyalarını kopyala
 COPY . .
