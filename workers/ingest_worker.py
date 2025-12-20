@@ -171,8 +171,10 @@ class IngestWorker:
     # ------------------------------------------------------------------
     def _process_payload(self, payload: Dict[str, Any]) -> None:
         if self._is_content_index_message(payload):
+            log(f"Received content-index message")
             self._process_content_index_message(payload)
         else:
+            log("Received legacy ingest payload")
             self._process_legacy_payload(payload)
 
     def _is_content_index_message(self, payload: Dict[str, Any]) -> bool:
@@ -200,6 +202,8 @@ class IngestWorker:
         job_id = self._coalesce(payload, "jobId", "job_id")
         trigger = self._coalesce(payload, "trigger") or "manual"
         options_override = payload.get("options") or {}
+
+        log(f"Processing company_id={company_id} documents={document_ids} job_id={job_id}")
 
         documents = self.content_store.get_documents(company_id, document_ids)
         missing_docs = [doc_id for doc_id in document_ids if doc_id not in documents]
@@ -250,6 +254,7 @@ class IngestWorker:
     # ------------------------------------------------------------------
     def _process_single_document(self, document: Dict[str, Any], context: DocumentJobContext) -> None:
         started_at = datetime.now(timezone.utc)
+        log(f"Begin document doc_id={context.document_id} company_id={context.company_id} job_id={context.job_id}")
         options = context.options
         base_stats = self._initial_stats(options)
         self._safe_update_index_state(
@@ -299,6 +304,7 @@ class IngestWorker:
             if detected_lang:
                 metadata = dict(metadata)
                 metadata.setdefault("language", detected_lang)
+                log(f"Detected language for doc_id={context.document_id}: {detected_lang}")
 
         try:
             stats = self._chunk_and_embed(
@@ -330,6 +336,10 @@ class IngestWorker:
             message=f"Embedding completed with {stats['chunkCount']} chunks.",
             state="processing",
             details={"chunks": stats["chunkCount"], "tokenCount": stats["tokenCount"], "charCount": stats["charCount"]},
+        )
+        log(
+            f"Completed doc_id={context.document_id} chunks={stats['chunkCount']} "
+            f"tokens={stats['tokenCount']} chars={stats['charCount']}"
         )
         stats_with_flags = dict(stats)
         stats_with_flags.update(

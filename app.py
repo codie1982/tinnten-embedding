@@ -168,9 +168,9 @@ def _resolve_upload_s3_location(upload_doc, file_doc):
     raise RuntimeError("Unable to resolve S3 object key for upload.")
 
 
-def _vector_upsert_response(target_store, label: str = "upsert"):
+def _vector_upsert_response(target_store, label: str = "upsert", payload: dict | None = None):
     try:
-        payload = request.get_json() or {}
+        payload = payload if payload is not None else (request.get_json() or {})
         text = payload.get("text")
         vector = payload.get("vector")
         external_id = payload.get("external_id")
