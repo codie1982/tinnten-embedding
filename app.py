@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 
 import numpy as np
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -20,6 +20,7 @@ from services import (
 from services.embedding_engine import EmbeddingEngine
 from services.mongo_store import MongoStore
 from services.rabbit_publisher import RabbitPublisher
+from keycloak_service import get_keycloak_service, KeycloakError, KeycloakTokenError
 
 load_dotenv()
 
@@ -68,6 +69,7 @@ ATTRIBUTE_META_COLLECTION = os.getenv("ATTRIBUTE_META_COLLECTION", "attribute_fa
 DEFAULT_INDEX_CHUNK_SIZE = int(os.getenv("EMBED_CHUNK_SIZE") or 1200)
 DEFAULT_INDEX_CHUNK_OVERLAP = int(os.getenv("EMBED_CHUNK_OVERLAP") or 200)
 DEFAULT_INDEX_MIN_CHARS = int(os.getenv("EMBED_MIN_CHARS") or 80)
+REQUIRE_KEYCLOAK_AUTH = (os.getenv("REQUIRE_KEYCLOAK_AUTH") or "true").strip().lower() not in {"0", "false", "no", "off"}
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -99,6 +101,26 @@ job_publisher = RabbitPublisher()
 # Worker’la aynı FAISS + Mongo chunk akışı üzerinden arama için
 chunk_engine = EmbeddingEngine(model_name=MODEL_NAME, index_path=CHUNK_INDEX_PATH)
 chunk_store = MongoStore()
+def _should_require_auth() -> bool:
+    if not REQUIRE_KEYCLOAK_AUTH:
+        return False
+    if request.method == "OPTIONS":
+        return False
+    return True
+
+
+@app.before_request
+def enforce_keycloak_auth():
+    if not _should_require_auth():
+        return None
+    try:
+        token_info = get_keycloak_service().validate_bearer_header(request.headers.get("Authorization"))
+        g.token_info = token_info
+    except KeycloakTokenError as exc:
+        return jsonify({"error": "unauthorized", "reason": str(exc)}), 401
+    except KeycloakError as exc:
+        return jsonify({"error": "keycloak_error", "reason": str(exc)}), 503
+    return None
 
 
 def _get_payload_value(data: dict, *keys: str):
