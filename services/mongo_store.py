@@ -147,6 +147,10 @@ class MongoStore:
         cursor = self.chunks.find({"doc_id": doc_id}).sort("chunk_index", ASCENDING)
         return list(cursor)
 
+    def delete_chunks_by_doc(self, doc_id: str, *, session=None) -> int:
+        result = self.chunks.delete_many({"doc_id": doc_id}, session=session)
+        return int(result.deleted_count)
+
     # ------------------------------------------------------------------
     # Counter helpers
     # ------------------------------------------------------------------
@@ -166,3 +170,16 @@ class MongoStore:
         seq = int(result.get("seq", 0))
         start = seq - count + 1
         return list(range(start, seq + 1))
+
+    # ------------------------------------------------------------------
+    # Document maintenance helpers
+    # ------------------------------------------------------------------
+    def delete_document(self, doc_id: str, *, session=None) -> int:
+        result = self.documents.delete_one({"doc_id": doc_id}, session=session)
+        return int(result.deleted_count)
+
+    def get_documents_by_ids(self, doc_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+        if not doc_ids:
+            return {}
+        cursor = self.documents.find({"doc_id": {"$in": list(doc_ids)}})
+        return {doc["doc_id"]: doc for doc in cursor}

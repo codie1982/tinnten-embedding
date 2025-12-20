@@ -140,5 +140,5 @@ dmypy.json
 cython_debug/
 .env
 
-meta.json
-faiss.index
+*.json
+*.index

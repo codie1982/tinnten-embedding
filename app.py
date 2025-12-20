@@ -1,12 +1,13 @@
 import os
 import uuid
+from datetime import datetime, timezone
 
 import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 
-from vector_store import EmbeddingIndex
+from vector_store import EmbeddingIndex, MetaRepository
 from services import (
     DocumentLoader,
     DocumentDownloadError,
@@ -38,11 +39,12 @@ def _default_meta_path(index_path: str, fallback: str) -> str:
     return os.path.join(base_dir, fallback)
 
 
-INDEX_PATH = _path_from_env("INDEX_PATH", "FAISS_INDEX_PATH", default="faiss.index")
-META_PATH = _path_from_env("META_PATH", default=_default_meta_path(INDEX_PATH, "meta.json"))
+CHUNK_INDEX_PATH = _path_from_env("INDEX_PATH", "FAISS_INDEX_PATH", default="faiss.index")
+GENERAL_INDEX_PATH = _path_from_env("GENERAL_INDEX_PATH", default="general.index")
+GENERAL_META_PATH = _path_from_env("GENERAL_META_PATH", default=_default_meta_path(GENERAL_INDEX_PATH, "general_meta.json"))
 CATEGORY_INDEX_PATH = _path_from_env(
     "CATEGORY_INDEX_PATH",
-    default=os.path.join(os.path.dirname(INDEX_PATH) or ".", "category.index"),
+    default=os.path.join(os.path.dirname(GENERAL_INDEX_PATH) or ".", "category.index"),
 )
 CATEGORY_META_PATH = _path_from_env(
     "CATEGORY_META_PATH",
@@ -50,7 +52,7 @@ CATEGORY_META_PATH = _path_from_env(
 )
 ATTRIBUTE_INDEX_PATH = _path_from_env(
     "ATTRIBUTE_INDEX_PATH",
-    default=os.path.join(os.path.dirname(INDEX_PATH) or ".", "attribute.index"),
+    default=os.path.join(os.path.dirname(GENERAL_INDEX_PATH) or ".", "attribute.index"),
 )
 ATTRIBUTE_META_PATH = _path_from_env(
     "ATTRIBUTE_META_PATH",
@@ -59,6 +61,10 @@ ATTRIBUTE_META_PATH = _path_from_env(
 MODEL_NAME = os.getenv("MODEL_NAME", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
 CATEGORY_MODEL_NAME = os.getenv("CATEGORY_MODEL_NAME", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 ATTRIBUTE_MODEL_NAME = os.getenv("ATTRIBUTE_MODEL_NAME", CATEGORY_MODEL_NAME)
+CATEGORY_META_DB_NAME = os.getenv("CATEGORY_META_DB_NAME")
+CATEGORY_META_COLLECTION = os.getenv("CATEGORY_META_COLLECTION", "category_faiss_metadata")
+ATTRIBUTE_META_DB_NAME = os.getenv("ATTRIBUTE_META_DB_NAME")
+ATTRIBUTE_META_COLLECTION = os.getenv("ATTRIBUTE_META_COLLECTION", "attribute_faiss_metadata")
 DEFAULT_INDEX_CHUNK_SIZE = int(os.getenv("EMBED_CHUNK_SIZE") or 1200)
 DEFAULT_INDEX_CHUNK_OVERLAP = int(os.getenv("EMBED_CHUNK_OVERLAP") or 200)
 DEFAULT_INDEX_MIN_CHARS = int(os.getenv("EMBED_MIN_CHARS") or 80)
@@ -69,25 +75,29 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # Ana metin, kategori ve attribute için ayrı FAISS + gerekirse farklı modeller
 store = EmbeddingIndex(
     model_name=MODEL_NAME,
-    index_path=INDEX_PATH,
-    meta_path=META_PATH,
+    index_path=GENERAL_INDEX_PATH,
+    meta_path=GENERAL_META_PATH,
 )
+category_meta_repo = MetaRepository(db_name=CATEGORY_META_DB_NAME, collection=CATEGORY_META_COLLECTION)
 category_store = EmbeddingIndex(
     model_name=CATEGORY_MODEL_NAME,
     index_path=CATEGORY_INDEX_PATH,
     meta_path=CATEGORY_META_PATH,
+    meta_repo=category_meta_repo,
 )
+attribute_meta_repo = MetaRepository(db_name=ATTRIBUTE_META_DB_NAME, collection=ATTRIBUTE_META_COLLECTION)
 attribute_store = EmbeddingIndex(
     model_name=ATTRIBUTE_MODEL_NAME,
     index_path=ATTRIBUTE_INDEX_PATH,
     meta_path=ATTRIBUTE_META_PATH,
+    meta_repo=attribute_meta_repo,
 )
 upload_store = UploadStore()
 document_loader = DocumentLoader()
 content_store = ContentDocumentStore()
 job_publisher = RabbitPublisher()
 # Worker’la aynı FAISS + Mongo chunk akışı üzerinden arama için
-chunk_engine = EmbeddingEngine(model_name=MODEL_NAME, index_path=INDEX_PATH)
+chunk_engine = EmbeddingEngine(model_name=MODEL_NAME, index_path=CHUNK_INDEX_PATH)
 chunk_store = MongoStore()
 
 
@@ -175,6 +185,35 @@ def _passes_chunk_filters(chunk: dict, filters: dict) -> bool:
     return True
 
 
+def _reconstruct_from_chunks(chunks: list[dict]) -> str:
+    """
+    Rebuild text from overlapping chunks using their char_start offsets.
+    Pads gaps with spaces; trims overlapping prefix from each subsequent chunk.
+    """
+    if not chunks:
+        return ""
+    ordered = sorted(
+        chunks,
+        key=lambda c: (
+            int(c.get("char_start") or c.get("chunk_index") or 0),
+            int(c.get("chunk_index") or 0),
+        ),
+    )
+    buffer: list[str] = []
+    current_len = 0
+    for chunk in ordered:
+        text = chunk.get("text") or ""
+        start = int(chunk.get("char_start") or current_len)
+        if start > current_len:
+            buffer.append(" " * (start - current_len))
+            current_len += start - current_len
+        overlap = current_len - start
+        if overlap < len(text):
+            buffer.append(text[overlap:])
+            current_len += len(text) - overlap
+    return "".join(buffer)
+
+
 def _chunk_search_response(payload: dict):
     k = int(payload.get("k") or 5)
     if k <= 0:
@@ -202,6 +241,11 @@ def _chunk_search_response(payload: dict):
 
     faiss_ids = [int(i) for i in ids[0] if i != -1]
     chunk_docs = chunk_store.get_chunks_by_faiss_ids(faiss_ids)
+    doc_status_map = chunk_store.get_documents_by_ids({c.get("doc_id") for c in chunk_docs.values() if c})
+    radius = int(payload.get("radius") or 0)
+    if radius < 0:
+        return jsonify({"error": "radius must be >= 0"}), 400
+    doc_chunk_cache: dict[str, list[dict]] = {}
 
     results = []
     for idx, score in zip(ids[0], scores[0]):
@@ -210,8 +254,28 @@ def _chunk_search_response(payload: dict):
         chunk = chunk_docs.get(int(idx))
         if not chunk:
             continue
+        doc_info = doc_status_map.get(chunk.get("doc_id"))
+        if doc_info and str(doc_info.get("status")).lower() in {"disabled", "removed"}:
+            continue
         if not _passes_chunk_filters(chunk, filters):
             continue
+        combined_text = chunk.get("text")
+        if radius > 0:
+            doc_id = str(chunk.get("doc_id") or "")
+            chunk_index = chunk.get("chunk_index") if "chunk_index" in chunk else chunk.get("index")
+            if doc_id and chunk_index is not None:
+                if doc_id not in doc_chunk_cache:
+                    doc_chunk_cache[doc_id] = chunk_store.get_chunks_by_doc(doc_id)
+                all_chunks = doc_chunk_cache.get(doc_id) or []
+                try:
+                    target_idx = next(
+                        i for i, c in enumerate(all_chunks) if int(c.get("chunk_index", -1)) == int(chunk_index)
+                    )
+                    start = max(0, target_idx - radius)
+                    end = min(len(all_chunks), target_idx + radius + 1)
+                    combined_text = _reconstruct_from_chunks(all_chunks[start:end])
+                except StopIteration:
+                    combined_text = chunk.get("text")
         results.append(
             {
                 "type": "chunk",
@@ -219,15 +283,31 @@ def _chunk_search_response(payload: dict):
                 "score": float(score),
                 "chunk_id": chunk.get("chunk_id"),
                 "doc_id": chunk.get("doc_id"),
-                "text": chunk.get("text"),
+                "text": combined_text,
                 "metadata": chunk.get("metadata") or {},
                 "char_start": chunk.get("char_start"),
                 "char_end": chunk.get("char_end"),
                 "doc_type": chunk.get("doc_type"),
                 "source": chunk.get("source"),
+                "radius": radius,
             }
         )
     return jsonify({"results": results})
+
+
+def _deactivate_index_state(company_id: str | None, document_id: str, state: str) -> None:
+    if not company_id:
+        return
+    try:
+        content_store.update_index_fields(
+            company_id=company_id,
+            document_id=document_id,
+            state=state,
+            error=None,
+        )
+    except Exception:
+        # Avoid blocking the API on index state updates
+        pass
 
 
 @app.route("/", methods=["GET"])
@@ -295,8 +375,22 @@ def search_vector():
 def upsert_category_vector():
     """
     Insert or update a category vector in its dedicated FAISS index.
+
+    JSON body:
+        parentId (str, optional): Parent category identifier; stored under metadata.parentId.
     """
-    return _vector_upsert_response(category_store, label="category upsert")
+    payload = request.get_json() or {}
+    meta_payload = payload.get("metadata") or {}
+    if meta_payload and not isinstance(meta_payload, dict):
+        return jsonify({"error": "metadata must be an object"}), 400
+
+    parent_id = payload.get("parentId") or payload.get("parent_id") or payload.get("parent")
+    if parent_id is not None:
+        meta_payload = dict(meta_payload)
+        meta_payload["parentId"] = str(parent_id)
+
+    payload["metadata"] = meta_payload
+    return _vector_upsert_response(category_store, label="category upsert", payload=payload)
 
 
 @app.route("/api/v10/categories/search", methods=["POST"])
@@ -311,8 +405,22 @@ def search_category_vector():
 def upsert_attribute_vector():
     """
     Insert or update an attribute vector in its dedicated FAISS index.
+
+    JSON body:
+        categoryId (str, optional): Link attribute to a category; stored under metadata.categoryId.
     """
-    return _vector_upsert_response(attribute_store, label="attribute upsert")
+    payload = request.get_json() or {}
+    meta_payload = payload.get("metadata") or {}
+    if meta_payload and not isinstance(meta_payload, dict):
+        return jsonify({"error": "metadata must be an object"}), 400
+
+    category_id = payload.get("categoryId") or payload.get("category_id") or payload.get("category")
+    if category_id is not None:
+        meta_payload = dict(meta_payload)
+        meta_payload["categoryId"] = str(category_id)
+
+    payload["metadata"] = meta_payload
+    return _vector_upsert_response(attribute_store, label="attribute upsert", payload=payload)
 
 
 @app.route("/api/v10/attributes/search", methods=["POST"])
@@ -321,6 +429,98 @@ def search_attribute_vector():
     Run a similarity search on the attribute FAISS index.
     """
     return _vector_search_response(attribute_store, label="attribute search")
+
+
+@app.route("/api/v10/content/index/deactivate", methods=["POST"])
+def deactivate_document():
+    """
+    Soft-disable a document's embeddings without touching FAISS.
+
+    JSON body:
+        documentId (str, required)
+        companyId (str, optional): Used to update contentdocuments.index.state
+    """
+    payload = request.get_json() or {}
+    document_id = _get_payload_value(payload, "documentId", "document_id", "documentid")
+    company_id = _get_payload_value(payload, "companyId", "company_id", "companyid")
+    if not document_id:
+        return jsonify({"error": "documentId is required"}), 400
+
+    # Mark embedding_documents as disabled
+    try:
+        chunk_store.update_document_status(str(document_id), status="disabled")
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"failed to update document status: {exc}"}), 500
+
+    _deactivate_index_state(company_id, str(document_id), state="disabled")
+    return jsonify({"documentId": str(document_id), "state": "disabled"})
+
+
+@app.route("/api/v10/content/document/<doc_id>/reconstruct", methods=["GET"])
+def reconstruct_document(doc_id: str):
+    """
+    Rebuild and return the concatenated text for a document from its stored chunks.
+    """
+    doc_info = chunk_store.get_documents_by_ids([doc_id]).get(doc_id)
+    if doc_info and str(doc_info.get("status")).lower() in {"disabled", "removed"}:
+        return jsonify({"error": "document_disabled", "documentId": doc_id, "status": doc_info.get("status")}), 409
+
+    chunks = chunk_store.get_chunks_by_doc(doc_id)
+    if not chunks:
+        return jsonify({"error": "not_found", "documentId": doc_id}), 404
+
+    text = _reconstruct_from_chunks(chunks)
+    return jsonify(
+        {
+            "documentId": doc_id,
+            "status": (doc_info or {}).get("status"),
+            "chunkCount": len(chunks),
+            "text": text,
+        }
+    )
+
+
+@app.route("/api/v10/content/index/remove", methods=["POST"])
+def remove_document():
+    """
+    Hard-delete a document's embeddings from FAISS and Mongo.
+
+    JSON body:
+        documentId (str, required)
+        companyId (str, optional): Used to update contentdocuments.index.state
+    """
+    payload = request.get_json() or {}
+    document_id = _get_payload_value(payload, "documentId", "document_id", "documentid")
+    company_id = _get_payload_value(payload, "companyId", "company_id", "companyid")
+    if not document_id:
+        return jsonify({"error": "documentId is required"}), 400
+
+    doc_id_str = str(document_id)
+    chunks = chunk_store.get_chunks_by_doc(doc_id_str)
+    faiss_ids = sorted({int(c["faiss_id"]) for c in chunks if "faiss_id" in c})
+
+    removed_count = 0
+    try:
+        chunk_engine.remove_ids(faiss_ids)
+        removed_count = len(faiss_ids)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"failed to remove from FAISS: {exc}"}), 500
+
+    # Clean Mongo collections
+    deleted_chunks = chunk_store.delete_chunks_by_doc(doc_id_str)
+    chunk_store.delete_document(doc_id_str)
+
+    _deactivate_index_state(company_id, doc_id_str, state="removed")
+
+    return jsonify(
+        {
+            "documentId": doc_id_str,
+            "faissRemoved": removed_count,
+            "chunksDeleted": deleted_chunks,
+            "state": "removed",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    )
 
 
 @app.route("/api/v10/content/index", methods=["POST"])

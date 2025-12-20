@@ -93,6 +93,25 @@ class EmbeddingEngine:
         with self._lock:
             return int(self._index.ntotal) if self._index is not None else 0
 
+    def remove_ids(self, ids: Sequence[int]) -> int:
+        """
+        Remove the supplied FAISS IDs from the index and persist the updated index.
+        Returns the number of IDs requested for removal (not the number actually present).
+        """
+        id_list = [int(i) for i in ids if i is not None]
+        if not id_list:
+            return 0
+        with self._lock:
+            self.reload_if_updated_locked()
+            if self._index is None:
+                return 0
+            id_array = np.asarray(id_list, dtype=np.int64)
+            try:
+                self._index.remove_ids(id_array)
+            finally:
+                self._save_index()
+        return len(id_list)
+
     # ------------------------------------------------------------------
     # Internal methods
     # ------------------------------------------------------------------
