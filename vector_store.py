@@ -510,9 +510,11 @@ class EmbeddingIndex:
         return self.model
 
     def _save_state(self) -> None:
+        self._ensure_parent_dir(self.meta_path)
         with open(self.meta_path, "w", encoding="utf-8") as f:
             json.dump({str(k): v for k, v in self.meta.items()}, f, ensure_ascii=False)
         if self.index is not None:
+            self._ensure_parent_dir(self.index_path)
             faiss.write_index(self.index, self.index_path)
 
     def _load_state(self) -> None:
@@ -577,3 +579,13 @@ class EmbeddingIndex:
                 if item_meta.get(key) != val:
                     return False
         return True
+
+    @staticmethod
+    def _ensure_parent_dir(path: str) -> None:
+        parent = os.path.dirname(path)
+        if not parent:
+            return
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as exc:  # noqa: PERF203
+            raise RuntimeError(f"Unable to create directory for {path}: {exc}") from exc

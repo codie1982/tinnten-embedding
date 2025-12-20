@@ -18,12 +18,40 @@ from services.rabbit_publisher import RabbitPublisher
 
 load_dotenv()
 
-INDEX_PATH = os.getenv("INDEX_PATH", "/data/faiss.index")
-META_PATH  = os.getenv("META_PATH",  "/data/meta.json")
-CATEGORY_INDEX_PATH = os.getenv("CATEGORY_INDEX_PATH", "/data/category.index")
-CATEGORY_META_PATH  = os.getenv("CATEGORY_META_PATH",  "/data/category_meta.json")
-ATTRIBUTE_INDEX_PATH = os.getenv("ATTRIBUTE_INDEX_PATH", "/data/attribute.index")
-ATTRIBUTE_META_PATH  = os.getenv("ATTRIBUTE_META_PATH",  "/data/attribute_meta.json")
+
+def _path_from_env(*keys, default: str) -> str:
+    for key in keys:
+        if not key:
+            continue
+        value = os.getenv(key)
+        if value and value.strip():
+            return value.strip()
+    return default
+
+
+def _default_meta_path(index_path: str, fallback: str) -> str:
+    base_dir = os.path.dirname(index_path) or "."
+    return os.path.join(base_dir, fallback)
+
+
+INDEX_PATH = _path_from_env("INDEX_PATH", "FAISS_INDEX_PATH", default="faiss.index")
+META_PATH = _path_from_env("META_PATH", default=_default_meta_path(INDEX_PATH, "meta.json"))
+CATEGORY_INDEX_PATH = _path_from_env(
+    "CATEGORY_INDEX_PATH",
+    default=os.path.join(os.path.dirname(INDEX_PATH) or ".", "category.index"),
+)
+CATEGORY_META_PATH = _path_from_env(
+    "CATEGORY_META_PATH",
+    default=_default_meta_path(CATEGORY_INDEX_PATH, "category_meta.json"),
+)
+ATTRIBUTE_INDEX_PATH = _path_from_env(
+    "ATTRIBUTE_INDEX_PATH",
+    default=os.path.join(os.path.dirname(INDEX_PATH) or ".", "attribute.index"),
+)
+ATTRIBUTE_META_PATH = _path_from_env(
+    "ATTRIBUTE_META_PATH",
+    default=_default_meta_path(ATTRIBUTE_INDEX_PATH, "attribute_meta.json"),
+)
 MODEL_NAME = os.getenv("MODEL_NAME", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
 CATEGORY_MODEL_NAME = os.getenv("CATEGORY_MODEL_NAME", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 ATTRIBUTE_MODEL_NAME = os.getenv("ATTRIBUTE_MODEL_NAME", CATEGORY_MODEL_NAME)
