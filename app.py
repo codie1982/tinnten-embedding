@@ -160,7 +160,7 @@ def upsert_vector():
         vector (list[float], optional): Raw vector to upsert.
         external_id (str, optional): Reference identifier to store with metadata.
         metadata (dict, optional): Arbitrary metadata payload.
-        id (int, optional): Existing FAISS ID to overwrite; auto-assigned otherwise.
+        id (int | str, optional): Existing FAISS ID to overwrite; accepts custom text keys too.
     """
     return _vector_upsert_response(store, label="vector upsert")
 

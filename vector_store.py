@@ -130,7 +130,7 @@ class EmbeddingIndex:
         vector: Optional[List[float]],
         external_id: Optional[str],
         metadata: Optional[Dict[str, Any]],
-        int_id: Optional[int] = None,
+        int_id: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Tek bir vektörü FAISS'e ekler/günceller.
@@ -154,27 +154,31 @@ class EmbeddingIndex:
             self._ensure_index(dim)
             self._normalize(v)
 
-            if int_id is None:
-                int_id = self._next_int_id
+            faiss_id, alias_source = self._resolve_faiss_id(int_id)
+            if faiss_id is None:
+                faiss_id = self._next_int_id
                 self._next_int_id += 1
             else:
-                # Varsa eski kaydı çıkar (yoksa FAISS zaten ignore eder)
                 try:
-                    self.index.remove_ids(np.array([int(int_id)], dtype=np.int64))
+                    self.index.remove_ids(np.array([int(faiss_id)], dtype=np.int64))
                 except Exception:
                     pass
 
-            self.index.add_with_ids(v, np.array([int(int_id)], dtype=np.int64))
+            self.index.add_with_ids(v, np.array([int(faiss_id)], dtype=np.int64))
+            existing_meta = self.meta.get(int(faiss_id), {})
             meta_entry = {
-                "external_id": external_id or str(uuid.uuid4()),
-                "text": text if text else self.meta.get(int(int_id), {}).get("text"),
+                "external_id": external_id
+                or alias_source
+                or existing_meta.get("external_id")
+                or str(uuid.uuid4()),
+                "text": text if text else existing_meta.get("text"),
                 "metadata": metadata or {},
             }
-            self.meta[int(int_id)] = meta_entry
-            self._meta_repo.upsert_one(int(int_id), meta_entry)
+            self.meta[int(faiss_id)] = meta_entry
+            self._meta_repo.upsert_one(int(faiss_id), meta_entry)
             self._save_state()
 
-        return {"id": int(int_id), "external_id": self.meta[int(int_id)]["external_id"]}
+        return {"id": int(faiss_id), "external_id": self.meta[int(faiss_id)]["external_id"]}
 
     def search(
         self,
@@ -450,6 +454,49 @@ class EmbeddingIndex:
         return chunks
 
     # ---------- Internal helpers ----------
+
+    def _resolve_faiss_id(self, raw_id: Optional[Any]) -> Tuple[Optional[int], Optional[str]]:
+        """
+        Normalize incoming FAISS id. Accepts native ints, numeric strings, or string keys.
+
+        Returns (faiss_id, alias) where alias stores the original text id if one was provided.
+        """
+        if raw_id is None:
+            return None, None
+
+        candidate = raw_id
+        if isinstance(candidate, np.generic):
+            candidate = candidate.item()
+
+        if isinstance(candidate, (int, np.integer)):
+            return int(candidate), None
+
+        if isinstance(candidate, float) and float(candidate).is_integer():
+            return int(candidate), None
+
+        if isinstance(candidate, str):
+            cleaned = candidate.strip()
+            if not cleaned:
+                return None, None
+            if re.fullmatch(r"[+-]?\d+", cleaned):
+                return int(cleaned), None
+            return self._string_id_to_faiss_id(cleaned), cleaned
+
+        raise ValueError("id must be an integer, numeric string, or text identifier")
+
+    @staticmethod
+    def _string_id_to_faiss_id(value: str) -> int:
+        """
+        Deterministically map a string id to the upper half of the positive int64 range.
+        """
+        digest = hashlib.sha1(value.encode("utf-8")).digest()
+        # Keep 62 bits to avoid flipping the int64 sign bit, then reserve the 62nd bit
+        # so we don't collide with sequential ids allocated from the low range.
+        mask = (1 << 62) - 1
+        high_range_flag = 1 << 62
+        hashed = int.from_bytes(digest[:8], byteorder="big") & mask
+        # Ensure we don't accidentally zero out the lower bits
+        return high_range_flag | hashed
 
     @staticmethod
     def _normalize(a: np.ndarray) -> np.ndarray:
