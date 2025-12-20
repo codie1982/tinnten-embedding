@@ -1,5 +1,7 @@
 import os
 import uuid
+
+import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -14,6 +16,8 @@ from services import (
     ContentDocumentStore,
     normalize_index_options,
 )
+from services.embedding_engine import EmbeddingEngine
+from services.mongo_store import MongoStore
 from services.rabbit_publisher import RabbitPublisher
 
 load_dotenv()
@@ -82,6 +86,9 @@ upload_store = UploadStore()
 document_loader = DocumentLoader()
 content_store = ContentDocumentStore()
 job_publisher = RabbitPublisher()
+# Worker’la aynı FAISS + Mongo chunk akışı üzerinden arama için
+chunk_engine = EmbeddingEngine(model_name=MODEL_NAME, index_path=INDEX_PATH)
+chunk_store = MongoStore()
 
 
 def _get_payload_value(data: dict, *keys: str):
@@ -143,9 +150,9 @@ def _vector_upsert_response(target_store, label: str = "upsert"):
         return jsonify({"error": f"{label} failed: {exc}"}), 400
 
 
-def _vector_search_response(target_store, label: str = "search"):
+def _vector_search_response(target_store, label: str = "search", payload: dict | None = None):
     try:
-        payload = request.get_json() or {}
+        payload = payload if payload is not None else (request.get_json() or {})
         text = payload.get("text")
         vector = payload.get("vector")
         k = int(payload.get("k") or 5)
@@ -154,6 +161,73 @@ def _vector_search_response(target_store, label: str = "search"):
         return jsonify({"results": results})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"{label} failed: {exc}"}), 400
+
+
+def _passes_chunk_filters(chunk: dict, filters: dict) -> bool:
+    for key, val in (filters or {}).items():
+        if key.startswith("metadata."):
+            sub = key.split(".", 1)[1]
+            if (chunk.get("metadata") or {}).get(sub) != val:
+                return False
+        else:
+            if chunk.get(key) != val:
+                return False
+    return True
+
+
+def _chunk_search_response(payload: dict):
+    k = int(payload.get("k") or 5)
+    if k <= 0:
+        return jsonify({"error": "k must be positive"}), 400
+
+    vector = payload.get("vector")
+    if vector is None:
+        text = payload.get("text")
+        if not text or not isinstance(text, str) or not text.strip():
+            return jsonify({"error": "Provide either 'text' or 'vector'."}), 400
+        query_vec = chunk_engine.encode([text], batch_size=1)
+    else:
+        arr = np.array(vector, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        if arr.ndim != 2:
+            return jsonify({"error": "vector must be 1D or 2D array"}), 400
+        query_vec = arr.astype(np.float32, copy=False)
+
+    filters = payload.get("filter") or {}
+    try:
+        scores, ids = chunk_engine.search(query_vec, k)
+    except RuntimeError:
+        return jsonify({"results": []})
+
+    faiss_ids = [int(i) for i in ids[0] if i != -1]
+    chunk_docs = chunk_store.get_chunks_by_faiss_ids(faiss_ids)
+
+    results = []
+    for idx, score in zip(ids[0], scores[0]):
+        if idx == -1:
+            continue
+        chunk = chunk_docs.get(int(idx))
+        if not chunk:
+            continue
+        if not _passes_chunk_filters(chunk, filters):
+            continue
+        results.append(
+            {
+                "type": "chunk",
+                "id": int(idx),
+                "score": float(score),
+                "chunk_id": chunk.get("chunk_id"),
+                "doc_id": chunk.get("doc_id"),
+                "text": chunk.get("text"),
+                "metadata": chunk.get("metadata") or {},
+                "char_start": chunk.get("char_start"),
+                "char_end": chunk.get("char_end"),
+                "doc_type": chunk.get("doc_type"),
+                "source": chunk.get("source"),
+            }
+        )
+    return jsonify({"results": results})
 
 
 @app.route("/", methods=["GET"])
@@ -198,12 +272,23 @@ def search_vector():
     Run a similarity search against the FAISS index.
 
     JSON body:
-        text (str, optional): Query text to encode if vector omitted.
-        vector (list[float], optional): Pre-computed query vector.
+        type (str, optional): "chunk" (default), "category", "attribute", or "vector"
+        text / vector (optional): Query input; vector skips encoding
         k (int, optional): Number of results to return (default 5).
         filter (dict, optional): Metadata filters applied to stored entries.
     """
-    return _vector_search_response(store, label="vector search")
+    payload = request.get_json() or {}
+    target = (payload.get("type") or payload.get("target") or "chunk").strip().lower()
+
+    if target in {"chunk", "chunks", "content"}:
+        return _chunk_search_response(payload)
+    if target in {"category", "categories"}:
+        return _vector_search_response(category_store, label="category search", payload=payload)
+    if target in {"attribute", "attributes"}:
+        return _vector_search_response(attribute_store, label="attribute search", payload=payload)
+
+    # Fallback to legacy/vector search against the general index
+    return _vector_search_response(store, label="vector search", payload=payload)
 
 
 @app.route("/api/v10/categories/upsert", methods=["POST"])
