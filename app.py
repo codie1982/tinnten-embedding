@@ -1,4 +1,5 @@
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -40,7 +41,13 @@ def _default_meta_path(index_path: str, fallback: str) -> str:
     return os.path.join(base_dir, fallback)
 
 
-CHUNK_INDEX_PATH = _path_from_env("INDEX_PATH", "FAISS_INDEX_PATH", default="faiss.index")
+CHUNK_INDEX_PATH = _path_from_env(
+    "CHUNK_INDEX_PATH",
+    "CONTENT_INDEX_PATH",
+    "FAISS_INDEX_PATH",
+    "INDEX_PATH",
+    default="faiss.index",
+)
 GENERAL_INDEX_PATH = _path_from_env("GENERAL_INDEX_PATH", default="general.index")
 GENERAL_META_PATH = _path_from_env("GENERAL_META_PATH", default=_default_meta_path(GENERAL_INDEX_PATH, "general_meta.json"))
 CATEGORY_INDEX_PATH = _path_from_env(
@@ -60,6 +67,7 @@ ATTRIBUTE_META_PATH = _path_from_env(
     default=_default_meta_path(ATTRIBUTE_INDEX_PATH, "attribute_meta.json"),
 )
 MODEL_NAME = os.getenv("MODEL_NAME", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
+CHUNK_MODEL_NAME = os.getenv("CHUNK_MODEL_NAME", MODEL_NAME)
 CATEGORY_MODEL_NAME = os.getenv("CATEGORY_MODEL_NAME", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 ATTRIBUTE_MODEL_NAME = os.getenv("ATTRIBUTE_MODEL_NAME", CATEGORY_MODEL_NAME)
 CATEGORY_META_DB_NAME = os.getenv("CATEGORY_META_DB_NAME")
@@ -70,6 +78,16 @@ DEFAULT_INDEX_CHUNK_SIZE = int(os.getenv("EMBED_CHUNK_SIZE") or 1200)
 DEFAULT_INDEX_CHUNK_OVERLAP = int(os.getenv("EMBED_CHUNK_OVERLAP") or 200)
 DEFAULT_INDEX_MIN_CHARS = int(os.getenv("EMBED_MIN_CHARS") or 80)
 REQUIRE_KEYCLOAK_AUTH = (os.getenv("REQUIRE_KEYCLOAK_AUTH") or "true").strip().lower() not in {"0", "false", "no", "off"}
+CONTENT_INDEX_DELAY_SECONDS = int(os.getenv("CONTENT_INDEX_DELAY_SECONDS") or 10)
+CONTENT_INDEX_PUBLISH_RETRIES = int(os.getenv("CONTENT_INDEX_PUBLISH_RETRIES") or 3)
+CONTENT_INDEX_PUBLISH_RETRY_DELAY_SECONDS = float(os.getenv("CONTENT_INDEX_PUBLISH_RETRY_DELAY_SECONDS") or 2.0)
+ALLOW_UNAUTH_CONTENT_INDEX = (os.getenv("ALLOW_UNAUTH_CONTENT_INDEX") or "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+}
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -99,12 +117,14 @@ document_loader = DocumentLoader()
 content_store = ContentDocumentStore()
 job_publisher = RabbitPublisher()
 # Worker’la aynı FAISS + Mongo chunk akışı üzerinden arama için
-chunk_engine = EmbeddingEngine(model_name=MODEL_NAME, index_path=CHUNK_INDEX_PATH)
+chunk_engine = EmbeddingEngine(model_name=CHUNK_MODEL_NAME, index_path=CHUNK_INDEX_PATH)
 chunk_store = MongoStore()
 def _should_require_auth() -> bool:
     if not REQUIRE_KEYCLOAK_AUTH:
         return False
     if request.method == "OPTIONS":
+        return False
+    if ALLOW_UNAUTH_CONTENT_INDEX and request.path == "/api/v10/content/index":
         return False
     return True
 
@@ -260,6 +280,22 @@ def _chunk_search_response(payload: dict):
         scores, ids = chunk_engine.search(query_vec, k)
     except RuntimeError:
         return jsonify({"results": []})
+    except ValueError as exc:
+        index_obj = getattr(chunk_engine, "_index", None)
+        index_dim = getattr(index_obj, "d", None)
+        return (
+            jsonify(
+                {
+                    "error": str(exc),
+                    "hint": "Embedding dimension mismatch: ensure CHUNK_MODEL_NAME matches the model used to build the index.",
+                    "index_path": CHUNK_INDEX_PATH,
+                    "model_name": getattr(chunk_engine, "model_name", None),
+                    "index_dim": index_dim,
+                    "query_dim": int(query_vec.shape[1]),
+                }
+            ),
+            400,
+        )
 
     faiss_ids = [int(i) for i in ids[0] if i != -1]
     chunk_docs = chunk_store.get_chunks_by_faiss_ids(faiss_ids)
@@ -335,8 +371,20 @@ def _deactivate_index_state(company_id: str | None, document_id: str, state: str
 @app.route("/", methods=["GET"])
 def root():
     """Health check: returns basic status text and current FAISS index size."""
-    size = int(store.index.ntotal) if store.index is not None else 0
-    return jsonify({"message": "tinnten-embedding up", "index_size": size})
+    general_size = int(store.index.ntotal) if store.index is not None else 0
+    try:
+        chunk_size = chunk_engine.count()
+    except Exception:
+        chunk_size = None
+    return jsonify(
+        {
+            "message": "tinnten-embedding up",
+            "index_size": general_size,
+            "chunk_index_size": chunk_size,
+            "chunk_index_path": CHUNK_INDEX_PATH,
+            "chunk_model_name": CHUNK_MODEL_NAME,
+        }
+    )
 
 @app.route("/api/v10/llm/vector", methods=["POST"])
 def generate_vector():
@@ -587,6 +635,12 @@ def queue_content_index():
         job_id = str(job_id)
     else:
         job_id = str(uuid.uuid4())
+    app.logger.info(
+        "Content index request received (companyId=%s documentId=%s jobId=%s)",
+        company_id,
+        document_id,
+        job_id,
+    )
 
     raw_options = payload.get("indexOptions") or payload.get("options") or {}
     try:
@@ -707,10 +761,45 @@ def queue_content_index():
     if user_id:
         message["userId"] = user_id
 
-    try:
-        job_publisher.publish(message)
-    except Exception as exc:  # noqa: BLE001
-        error_msg = f"failed to enqueue indexing job: {exc}"
+    delay_seconds = max(0, int(CONTENT_INDEX_DELAY_SECONDS or 0))
+    if delay_seconds:
+        app.logger.info(
+            "Content index enqueue delayed %ss (companyId=%s documentId=%s jobId=%s)",
+            delay_seconds,
+            company_id,
+            document_id,
+            job_id,
+        )
+        time.sleep(delay_seconds)
+        app.logger.info(
+            "Content index enqueue delay complete (companyId=%s documentId=%s jobId=%s)",
+            company_id,
+            document_id,
+            job_id,
+        )
+
+    publish_retries = max(1, int(CONTENT_INDEX_PUBLISH_RETRIES or 1))
+    publish_delay = float(CONTENT_INDEX_PUBLISH_RETRY_DELAY_SECONDS or 0)
+    last_exc: Exception | None = None
+    for attempt in range(1, publish_retries + 1):
+        try:
+            job_publisher.publish(message)
+            last_exc = None
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < publish_retries and publish_delay > 0:
+                app.logger.warning(
+                    "Failed to enqueue indexing job (attempt %s/%s); retrying in %ss: %s",
+                    attempt,
+                    publish_retries,
+                    publish_delay,
+                    exc,
+                )
+                time.sleep(publish_delay)
+
+    if last_exc is not None:
+        error_msg = f"failed to enqueue indexing job: {last_exc}"
         content_store.update_index_fields(
             company_id=company_id,
             document_id=document_id,

@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -33,6 +34,8 @@ LEGACY_QUEUE_NAME = "embedding.ingest"
 DEFAULT_CHUNK_SIZE = 1200
 DEFAULT_CHUNK_OVERLAP = 200
 DEFAULT_BATCH_SIZE = 32
+DEFAULT_CONTENT_DOC_LOOKUP_RETRIES = 3
+DEFAULT_CONTENT_DOC_LOOKUP_DELAY_SECONDS = 2.0
 
 
 def log(msg: str) -> None:
@@ -81,10 +84,13 @@ class IngestWorker:
         self.chunk_overlap = int(os.getenv("EMBED_CHUNK_OVERLAP") or DEFAULT_CHUNK_OVERLAP)
         self.batch_size = int(os.getenv("EMBED_BATCH_SIZE") or DEFAULT_BATCH_SIZE)
         model_name = os.getenv(
-            "MODEL_NAME",
-            "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+            "CHUNK_MODEL_NAME",
+            os.getenv(
+                "MODEL_NAME",
+                "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+            ),
         )
-        index_path = os.getenv("FAISS_INDEX_PATH", "faiss.index")
+        index_path = os.getenv("CHUNK_INDEX_PATH") or os.getenv("FAISS_INDEX_PATH") or "faiss.index"
 
         self.store = MongoStore()
         self.content_store = ContentDocumentStore()
@@ -205,8 +211,24 @@ class IngestWorker:
 
         log(f"Processing company_id={company_id} documents={document_ids} job_id={job_id}")
 
-        documents = self.content_store.get_documents(company_id, document_ids)
-        missing_docs = [doc_id for doc_id in document_ids if doc_id not in documents]
+        lookup_retries = int(os.getenv("CONTENT_DOC_LOOKUP_RETRIES") or DEFAULT_CONTENT_DOC_LOOKUP_RETRIES)
+        lookup_delay = float(os.getenv("CONTENT_DOC_LOOKUP_DELAY_SECONDS") or DEFAULT_CONTENT_DOC_LOOKUP_DELAY_SECONDS)
+        attempts = max(1, lookup_retries)
+
+        documents: Dict[str, Dict[str, Any]] = {}
+        missing_docs: List[str] = []
+        for attempt in range(1, attempts + 1):
+            documents = self.content_store.get_documents(company_id, document_ids)
+            missing_docs = [doc_id for doc_id in document_ids if doc_id not in documents]
+            if not missing_docs:
+                break
+            if attempt < attempts and lookup_delay > 0:
+                log(
+                    f"Documents missing from contentdocuments (attempt {attempt}/{attempts}); "
+                    f"retrying in {lookup_delay}s: {missing_docs}"
+                )
+                time.sleep(lookup_delay)
+
         if missing_docs:
             for doc_id in missing_docs:
                 ctx = DocumentJobContext(

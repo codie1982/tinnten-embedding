@@ -21,12 +21,13 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 keycloak = get_keycloak_service()
 
 MODEL_NAME = os.getenv("MODEL_NAME", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
-INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "faiss.index")
+CHUNK_MODEL_NAME = os.getenv("CHUNK_MODEL_NAME", MODEL_NAME)
+INDEX_PATH = os.getenv("CHUNK_INDEX_PATH") or os.getenv("FAISS_INDEX_PATH") or "faiss.index"
 DEFAULT_CHUNK_SIZE = int(os.getenv("EMBED_CHUNK_SIZE") or 1200)
 DEFAULT_CHUNK_OVERLAP = int(os.getenv("EMBED_CHUNK_OVERLAP") or 200)
 DEFAULT_MIN_CHARS = int(os.getenv("EMBED_MIN_CHARS") or 80)
 
-embedding_engine = EmbeddingEngine(model_name=MODEL_NAME, index_path=INDEX_PATH)
+embedding_engine = EmbeddingEngine(model_name=CHUNK_MODEL_NAME, index_path=INDEX_PATH)
 mongo_store = MongoStore()
 rabbit_publisher = RabbitPublisher()
 upload_store = UploadStore()

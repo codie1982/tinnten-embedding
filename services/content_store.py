@@ -159,8 +159,14 @@ class ContentDocumentStore:
             return {}
         doc_ids = [str(doc_id) for doc_id in document_ids]
         documents: Dict[str, Dict[str, Any]] = {}
+
+        company_obj = _safe_object_id(company_id)
+        company_filters: List[Dict[str, Any]] = [{"companyId": company_id}, {"companyid": company_id}]
+        if company_obj is not None:
+            company_filters.extend([{"companyId": company_obj}, {"companyid": company_obj}])
+
         cursor = self.documents.find(
-            {"companyId": company_id, "documentId": {"$in": doc_ids}},
+            {"$and": [{"$or": company_filters}, {"documentId": {"$in": doc_ids}}]},
             projection,
         )
         for doc in cursor:
@@ -171,9 +177,8 @@ class ContentDocumentStore:
         if missing_ids:
             object_ids = [oid for oid in (_safe_object_id(doc_id) for doc_id in missing_ids) if oid]
             if object_ids:
-                company_obj = _safe_object_id(company_id) or company_id
                 cursor = self.documents.find(
-                    {"companyid": company_obj, "_id": {"$in": object_ids}},
+                    {"$and": [{"$or": company_filters}, {"_id": {"$in": object_ids}}]},
                     projection,
                 )
                 for doc in cursor:
@@ -182,14 +187,22 @@ class ContentDocumentStore:
         return documents
 
     def get_document(self, company_id: str, document_id: str) -> Optional[Dict[str, Any]]:
-        doc = self.documents.find_one({"companyId": company_id, "documentId": document_id})
-        if doc:
-            return doc
-        company_obj = _safe_object_id(company_id) or company_id
-        doc_obj = _safe_object_id(document_id)
-        if doc_obj:
-            return self.documents.find_one({"companyid": company_obj, "_id": doc_obj})
-        return None
+        doc_id_str = str(document_id)
+        company_obj = _safe_object_id(company_id)
+        doc_obj = _safe_object_id(doc_id_str)
+
+        company_filters: List[Dict[str, Any]] = [{"companyId": company_id}, {"companyid": company_id}]
+        if company_obj is not None:
+            company_filters.extend([{"companyId": company_obj}, {"companyid": company_obj}])
+
+        selectors: List[Dict[str, Any]] = [
+            {"$and": [{"$or": company_filters}, {"documentId": doc_id_str}]},
+        ]
+        if doc_obj is not None:
+            selectors.append({"$and": [{"$or": company_filters}, {"documentId": doc_obj}]})
+            selectors.append({"$and": [{"$or": company_filters}, {"_id": doc_obj}]})
+
+        return self.documents.find_one({"$or": selectors})
 
     # ------------------------------------------------------------------
     # Index state helpers
