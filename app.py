@@ -501,6 +501,21 @@ def search_attribute_vector():
     return _vector_search_response(attribute_store, label="attribute search")
 
 
+@app.route("/api/v10/content/search", methods=["POST"])
+def search_content_chunks():
+    """
+    Run a similarity search on the chunk/content FAISS index created via `/api/v10/content/index`.
+
+    JSON body:
+        text / vector (optional): Query input; vector skips encoding
+        k (int, optional): Number of results to return (default 5).
+        filter (dict, optional): Metadata filters applied to stored chunks.
+        radius (int, optional): Reconstruct surrounding chunks for more context.
+    """
+    payload = request.get_json() or {}
+    return _chunk_search_response(payload)
+
+
 @app.route("/api/v10/content/index/deactivate", methods=["POST"])
 def deactivate_document():
     """

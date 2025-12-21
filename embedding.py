@@ -192,6 +192,7 @@ def ingest_upload():
 
 
 @app.route("/api/v10/vector/search", methods=["POST"])
+@app.route("/api/v10/content/search", methods=["POST"])
 @require_service_token
 def search_vector():
     data = request.get_json() or {}

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import Iterable, List, Sequence, Tuple
 
 import faiss
@@ -25,6 +26,13 @@ class EmbeddingEngine:
     ) -> None:
         self.model_name = model_name
         self.index_path = index_path
+        self.auto_reset_on_error = (os.getenv("FAISS_AUTO_RESET_ON_ERROR") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
         self._lock = threading.RLock()
         self._model = SentenceTransformer(self.model_name)
         self._index: faiss.IndexIDMap2 | None = None
@@ -115,19 +123,45 @@ class EmbeddingEngine:
     # ------------------------------------------------------------------
     # Internal methods
     # ------------------------------------------------------------------
+    def _quarantine_index_file(self, *, reason: str) -> None:
+        """
+        Move the current index file aside so a fresh index can be created.
+        """
+        if not os.path.exists(self.index_path):
+            return
+        suffix = time.strftime("%Y%m%d-%H%M%S")
+        target = f"{self.index_path}.corrupt.{suffix}"
+        try:
+            os.replace(self.index_path, target)
+        except OSError:
+            return
+        print(f"[embedding-engine] quarantined invalid index {self.index_path} -> {target} ({reason})", flush=True)
+
     def _load_index(self) -> None:
         if not os.path.exists(self.index_path):
             return
         with self._lock:
-            index = faiss.read_index(self.index_path)
-            if not isinstance(index, faiss.IndexIDMap):
-                # Wrap plain indices to support explicit IDs
-                index = faiss.IndexIDMap(index)
-            self._index = faiss.downcast_index(index)
-            self._dimension = self._index.d
             try:
-                self._index_mtime = os.path.getmtime(self.index_path)
-            except OSError:
+                index = faiss.read_index(self.index_path)
+                if not isinstance(index, faiss.IndexIDMap):
+                    # Wrap plain indices to support explicit IDs
+                    index = faiss.IndexIDMap(index)
+                self._index = faiss.downcast_index(index)
+                self._dimension = int(self._index.d)
+                if self._dimension <= 0:
+                    raise ValueError(f"invalid FAISS index dimension: {self._dimension}")
+                try:
+                    self._index_mtime = os.path.getmtime(self.index_path)
+                except OSError:
+                    self._index_mtime = None
+            except Exception as exc:  # noqa: BLE001
+                # If the index file is corrupt or not a FAISS index, avoid crashing the service.
+                # Optionally move it aside so ingest can rebuild a fresh one.
+                print(f"[embedding-engine] failed to load index {self.index_path}: {exc}", flush=True)
+                if self.auto_reset_on_error:
+                    self._quarantine_index_file(reason=str(exc))
+                self._index = None
+                self._dimension = None
                 self._index_mtime = None
 
     def _save_index(self) -> None:
@@ -168,9 +202,19 @@ class EmbeddingEngine:
         except OSError:
             return
         if self._index is None or self._index_mtime is None or mtime > self._index_mtime:
-            index = faiss.read_index(self.index_path)
-            if not isinstance(index, faiss.IndexIDMap):
-                index = faiss.IndexIDMap(index)
-            self._index = faiss.downcast_index(index)
-            self._dimension = self._index.d
-            self._index_mtime = mtime
+            try:
+                index = faiss.read_index(self.index_path)
+                if not isinstance(index, faiss.IndexIDMap):
+                    index = faiss.IndexIDMap(index)
+                self._index = faiss.downcast_index(index)
+                self._dimension = int(self._index.d)
+                if self._dimension <= 0:
+                    raise ValueError(f"invalid FAISS index dimension: {self._dimension}")
+                self._index_mtime = mtime
+            except Exception as exc:  # noqa: BLE001
+                print(f"[embedding-engine] failed to reload index {self.index_path}: {exc}", flush=True)
+                if self.auto_reset_on_error:
+                    self._quarantine_index_file(reason=str(exc))
+                self._index = None
+                self._dimension = None
+                self._index_mtime = None
