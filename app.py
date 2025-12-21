@@ -612,6 +612,8 @@ def queue_content_index():
     metadata.setdefault("documentId", document_id)
 
     upload_id = _get_payload_value(payload, "uploadId", "upload_id", "uploadid")
+    if not upload_id and isinstance(existing_doc, dict):
+        upload_id = _get_payload_value(existing_doc, "uploadId", "upload_id", "uploadid")
     if upload_id:
         upload_id = str(upload_id)
         metadata.setdefault("uploadId", upload_id)
@@ -622,6 +624,10 @@ def queue_content_index():
     url = payload.get("url")
     if url is not None and not isinstance(url, str):
         return jsonify({"error": "url must be a string"}), 400
+    if not url and isinstance(existing_doc, dict):
+        existing_url = existing_doc.get("url")
+        if isinstance(existing_url, str) and existing_url.strip():
+            url = existing_url
 
     source = None
     if upload_id:
@@ -650,14 +656,14 @@ def queue_content_index():
 
     doc_type = options.get("scope")
     if not doc_type and isinstance(existing_doc, dict):
-        doc_type = existing_doc.get("docType")
+        doc_type = existing_doc.get("docType") or existing_doc.get("type")
     if doc_type:
         source.setdefault("docType", doc_type)
         metadata.setdefault("scope", doc_type)
 
     title = payload.get("title") or metadata.get("title")
     if not title and isinstance(existing_doc, dict):
-        title = existing_doc.get("title")
+        title = existing_doc.get("title") or existing_doc.get("name")
 
     try:
         doc = content_store.upsert_document_with_source(

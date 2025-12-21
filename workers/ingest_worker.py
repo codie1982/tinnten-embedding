@@ -734,10 +734,13 @@ class IngestWorker:
         upload_id = (
             source_info.get("uploadId")
             or source_info.get("upload_id")
+            or source_info.get("uploadid")
             or document.get("uploadId")
             or document.get("upload_id")
+            or document.get("uploadid")
             or metadata.get("uploadId")
             or metadata.get("upload_id")
+            or metadata.get("uploadid")
         )
 
         payload_section = document.get("payload") if isinstance(document.get("payload"), dict) else {}
@@ -783,8 +786,15 @@ class IngestWorker:
                 metadata.update(value)
         if "title" in document:
             metadata.setdefault("title", document.get("title"))
-        metadata.setdefault("companyId", document.get("companyId"))
-        metadata.setdefault("documentId", document.get("documentId"))
+        company_id = document.get("companyId") or document.get("companyid")
+        if company_id is not None:
+            metadata.setdefault("companyId", str(company_id))
+        document_id = document.get("documentId") or document.get("documentid") or document.get("_id")
+        if document_id is not None:
+            metadata.setdefault("documentId", str(document_id))
+        upload_id = document.get("uploadId") or document.get("upload_id") or document.get("uploadid")
+        if upload_id is not None:
+            metadata.setdefault("uploadId", upload_id)
         return metadata
 
     @staticmethod

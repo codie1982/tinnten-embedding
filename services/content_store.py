@@ -7,6 +7,8 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence
 
+from bson import ObjectId
+from bson.errors import InvalidId
 from pymongo import ASCENDING, ReturnDocument
 from pymongo.collection import Collection
 
@@ -31,6 +33,19 @@ def _coerce_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on", "t"}
     return bool(value)
+
+
+def _safe_object_id(value: Any) -> Optional[ObjectId]:
+    if isinstance(value, ObjectId):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            return ObjectId(value)
+        except (InvalidId, TypeError):
+            return None
+    return None
 
 
 def normalize_index_options(
@@ -133,14 +148,39 @@ class ContentDocumentStore:
         """
         if not document_ids:
             return {}
+        doc_ids = [str(doc_id) for doc_id in document_ids]
+        documents: Dict[str, Dict[str, Any]] = {}
         cursor = self.documents.find(
-            {"companyId": company_id, "documentId": {"$in": list(document_ids)}},
+            {"companyId": company_id, "documentId": {"$in": doc_ids}},
             projection,
         )
-        return {doc["documentId"]: doc for doc in cursor}
+        for doc in cursor:
+            key = str(doc.get("documentId") or doc.get("_id"))
+            documents[key] = doc
+
+        missing_ids = [doc_id for doc_id in doc_ids if doc_id not in documents]
+        if missing_ids:
+            object_ids = [oid for oid in (_safe_object_id(doc_id) for doc_id in missing_ids) if oid]
+            if object_ids:
+                company_obj = _safe_object_id(company_id) or company_id
+                cursor = self.documents.find(
+                    {"companyid": company_obj, "_id": {"$in": object_ids}},
+                    projection,
+                )
+                for doc in cursor:
+                    key = str(doc.get("documentId") or doc.get("_id"))
+                    documents[key] = doc
+        return documents
 
     def get_document(self, company_id: str, document_id: str) -> Optional[Dict[str, Any]]:
-        return self.documents.find_one({"companyId": company_id, "documentId": document_id})
+        doc = self.documents.find_one({"companyId": company_id, "documentId": document_id})
+        if doc:
+            return doc
+        company_obj = _safe_object_id(company_id) or company_id
+        doc_obj = _safe_object_id(document_id)
+        if doc_obj:
+            return self.documents.find_one({"companyid": company_obj, "_id": doc_obj})
+        return None
 
     # ------------------------------------------------------------------
     # Index state helpers
@@ -167,6 +207,7 @@ class ContentDocumentStore:
         updates: Dict[str, Any] = {"index.lastRunAt": now}
         if state is not None:
             updates["index.state"] = state
+            updates["indexState"] = state
         if stats is not _UNSET:
             updates["index.stats"] = stats
         if error is not _UNSET:
@@ -189,6 +230,16 @@ class ContentDocumentStore:
             return_document=ReturnDocument.AFTER,
             session=session,
         )
+        if result is None:
+            company_obj = _safe_object_id(company_id) or company_id
+            doc_obj = _safe_object_id(document_id)
+            if doc_obj:
+                result = self.documents.find_one_and_update(
+                    {"companyid": company_obj, "_id": doc_obj},
+                    {"$set": updates},
+                    return_document=ReturnDocument.AFTER,
+                    session=session,
+                )
         return result
 
     def reset_index_error(
@@ -220,6 +271,7 @@ class ContentDocumentStore:
         session=None,
     ) -> Dict[str, Any]:
         now = datetime.now(timezone.utc)
+        existing_doc = self.get_document(company_id, document_id)
         stats = {
             "chunkCount": 0,
             "tokenCount": 0,
@@ -230,12 +282,11 @@ class ContentDocumentStore:
         }
 
         set_updates: Dict[str, Any] = {
-            "companyId": company_id,
-            "documentId": document_id,
             "source": source,
             "metadata": metadata or {},
             "updatedAt": now,
             "index.state": state,
+            "indexState": state,
             "index.jobId": job_id,
             "index.options": options,
             "index.stats": stats,
@@ -258,10 +309,27 @@ class ContentDocumentStore:
             "createdAt": now,
         }
 
+        uses_legacy_schema = (
+            isinstance(existing_doc, dict)
+            and "_id" in existing_doc
+            and "documentId" not in existing_doc
+            and "companyId" not in existing_doc
+        )
+        if uses_legacy_schema:
+            query: Dict[str, Any] = {"_id": existing_doc["_id"]}
+            if "companyid" in existing_doc:
+                query["companyid"] = existing_doc["companyid"]
+            upsert = False
+        else:
+            query = {"companyId": company_id, "documentId": document_id}
+            set_updates["companyId"] = company_id
+            set_updates["documentId"] = document_id
+            upsert = True
+
         self.documents.update_one(
-            {"companyId": company_id, "documentId": document_id},
+            query,
             {"$set": set_updates, "$setOnInsert": set_on_insert},
-            upsert=True,
+            upsert=upsert,
             session=session,
         )
         doc = self.get_document(company_id, document_id)
