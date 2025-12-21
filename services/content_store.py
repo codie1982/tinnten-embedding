@@ -121,6 +121,15 @@ class ContentDocumentStore:
             [("companyId", ASCENDING), ("documentId", ASCENDING)],
             unique=True,
             name="company_document_unique",
+            # Only enforce uniqueness when both identifiers are present to avoid
+            # legacy rows with null values blocking index creation.
+            partialFilterExpression={
+                # `$ne: null` gets rewritten as `$not: {$eq: null}` which is not
+                # supported by older MongoDB versions in partial index filters.
+                # `$gt: null` matches documents where the field exists and is not null.
+                "companyId": {"$gt": None},
+                "documentId": {"$gt": None},
+            },
         )
         self.documents.create_index([("index.state", ASCENDING)], name="index_state_idx")
         self.logs.create_index(
