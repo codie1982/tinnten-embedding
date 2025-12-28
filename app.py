@@ -66,8 +66,9 @@ ATTRIBUTE_META_PATH = _path_from_env(
     "ATTRIBUTE_META_PATH",
     default=_default_meta_path(ATTRIBUTE_INDEX_PATH, "attribute_meta.json"),
 )
-MODEL_NAME = os.getenv("MODEL_NAME", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
-CHUNK_MODEL_NAME = os.getenv("CHUNK_MODEL_NAME", MODEL_NAME)
+DEFAULT_CHUNK_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+MODEL_NAME = os.getenv("MODEL_NAME", DEFAULT_CHUNK_MODEL)
+CHUNK_MODEL_NAME = os.getenv("CHUNK_MODEL_NAME", DEFAULT_CHUNK_MODEL)
 CATEGORY_MODEL_NAME = os.getenv("CATEGORY_MODEL_NAME", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 ATTRIBUTE_MODEL_NAME = os.getenv("ATTRIBUTE_MODEL_NAME", CATEGORY_MODEL_NAME)
 CATEGORY_META_DB_NAME = os.getenv("CATEGORY_META_DB_NAME")
@@ -78,7 +79,6 @@ DEFAULT_INDEX_CHUNK_SIZE = int(os.getenv("EMBED_CHUNK_SIZE") or 1200)
 DEFAULT_INDEX_CHUNK_OVERLAP = int(os.getenv("EMBED_CHUNK_OVERLAP") or 200)
 DEFAULT_INDEX_MIN_CHARS = int(os.getenv("EMBED_MIN_CHARS") or 80)
 REQUIRE_KEYCLOAK_AUTH = (os.getenv("REQUIRE_KEYCLOAK_AUTH") or "true").strip().lower() not in {"0", "false", "no", "off"}
-CONTENT_INDEX_DELAY_SECONDS = int(os.getenv("CONTENT_INDEX_DELAY_SECONDS") or 10)
 CONTENT_INDEX_PUBLISH_RETRIES = int(os.getenv("CONTENT_INDEX_PUBLISH_RETRIES") or 3)
 CONTENT_INDEX_PUBLISH_RETRY_DELAY_SECONDS = float(os.getenv("CONTENT_INDEX_PUBLISH_RETRY_DELAY_SECONDS") or 2.0)
 ALLOW_UNAUTH_CONTENT_INDEX = (os.getenv("ALLOW_UNAUTH_CONTENT_INDEX") or "false").strip().lower() in {
@@ -376,6 +376,12 @@ def root():
         chunk_size = chunk_engine.count()
     except Exception:
         chunk_size = None
+    try:
+        chunk_index_dim = chunk_engine.index_dimension()
+        chunk_model_dim = chunk_engine.model_dimension()
+    except Exception:
+        chunk_index_dim = None
+        chunk_model_dim = None
     return jsonify(
         {
             "message": "tinnten-embedding up",
@@ -383,6 +389,8 @@ def root():
             "chunk_index_size": chunk_size,
             "chunk_index_path": CHUNK_INDEX_PATH,
             "chunk_model_name": CHUNK_MODEL_NAME,
+            "chunk_index_dim": chunk_index_dim,
+            "chunk_model_dim": chunk_model_dim,
         }
     )
 
@@ -775,23 +783,13 @@ def queue_content_index():
     }
     if user_id:
         message["userId"] = user_id
-
-    delay_seconds = max(0, int(CONTENT_INDEX_DELAY_SECONDS or 0))
-    if delay_seconds:
-        app.logger.info(
-            "Content index enqueue delayed %ss (companyId=%s documentId=%s jobId=%s)",
-            delay_seconds,
-            company_id,
-            document_id,
-            job_id,
-        )
-        time.sleep(delay_seconds)
-        app.logger.info(
-            "Content index enqueue delay complete (companyId=%s documentId=%s jobId=%s)",
-            company_id,
-            document_id,
-            job_id,
-        )
+    app.logger.info(
+        "Publishing content index job (queue=%s companyId=%s documentId=%s jobId=%s)",
+        getattr(job_publisher, "queue_name", None),
+        company_id,
+        document_id,
+        job_id,
+    )
 
     publish_retries = max(1, int(CONTENT_INDEX_PUBLISH_RETRIES or 1))
     publish_delay = float(CONTENT_INDEX_PUBLISH_RETRY_DELAY_SECONDS or 0)
@@ -800,6 +798,13 @@ def queue_content_index():
         try:
             job_publisher.publish(message)
             last_exc = None
+            app.logger.info(
+                "Content index job published (queue=%s companyId=%s documentId=%s jobId=%s)",
+                getattr(job_publisher, "queue_name", None),
+                company_id,
+                document_id,
+                job_id,
+            )
             break
         except Exception as exc:  # noqa: BLE001
             last_exc = exc

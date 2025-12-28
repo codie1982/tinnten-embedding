@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -16,16 +17,23 @@ import pika
 import requests
 import uuid
 
+# Ensure project-root imports work when executed as `python workers/ingest_worker.py`.
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+try:
+    from dotenv import load_dotenv
+except Exception:  # noqa: BLE001
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
+
 from init.rabbit_connection import connect_rabbit_with_retry
 from services.chunker import chunk_text
-from services.embedding_engine import EmbeddingEngine
 from services.mongo_store import MongoStore
 from services.content_store import ContentDocumentStore, normalize_index_options
-from services.document_loader import (
-    DocumentLoader,
-    DocumentDownloadError,
-    DocumentParseError,
-)
 from services.upload_store import UploadStore, UploadNotFoundError
 
 
@@ -36,9 +44,16 @@ DEFAULT_CHUNK_OVERLAP = 200
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_CONTENT_DOC_LOOKUP_RETRIES = 3
 DEFAULT_CONTENT_DOC_LOOKUP_DELAY_SECONDS = 2.0
+DEFAULT_UPLOAD_DOWNLOAD_RETRIES = 5
+DEFAULT_UPLOAD_DOWNLOAD_RETRY_DELAY_SECONDS = 10.0
 
 
-def log(msg: str) -> None:
+def log(msg: str, *args: object) -> None:
+    if args:
+        try:
+            msg = msg % args
+        except Exception:
+            msg = " ".join([str(msg), *[str(a) for a in args]])
     print(f"[ingest-worker] {msg}", flush=True)
 
 
@@ -83,27 +98,91 @@ class IngestWorker:
         self.chunk_size = int(os.getenv("EMBED_CHUNK_SIZE") or DEFAULT_CHUNK_SIZE)
         self.chunk_overlap = int(os.getenv("EMBED_CHUNK_OVERLAP") or DEFAULT_CHUNK_OVERLAP)
         self.batch_size = int(os.getenv("EMBED_BATCH_SIZE") or DEFAULT_BATCH_SIZE)
-        model_name = os.getenv(
-            "CHUNK_MODEL_NAME",
-            os.getenv(
-                "MODEL_NAME",
-                "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
-            ),
-        )
-        index_path = os.getenv("CHUNK_INDEX_PATH") or os.getenv("FAISS_INDEX_PATH") or "faiss.index"
+        default_chunk_model = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+        self.model_name = os.getenv("CHUNK_MODEL_NAME") or os.getenv("MODEL_NAME") or default_chunk_model
+        self.index_path = os.getenv("CHUNK_INDEX_PATH") or os.getenv("FAISS_INDEX_PATH") or "faiss.index"
 
-        self.store = MongoStore()
-        self.content_store = ContentDocumentStore()
-        self.upload_store = UploadStore()
-        self.loader = DocumentLoader()
-        self.engine = EmbeddingEngine(model_name=model_name, index_path=index_path)
+        # Lazily initialised dependencies to keep startup fast and avoid blocking
+        # on network connections/model downloads before consuming messages.
+        self.store: MongoStore | None = None
+        self._store_lock = threading.RLock()
+        self.content_store: ContentDocumentStore | None = None
+        self._content_store_lock = threading.RLock()
+        self.upload_store: UploadStore | None = None
+        self._upload_store_lock = threading.RLock()
+        self.loader: DocumentLoader | None = None
+        self._loader_lock = threading.RLock()
+        self.engine: EmbeddingEngine | None = None
+        self._engine_lock = threading.RLock()
         self.connection: pika.BlockingConnection | None = None
         self.channel: pika.adapters.blocking_connection.BlockingChannel | None = None
         self._stop_event = threading.Event()
 
+    def _get_store(self) -> MongoStore:
+        if self.store is not None:
+            return self.store
+        with self._store_lock:
+            if self.store is None:
+                log("Initialising MongoStore...")
+                self.store = MongoStore()
+            return self.store
+
+    def _get_content_store(self) -> ContentDocumentStore:
+        if self.content_store is not None:
+            return self.content_store
+        with self._content_store_lock:
+            if self.content_store is None:
+                log("Initialising ContentDocumentStore...")
+                self.content_store = ContentDocumentStore()
+            return self.content_store
+
+    def _get_upload_store(self) -> UploadStore:
+        if self.upload_store is not None:
+            return self.upload_store
+        with self._upload_store_lock:
+            if self.upload_store is None:
+                log("Initialising UploadStore...")
+                self.upload_store = UploadStore()
+            return self.upload_store
+
+    def _get_loader(self) -> DocumentLoader:
+        if self.loader is not None:
+            return self.loader
+        with self._loader_lock:
+            if self.loader is None:
+                log("Initialising DocumentLoader...")
+                from services.document_loader import DocumentLoader  # local import for faster startup
+
+                self.loader = DocumentLoader()
+            return self.loader
+
+    def _get_engine(self) -> EmbeddingEngine:
+        """
+        Lazily initialise the embedding engine so the worker can start consuming messages
+        without waiting for model downloads at process start.
+        """
+        if self.engine is not None:
+            return self.engine
+        with self._engine_lock:
+            if self.engine is None:
+                log("Initialising embedding engine (model=%s index_path=%s)...", self.model_name, self.index_path)
+                from services.embedding_engine import EmbeddingEngine  # local import for faster startup
+
+                self.engine = EmbeddingEngine(model_name=self.model_name, index_path=self.index_path)
+            return self.engine
+
     # ------------------------------------------------------------------
     def start(self) -> None:
         log("Starting ingest worker...")
+        log(
+            "Config: queues=%s rabbit=%s:%s vhost=%s index_path=%s model=%s",
+            self.queue_names,
+            os.getenv("RABBITMQ_HOST") or "rabbitmq",
+            os.getenv("RABBITMQ_PORT") or "5672",
+            os.getenv("RABBITMQ_VHOST") or "/",
+            self.index_path,
+            self.model_name,
+        )
         self.connection = connect_rabbit_with_retry()
         self.channel = self.connection.channel()
         self.channel.basic_qos(prefetch_count=1)
@@ -151,7 +230,7 @@ class IngestWorker:
                 if isinstance(payload, dict):
                     doc_id = payload.get("doc_id")
                     if doc_id:
-                        self.store.update_document_status(doc_id, status="failed", error=str(exc))
+                        self._get_store().update_document_status(doc_id, status="failed", error=str(exc))
                     else:
                         document_ids = self._coalesce(payload, "documentIds", "document_ids", "documentids")
                         company_id = self._coalesce(payload, "companyId", "company_id", "companyid")
@@ -218,7 +297,7 @@ class IngestWorker:
         documents: Dict[str, Dict[str, Any]] = {}
         missing_docs: List[str] = []
         for attempt in range(1, attempts + 1):
-            documents = self.content_store.get_documents(company_id, document_ids)
+            documents = self._get_content_store().get_documents(company_id, document_ids)
             missing_docs = [doc_id for doc_id in document_ids if doc_id not in documents]
             if not missing_docs:
                 break
@@ -433,15 +512,17 @@ class IngestWorker:
         metadata: Dict[str, Any],
         context: DocumentJobContext,
     ) -> Tuple[str, Dict[str, Any]]:
+        from services.document_loader import DocumentDownloadError, DocumentParseError
+
         try:
-            upload_doc = self.upload_store.get_upload_by_id(upload_id)
+            upload_doc = self._get_upload_store().get_upload_by_id(upload_id)
         except UploadNotFoundError as exc:
             raise RuntimeError(f"upload record not found for uploadId={upload_id}") from exc
 
-        file_doc = self.upload_store.get_file_by_upload_id(upload_id)
+        file_doc = self._get_upload_store().get_file_by_upload_id(upload_id)
         bucket, key, filename = self._resolve_s3_location(upload_doc, file_doc)
 
-        self.upload_store.update_upload_status(
+        self._get_upload_store().update_upload_status(
             upload_id,
             index_status="in_progress",
             is_file_opened=False,
@@ -449,24 +530,50 @@ class IngestWorker:
             embedding_doc_id=context.document_id,
         )
 
-        try:
-            document = self.loader.fetch_text(key, bucket=bucket)
-        except (DocumentDownloadError, DocumentParseError) as exc:
-            self.upload_store.update_upload_status(
+        download_retries = int(os.getenv("UPLOAD_DOWNLOAD_RETRIES") or DEFAULT_UPLOAD_DOWNLOAD_RETRIES)
+        download_delay = float(
+            os.getenv("UPLOAD_DOWNLOAD_RETRY_DELAY_SECONDS") or DEFAULT_UPLOAD_DOWNLOAD_RETRY_DELAY_SECONDS
+        )
+        attempts = max(1, download_retries)
+
+        last_exc: Exception | None = None
+        document = None
+        for attempt in range(1, attempts + 1):
+            if download_delay > 0:
+                log(
+                    "Upload download wait %ss (attempt %s/%s) uploadId=%s key=%s",
+                    download_delay,
+                    attempt,
+                    attempts,
+                    upload_id,
+                    key,
+                )
+                time.sleep(download_delay)
+            try:
+                document = self._get_loader().fetch_text(key, bucket=bucket)
+                last_exc = None
+                break
+            except DocumentParseError as exc:
+                last_exc = exc
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt < attempts:
+                    log("Upload download failed (attempt %s/%s): %s", attempt, attempts, exc)
+                    continue
+                break
+
+        if document is None:
+            error_text = str(last_exc) if last_exc is not None else "unknown download error"
+            self._get_upload_store().update_upload_status(
                 upload_id,
                 index_status="failed",
                 is_file_opened=False,
-                file_open_error=str(exc),
+                file_open_error=error_text,
             )
-            raise
-        except Exception as exc:  # noqa: BLE001
-            self.upload_store.update_upload_status(
-                upload_id,
-                index_status="failed",
-                is_file_opened=False,
-                file_open_error=str(exc),
-            )
-            raise
+            if last_exc is not None:
+                raise last_exc
+            raise DocumentDownloadError(error_text)
 
         combined_metadata = dict(metadata)
         combined_metadata.setdefault("uploadId", upload_id)
@@ -476,7 +583,7 @@ class IngestWorker:
         if document.content_type:
             combined_metadata.setdefault("contentType", document.content_type)
 
-        self.upload_store.update_upload_status(
+        self._get_upload_store().update_upload_status(
             upload_id,
             index_status="completed",
             is_file_opened=True,
@@ -516,9 +623,10 @@ class IngestWorker:
                 "minChars": min_chars,
             }
 
-        faiss_ids = self.store.reserve_faiss_ids(len(chunks))
-        embeddings = self.engine.encode([chunk.text for chunk in chunks], batch_size=self.batch_size)
-        self.engine.add_embeddings(embeddings, faiss_ids)
+        faiss_ids = self._get_store().reserve_faiss_ids(len(chunks))
+        engine = self._get_engine()
+        embeddings = engine.encode([chunk.text for chunk in chunks], batch_size=self.batch_size)
+        engine.add_embeddings(embeddings, faiss_ids)
 
         now = datetime.now(timezone.utc)
         chunk_docs: List[Dict[str, Any]] = []
@@ -545,7 +653,7 @@ class IngestWorker:
                     "created_at": now,
                 }
             )
-        self.store.insert_chunks(chunk_docs)
+        self._get_store().insert_chunks(chunk_docs)
         return {
             "chunkCount": len(chunk_docs),
             "tokenCount": total_tokens,
@@ -609,7 +717,7 @@ class IngestWorker:
         chunk_overlap: int,
         min_chars: int,
     ) -> None:
-        self.store.update_document_status(doc_id, status="processing", error=None)
+        self._get_store().update_document_status(doc_id, status="processing", error=None)
 
         chunks = chunk_text(
             text,
@@ -618,12 +726,13 @@ class IngestWorker:
             min_chars=min_chars,
         )
         if not chunks:
-            self.store.update_document_status(doc_id, status="ready", chunk_count=0)
+            self._get_store().update_document_status(doc_id, status="ready", chunk_count=0)
             return
 
-        faiss_ids = self.store.reserve_faiss_ids(len(chunks))
-        embeddings = self.engine.encode([chunk.text for chunk in chunks], batch_size=self.batch_size)
-        self.engine.add_embeddings(embeddings, faiss_ids)
+        faiss_ids = self._get_store().reserve_faiss_ids(len(chunks))
+        engine = self._get_engine()
+        embeddings = engine.encode([chunk.text for chunk in chunks], batch_size=self.batch_size)
+        engine.add_embeddings(embeddings, faiss_ids)
 
         now = datetime.now(timezone.utc)
         chunk_docs: List[Dict[str, Any]] = []
@@ -643,8 +752,8 @@ class IngestWorker:
                     "created_at": now,
                 }
             )
-        self.store.insert_chunks(chunk_docs)
-        self.store.update_document_status(doc_id, status="ready", chunk_count=len(chunk_docs))
+        self._get_store().insert_chunks(chunk_docs)
+        self._get_store().update_document_status(doc_id, status="ready", chunk_count=len(chunk_docs))
         log(f"Processed doc_id={doc_id} chunks={len(chunk_docs)}")
 
     def _process_upload_ingest_legacy(
@@ -657,16 +766,18 @@ class IngestWorker:
         chunk_overlap: int,
         min_chars: int,
     ) -> None:
+        from services.document_loader import DocumentDownloadError, DocumentParseError
+
         try:
-            upload_doc = self.upload_store.get_upload_by_id(upload_id)
+            upload_doc = self._get_upload_store().get_upload_by_id(upload_id)
         except UploadNotFoundError as exc:
-            self.store.update_document_status(doc_id, status="failed", error=str(exc))
+            self._get_store().update_document_status(doc_id, status="failed", error=str(exc))
             raise
 
-        file_doc = self.upload_store.get_file_by_upload_id(upload_id)
+        file_doc = self._get_upload_store().get_file_by_upload_id(upload_id)
         bucket, key, filename = self._resolve_s3_location(upload_doc, file_doc)
 
-        self.upload_store.update_upload_status(
+        self._get_upload_store().update_upload_status(
             upload_id,
             index_status="in_progress",
             is_file_opened=False,
@@ -675,10 +786,10 @@ class IngestWorker:
         )
 
         try:
-            document = self.loader.fetch_text(key, bucket=bucket)
+            document = self._get_loader().fetch_text(key, bucket=bucket)
         except (DocumentDownloadError, DocumentParseError) as exc:
-            self.store.update_document_status(doc_id, status="failed", error=str(exc))
-            self.upload_store.update_upload_status(
+            self._get_store().update_document_status(doc_id, status="failed", error=str(exc))
+            self._get_upload_store().update_upload_status(
                 upload_id,
                 index_status="failed",
                 is_file_opened=False,
@@ -706,7 +817,7 @@ class IngestWorker:
                 min_chars=min_chars,
             )
         except Exception as exc:  # noqa: BLE001
-            self.upload_store.update_upload_status(
+            self._get_upload_store().update_upload_status(
                 upload_id,
                 index_status="failed",
                 is_file_opened=True,
@@ -714,7 +825,7 @@ class IngestWorker:
             )
             raise
 
-        self.upload_store.update_upload_status(
+        self._get_upload_store().update_upload_status(
             upload_id,
             index_status="completed",
             is_file_opened=True,
@@ -872,7 +983,7 @@ class IngestWorker:
         details: Optional[Dict[str, Any]] = None,
     ) -> None:
         try:
-            self.content_store.append_log_entry(
+            self._get_content_store().append_log_entry(
                 company_id=context.company_id,
                 document_id=context.document_id,
                 job_id=context.job_id,
@@ -911,7 +1022,7 @@ class IngestWorker:
                 update_kwargs["stats"] = stats
             if error is not UPDATE_UNSET:
                 update_kwargs["error"] = error
-            self.content_store.update_index_fields(**update_kwargs)
+            self._get_content_store().update_index_fields(**update_kwargs)
         except Exception as exc:  # noqa: BLE001
             log(f"Failed to update index state for {context.document_id}: {exc}")
 

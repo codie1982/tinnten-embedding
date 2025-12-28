@@ -20,8 +20,9 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 
 keycloak = get_keycloak_service()
 
-MODEL_NAME = os.getenv("MODEL_NAME", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
-CHUNK_MODEL_NAME = os.getenv("CHUNK_MODEL_NAME", MODEL_NAME)
+DEFAULT_CHUNK_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+MODEL_NAME = os.getenv("MODEL_NAME", DEFAULT_CHUNK_MODEL)
+CHUNK_MODEL_NAME = os.getenv("CHUNK_MODEL_NAME", DEFAULT_CHUNK_MODEL)
 INDEX_PATH = os.getenv("CHUNK_INDEX_PATH") or os.getenv("FAISS_INDEX_PATH") or "faiss.index"
 DEFAULT_CHUNK_SIZE = int(os.getenv("EMBED_CHUNK_SIZE") or 1200)
 DEFAULT_CHUNK_OVERLAP = int(os.getenv("EMBED_CHUNK_OVERLAP") or 200)
@@ -51,10 +52,20 @@ def require_service_token(fn):
 @app.route("/", methods=["GET"])
 def root():
     embedding_engine.reload_if_updated()
+    try:
+        index_dim = embedding_engine.index_dimension()
+        model_dim = embedding_engine.model_dimension()
+    except Exception:
+        index_dim = None
+        model_dim = None
     return jsonify(
         {
             "message": "tinnten-embedding up",
             "index_size": embedding_engine.count(),
+            "index_path": INDEX_PATH,
+            "model_name": CHUNK_MODEL_NAME,
+            "index_dim": index_dim,
+            "model_dim": model_dim,
         }
     )
 
@@ -218,6 +229,22 @@ def search_vector():
         scores, ids = embedding_engine.search(query_vec, k)
     except RuntimeError:
         return jsonify({"results": []})
+    except ValueError as exc:
+        index_obj = getattr(embedding_engine, "_index", None)
+        index_dim = getattr(index_obj, "d", None)
+        return (
+            jsonify(
+                {
+                    "error": str(exc),
+                    "hint": "Embedding dimension mismatch: ensure CHUNK_MODEL_NAME matches the model used to build the index.",
+                    "index_path": INDEX_PATH,
+                    "model_name": getattr(embedding_engine, "model_name", None),
+                    "index_dim": index_dim,
+                    "query_dim": int(query_vec.shape[1]),
+                }
+            ),
+            400,
+        )
 
     faiss_ids = [int(i) for i in ids[0] if i != -1]
     chunk_docs = mongo_store.get_chunks_by_faiss_ids(faiss_ids)

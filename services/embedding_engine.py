@@ -6,11 +6,18 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import Iterable, List, Sequence, Tuple
+import uuid
+from contextlib import contextmanager
+from typing import Iterable, Iterator, List, Sequence, Tuple
 
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
+
+try:
+    import fcntl  # type: ignore
+except Exception:  # noqa: BLE001
+    fcntl = None
 
 
 class EmbeddingEngine:
@@ -33,10 +40,19 @@ class EmbeddingEngine:
             "y",
             "on",
         }
+        self.auto_reset_on_dim_mismatch = (os.getenv("FAISS_AUTO_RESET_ON_DIM_MISMATCH") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        self.max_index_dimension = int(os.getenv("FAISS_MAX_INDEX_DIMENSION") or 16384)
         self._lock = threading.RLock()
         self._model = SentenceTransformer(self.model_name)
         self._index: faiss.IndexIDMap2 | None = None
         self._dimension: int | None = None
+        self._model_dimension: int | None = None
         self._index_mtime: float | None = None
         self._load_index()
 
@@ -70,17 +86,44 @@ class EmbeddingEngine:
     # ------------------------------------------------------------------
     # Index helpers
     # ------------------------------------------------------------------
+    @contextmanager
+    def _write_lock(self) -> Iterator[None]:
+        """
+        Best-effort cross-process lock for index writers.
+
+        This protects the `.tmp` write+replace sequence and prevents lost updates when
+        multiple ingest workers run concurrently on the same shared filesystem.
+        """
+        if fcntl is None:
+            yield
+            return
+        lock_path = f"{self.index_path}.lock"
+        lock_dir = os.path.dirname(lock_path)
+        if lock_dir:
+            try:
+                os.makedirs(lock_dir, exist_ok=True)
+            except OSError:
+                pass
+        with open(lock_path, "a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
     def add_embeddings(self, embeddings: np.ndarray, ids: Sequence[int]) -> None:
         if embeddings.ndim != 2:
             raise ValueError("embeddings must be 2D")
         if len(ids) != embeddings.shape[0]:
             raise ValueError("ids length must match embeddings rows")
         with self._lock:
-            self._ensure_index(embeddings.shape[1])
-            faiss.normalize_L2(embeddings)
-            id_array = np.asarray(list(ids), dtype=np.int64)
-            self._index.add_with_ids(embeddings, id_array)
-            self._save_index()
+            with self._write_lock():
+                self.reload_if_updated_locked()
+                self._ensure_index(embeddings.shape[1])
+                faiss.normalize_L2(embeddings)
+                id_array = np.asarray(list(ids), dtype=np.int64)
+                self._index.add_with_ids(embeddings, id_array)
+                self._save_index()
 
     def search(self, query_vectors: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         if query_vectors.ndim != 2:
@@ -90,6 +133,15 @@ class EmbeddingEngine:
         with self._lock:
             self.reload_if_updated_locked()
             if self._index is None or self._index.ntotal == 0:
+                raise RuntimeError("FAISS index is empty.")
+            if self._index.d <= 0 or self._index.d > self.max_index_dimension:
+                reason = f"invalid FAISS index dimension: {self._index.d}"
+                print(f"[embedding-engine] {reason}", flush=True)
+                with self._write_lock():
+                    self._quarantine_index_file(reason=reason)
+                self._index = None
+                self._dimension = None
+                self._index_mtime = None
                 raise RuntimeError("FAISS index is empty.")
             if self._index.d != query_vectors.shape[1]:
                 raise ValueError(f"Query dim {query_vectors.shape[1]} != index dim {self._index.d}")
@@ -110,19 +162,35 @@ class EmbeddingEngine:
         if not id_list:
             return 0
         with self._lock:
-            self.reload_if_updated_locked()
-            if self._index is None:
-                return 0
-            id_array = np.asarray(id_list, dtype=np.int64)
-            try:
-                self._index.remove_ids(id_array)
-            finally:
-                self._save_index()
+            with self._write_lock():
+                self.reload_if_updated_locked()
+                if self._index is None:
+                    return 0
+                id_array = np.asarray(id_list, dtype=np.int64)
+                try:
+                    self._index.remove_ids(id_array)
+                finally:
+                    self._save_index()
         return len(id_list)
 
     # ------------------------------------------------------------------
     # Internal methods
     # ------------------------------------------------------------------
+    def model_dimension(self) -> int:
+        with self._lock:
+            if self._model_dimension is not None:
+                return self._model_dimension
+            getter = getattr(self._model, "get_sentence_embedding_dimension", None)
+            if callable(getter):
+                self._model_dimension = int(getter())
+            else:
+                self._model_dimension = int(self.encode_single("dimension_probe").shape[1])
+            return self._model_dimension
+
+    def index_dimension(self) -> int | None:
+        with self._lock:
+            return int(self._dimension) if self._dimension is not None else None
+
     def _quarantine_index_file(self, *, reason: str) -> None:
         """
         Move the current index file aside so a fresh index can be created.
@@ -148,8 +216,21 @@ class EmbeddingEngine:
                     index = faiss.IndexIDMap(index)
                 self._index = faiss.downcast_index(index)
                 self._dimension = int(self._index.d)
-                if self._dimension <= 0:
+                if self._dimension <= 0 or self._dimension > self.max_index_dimension:
                     raise ValueError(f"invalid FAISS index dimension: {self._dimension}")
+                model_dim = self.model_dimension()
+                if model_dim != self._dimension:
+                    msg = (
+                        f"FAISS index dim mismatch for {self.index_path}: "
+                        f"index_dim={self._dimension} model_dim={model_dim} model={self.model_name}"
+                    )
+                    print(f"[embedding-engine] {msg}", flush=True)
+                    if self.auto_reset_on_dim_mismatch:
+                        self._quarantine_index_file(reason=msg)
+                        self._index = None
+                        self._dimension = None
+                        self._index_mtime = None
+                        return
                 try:
                     self._index_mtime = os.path.getmtime(self.index_path)
                 except OSError:
@@ -158,7 +239,7 @@ class EmbeddingEngine:
                 # If the index file is corrupt or not a FAISS index, avoid crashing the service.
                 # Optionally move it aside so ingest can rebuild a fresh one.
                 print(f"[embedding-engine] failed to load index {self.index_path}: {exc}", flush=True)
-                if self.auto_reset_on_error:
+                if self.auto_reset_on_error or "invalid FAISS index dimension" in str(exc):
                     self._quarantine_index_file(reason=str(exc))
                 self._index = None
                 self._dimension = None
@@ -167,9 +248,16 @@ class EmbeddingEngine:
     def _save_index(self) -> None:
         if self._index is None:
             return
-        tmp = f"{self.index_path}.tmp"
-        faiss.write_index(self._index, tmp)
-        os.replace(tmp, self.index_path)
+        tmp = f"{self.index_path}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+        try:
+            faiss.write_index(self._index, tmp)
+            os.replace(tmp, self.index_path)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
         try:
             self._index_mtime = os.path.getmtime(self.index_path)
         except OSError:
@@ -208,12 +296,25 @@ class EmbeddingEngine:
                     index = faiss.IndexIDMap(index)
                 self._index = faiss.downcast_index(index)
                 self._dimension = int(self._index.d)
-                if self._dimension <= 0:
+                if self._dimension <= 0 or self._dimension > self.max_index_dimension:
                     raise ValueError(f"invalid FAISS index dimension: {self._dimension}")
+                model_dim = self.model_dimension()
+                if model_dim != self._dimension:
+                    msg = (
+                        f"FAISS index dim mismatch for {self.index_path}: "
+                        f"index_dim={self._dimension} model_dim={model_dim} model={self.model_name}"
+                    )
+                    print(f"[embedding-engine] {msg}", flush=True)
+                    if self.auto_reset_on_dim_mismatch:
+                        self._quarantine_index_file(reason=msg)
+                        self._index = None
+                        self._dimension = None
+                        self._index_mtime = None
+                        return
                 self._index_mtime = mtime
             except Exception as exc:  # noqa: BLE001
                 print(f"[embedding-engine] failed to reload index {self.index_path}: {exc}", flush=True)
-                if self.auto_reset_on_error:
+                if self.auto_reset_on_error or "invalid FAISS index dimension" in str(exc):
                     self._quarantine_index_file(reason=str(exc))
                 self._index = None
                 self._dimension = None
