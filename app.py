@@ -581,6 +581,18 @@ def create_category():
         payload = _normalize_category_payload(payload)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+
+    text = payload.get("text")
+    if text:
+        # Check for duplicates by exact text match
+        total, exists = category_store.list_entries(limit=1, simple_filter={"text": text})
+        if total > 0:
+            return jsonify({
+                "error": "duplicate_entry",
+                "message": f"Category with name '{text}' already exists.",
+                "existing_id": exists[0].get("id")
+            }), 409
+
     return _vector_upsert_response(category_store, label="category create", payload=payload)
 
 @app.route("/api/v10/categories/<category_id>", methods=["GET"])
@@ -709,6 +721,18 @@ def create_attribute():
         payload = _normalize_attribute_payload(payload)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+
+    text = payload.get("text")
+    if text:
+        # Check for duplicates by exact text match
+        total, exists = attribute_store.list_entries(limit=1, simple_filter={"text": text})
+        if total > 0:
+            return jsonify({
+                "error": "duplicate_entry",
+                "message": f"Attribute with name '{text}' already exists.",
+                "existing_id": exists[0].get("id")
+            }), 409
+
     return _vector_upsert_response(attribute_store, label="attribute create", payload=payload)
 
 @app.route("/api/v10/attributes/<attribute_id>", methods=["GET"])
