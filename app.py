@@ -1,3 +1,4 @@
+import json
 import os
 import time
 import uuid
@@ -158,6 +159,76 @@ def _get_payload_value(data: dict, *keys: str):
         if stripped in lowered:
             return lowered[stripped]
     return None
+
+
+def _parse_int(value, default: int, minimum: int | None = None) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None and parsed < minimum:
+        return minimum
+    return parsed
+
+
+def _parse_filter_arg(raw_value):
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, dict):
+        return raw_value
+    if isinstance(raw_value, str):
+        if not raw_value.strip():
+            return None
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError:
+            return "__invalid__"
+        return parsed
+    return None
+
+
+def _should_use_external_id():
+    by = (request.args.get("by") or "").strip().lower()
+    if by in {"external_id", "externalid", "external"}:
+        return True
+    if "external_id" in request.args or "externalId" in request.args:
+        return True
+    return False
+
+
+def _resolve_ids_for_identifier(target_store, identifier: str, use_external: bool):
+    if use_external or not str(identifier).isdigit():
+        ids = target_store.find_ids_by_external_id(str(identifier))
+        return ids, "external_id"
+    return [int(identifier)], "id"
+
+
+def _normalize_category_payload(payload: dict) -> dict:
+    meta_payload = payload.get("metadata") or {}
+    if meta_payload and not isinstance(meta_payload, dict):
+        raise ValueError("metadata must be an object")
+
+    parent_id = payload.get("parentId") or payload.get("parent_id") or payload.get("parent")
+    if parent_id is not None:
+        meta_payload = dict(meta_payload)
+        meta_payload["parentId"] = str(parent_id)
+
+    payload["metadata"] = meta_payload
+    return payload
+
+
+def _normalize_attribute_payload(payload: dict) -> dict:
+    meta_payload = payload.get("metadata") or {}
+    if meta_payload and not isinstance(meta_payload, dict):
+        raise ValueError("metadata must be an object")
+
+    category_id = payload.get("categoryId") or payload.get("category_id") or payload.get("category")
+    if category_id is not None:
+        meta_payload = dict(meta_payload)
+        meta_payload["categoryId"] = str(category_id)
+
+    payload["metadata"] = meta_payload
+    return payload
 
 
 def _resolve_upload_s3_location(upload_doc, file_doc):
@@ -458,16 +529,10 @@ def upsert_category_vector():
         parentId (str, optional): Parent category identifier; stored under metadata.parentId.
     """
     payload = request.get_json() or {}
-    meta_payload = payload.get("metadata") or {}
-    if meta_payload and not isinstance(meta_payload, dict):
-        return jsonify({"error": "metadata must be an object"}), 400
-
-    parent_id = payload.get("parentId") or payload.get("parent_id") or payload.get("parent")
-    if parent_id is not None:
-        meta_payload = dict(meta_payload)
-        meta_payload["parentId"] = str(parent_id)
-
-    payload["metadata"] = meta_payload
+    try:
+        payload = _normalize_category_payload(payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     return _vector_upsert_response(category_store, label="category upsert", payload=payload)
 
 
@@ -477,6 +542,104 @@ def search_category_vector():
     Run a similarity search on the category FAISS index.
     """
     return _vector_search_response(category_store, label="category search")
+
+@app.route("/api/v10/categories", methods=["GET"])
+def list_categories():
+    limit = _parse_int(request.args.get("limit"), 100, minimum=0)
+    offset = _parse_int(request.args.get("offset"), 0, minimum=0)
+    filter_arg = _parse_filter_arg(request.args.get("filter"))
+    if filter_arg == "__invalid__":
+        return jsonify({"error": "filter must be valid JSON"}), 400
+    if filter_arg is not None and not isinstance(filter_arg, dict):
+        return jsonify({"error": "filter must be an object"}), 400
+
+    external_id = request.args.get("external_id") or request.args.get("externalId")
+    if external_id is not None:
+        filter_arg = dict(filter_arg or {})
+        filter_arg["external_id"] = str(external_id)
+
+    text = request.args.get("text")
+    if text is not None:
+        filter_arg = dict(filter_arg or {})
+        filter_arg["text"] = str(text)
+
+    total, items = category_store.list_entries(
+        offset=offset,
+        limit=limit,
+        simple_filter=filter_arg,
+    )
+    return jsonify({"total": total, "offset": offset, "limit": limit, "items": items})
+
+@app.route("/api/v10/categories", methods=["POST"])
+def create_category():
+    payload = request.get_json() or {}
+    try:
+        payload = _normalize_category_payload(payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return _vector_upsert_response(category_store, label="category create", payload=payload)
+
+@app.route("/api/v10/categories/<category_id>", methods=["GET"])
+def get_category(category_id: str):
+    if not category_id:
+        return jsonify({"error": "category_id is required"}), 400
+
+    use_external = _should_use_external_id()
+    ids, id_kind = _resolve_ids_for_identifier(category_store, category_id, use_external)
+    if not ids:
+        return jsonify({"error": "not_found"}), 404
+
+    if id_kind == "external_id":
+        entries = [category_store.get_entry(fid) for fid in ids]
+        entries = [entry for entry in entries if entry]
+        if len(entries) == 1:
+            return jsonify(entries[0])
+        return jsonify({"items": entries, "count": len(entries)})
+
+    entry = category_store.get_entry(ids[0])
+    if not entry:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify(entry)
+
+@app.route("/api/v10/categories/<category_id>", methods=["PUT", "PATCH"])
+def update_category(category_id: str):
+    if not category_id:
+        return jsonify({"error": "category_id is required"}), 400
+
+    use_external = _should_use_external_id()
+    ids, id_kind = _resolve_ids_for_identifier(category_store, category_id, use_external)
+    if not ids:
+        return jsonify({"error": "not_found"}), 404
+    if id_kind == "external_id" and len(ids) > 1:
+        return jsonify({"error": "multiple_matches", "count": len(ids)}), 409
+
+    resolved_id = ids[0]
+    if not category_store.get_entry(resolved_id):
+        return jsonify({"error": "not_found"}), 404
+
+    payload = request.get_json() or {}
+    payload["id"] = payload.get("id") or resolved_id
+    try:
+        payload = _normalize_category_payload(payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return _vector_upsert_response(category_store, label="category update", payload=payload)
+
+@app.route("/api/v10/categories/<category_id>", methods=["DELETE"])
+def delete_category(category_id: str):
+    if not category_id:
+        return jsonify({"error": "category_id is required"}), 400
+
+    use_external = _should_use_external_id()
+    ids, id_kind = _resolve_ids_for_identifier(category_store, category_id, use_external)
+    if not ids:
+        return jsonify({"error": "not_found"}), 404
+    try:
+        removed = category_store.delete_by_ids(ids)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    return jsonify({"removed": removed, "ids": ids, "identifierType": id_kind})
 
 
 @app.route("/api/v10/attributes/upsert", methods=["POST"])
@@ -488,16 +651,10 @@ def upsert_attribute_vector():
         categoryId (str, optional): Link attribute to a category; stored under metadata.categoryId.
     """
     payload = request.get_json() or {}
-    meta_payload = payload.get("metadata") or {}
-    if meta_payload and not isinstance(meta_payload, dict):
-        return jsonify({"error": "metadata must be an object"}), 400
-
-    category_id = payload.get("categoryId") or payload.get("category_id") or payload.get("category")
-    if category_id is not None:
-        meta_payload = dict(meta_payload)
-        meta_payload["categoryId"] = str(category_id)
-
-    payload["metadata"] = meta_payload
+    try:
+        payload = _normalize_attribute_payload(payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     return _vector_upsert_response(attribute_store, label="attribute upsert", payload=payload)
 
 
@@ -507,6 +664,104 @@ def search_attribute_vector():
     Run a similarity search on the attribute FAISS index.
     """
     return _vector_search_response(attribute_store, label="attribute search")
+
+@app.route("/api/v10/attributes", methods=["GET"])
+def list_attributes():
+    limit = _parse_int(request.args.get("limit"), 100, minimum=0)
+    offset = _parse_int(request.args.get("offset"), 0, minimum=0)
+    filter_arg = _parse_filter_arg(request.args.get("filter"))
+    if filter_arg == "__invalid__":
+        return jsonify({"error": "filter must be valid JSON"}), 400
+    if filter_arg is not None and not isinstance(filter_arg, dict):
+        return jsonify({"error": "filter must be an object"}), 400
+
+    external_id = request.args.get("external_id") or request.args.get("externalId")
+    if external_id is not None:
+        filter_arg = dict(filter_arg or {})
+        filter_arg["external_id"] = str(external_id)
+
+    text = request.args.get("text")
+    if text is not None:
+        filter_arg = dict(filter_arg or {})
+        filter_arg["text"] = str(text)
+
+    total, items = attribute_store.list_entries(
+        offset=offset,
+        limit=limit,
+        simple_filter=filter_arg,
+    )
+    return jsonify({"total": total, "offset": offset, "limit": limit, "items": items})
+
+@app.route("/api/v10/attributes", methods=["POST"])
+def create_attribute():
+    payload = request.get_json() or {}
+    try:
+        payload = _normalize_attribute_payload(payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return _vector_upsert_response(attribute_store, label="attribute create", payload=payload)
+
+@app.route("/api/v10/attributes/<attribute_id>", methods=["GET"])
+def get_attribute(attribute_id: str):
+    if not attribute_id:
+        return jsonify({"error": "attribute_id is required"}), 400
+
+    use_external = _should_use_external_id()
+    ids, id_kind = _resolve_ids_for_identifier(attribute_store, attribute_id, use_external)
+    if not ids:
+        return jsonify({"error": "not_found"}), 404
+
+    if id_kind == "external_id":
+        entries = [attribute_store.get_entry(fid) for fid in ids]
+        entries = [entry for entry in entries if entry]
+        if len(entries) == 1:
+            return jsonify(entries[0])
+        return jsonify({"items": entries, "count": len(entries)})
+
+    entry = attribute_store.get_entry(ids[0])
+    if not entry:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify(entry)
+
+@app.route("/api/v10/attributes/<attribute_id>", methods=["PUT", "PATCH"])
+def update_attribute(attribute_id: str):
+    if not attribute_id:
+        return jsonify({"error": "attribute_id is required"}), 400
+
+    use_external = _should_use_external_id()
+    ids, id_kind = _resolve_ids_for_identifier(attribute_store, attribute_id, use_external)
+    if not ids:
+        return jsonify({"error": "not_found"}), 404
+    if id_kind == "external_id" and len(ids) > 1:
+        return jsonify({"error": "multiple_matches", "count": len(ids)}), 409
+
+    resolved_id = ids[0]
+    if not attribute_store.get_entry(resolved_id):
+        return jsonify({"error": "not_found"}), 404
+
+    payload = request.get_json() or {}
+    payload["id"] = payload.get("id") or resolved_id
+    try:
+        payload = _normalize_attribute_payload(payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return _vector_upsert_response(attribute_store, label="attribute update", payload=payload)
+
+@app.route("/api/v10/attributes/<attribute_id>", methods=["DELETE"])
+def delete_attribute(attribute_id: str):
+    if not attribute_id:
+        return jsonify({"error": "attribute_id is required"}), 400
+
+    use_external = _should_use_external_id()
+    ids, id_kind = _resolve_ids_for_identifier(attribute_store, attribute_id, use_external)
+    if not ids:
+        return jsonify({"error": "not_found"}), 404
+    try:
+        removed = attribute_store.delete_by_ids(ids)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    return jsonify({"removed": removed, "ids": ids, "identifierType": id_kind})
 
 
 @app.route("/api/v10/content/search", methods=["POST"])

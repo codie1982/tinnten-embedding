@@ -62,6 +62,13 @@ class MetaRepository:
         cursor = self.collection.find({})
         return {int(doc["faiss_id"]): self._extract_meta(doc) for doc in cursor}
 
+    def delete_by_ids(self, faiss_ids: Sequence[int]) -> int:
+        if not faiss_ids:
+            return 0
+        ids = [int(fid) for fid in faiss_ids]
+        result = self.collection.delete_many({"faiss_id": {"$in": ids}})
+        return int(result.deleted_count or 0)
+
     @staticmethod
     def _normalize_payload(faiss_id: int, meta: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -454,6 +461,89 @@ class EmbeddingIndex:
         return chunks
 
     # ---------- Internal helpers ----------
+    def get_entry(self, faiss_id: int) -> Optional[Dict[str, Any]]:
+        if faiss_id is None:
+            return None
+        faiss_id = int(faiss_id)
+        with self._lock:
+            meta_snapshot = dict(self.meta)
+        meta = meta_snapshot.get(faiss_id)
+        if meta is None:
+            try:
+                db_meta = self._meta_repo.get_by_ids([faiss_id])
+                meta = db_meta.get(faiss_id)
+            except Exception:  # noqa: BLE001
+                meta = None
+        if not meta:
+            return None
+        return {"id": faiss_id, **meta}
+
+    def list_entries(
+        self,
+        offset: int = 0,
+        limit: Optional[int] = 100,
+        simple_filter: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[int, List[Dict[str, Any]]]:
+        with self._lock:
+            meta_snapshot = dict(self.meta)
+
+        items = []
+        for faiss_id, meta in meta_snapshot.items():
+            if simple_filter and not self._passes_filter(meta, simple_filter):
+                continue
+            items.append({"id": int(faiss_id), **meta})
+
+        items.sort(key=lambda item: item.get("id", 0))
+        total = len(items)
+
+        if offset and offset > 0:
+            items = items[offset:]
+        if limit is not None:
+            if limit < 0:
+                limit = 0
+            items = items[:limit]
+
+        return total, items
+
+    def find_ids_by_external_id(self, external_id: str) -> List[int]:
+        if not external_id:
+            return []
+        with self._lock:
+            meta_snapshot = dict(self.meta)
+        return [
+            int(faiss_id)
+            for faiss_id, meta in meta_snapshot.items()
+            if meta.get("external_id") == external_id
+        ]
+
+    def delete_by_ids(self, ids: Sequence[int]) -> int:
+        if not ids:
+            return 0
+        normalized = [int(val) for val in ids]
+        removed = 0
+
+        with self._lock:
+            if self.index is not None:
+                try:
+                    self.index.remove_ids(np.array(normalized, dtype=np.int64))
+                except Exception as exc:  # noqa: BLE001
+                    raise RuntimeError(f"failed to remove ids from FAISS: {exc}") from exc
+
+            for fid in normalized:
+                if fid in self.meta:
+                    del self.meta[fid]
+                    removed += 1
+
+            try:
+                self._meta_repo.delete_by_ids(normalized)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[vector-store] failed to delete meta from Mongo: {exc}", flush=True)
+
+            self._next_int_id = (max(self.meta.keys()) + 1) if self.meta else 1
+            self._save_state()
+
+        return removed
+
 
     def _resolve_faiss_id(self, raw_id: Optional[Any]) -> Tuple[Optional[int], Optional[str]]:
         """
