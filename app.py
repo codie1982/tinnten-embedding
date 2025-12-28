@@ -544,6 +544,8 @@ def search_category_vector():
     return _vector_search_response(category_store, label="category search")
 
 @app.route("/api/v10/categories", methods=["GET"])
+@app.route("/categories", methods=["GET"])
+@app.route("/embedding/categories", methods=["GET"])
 def list_categories():
     limit = _parse_int(request.args.get("limit"), 100, minimum=0)
     offset = _parse_int(request.args.get("offset"), 0, minimum=0)
@@ -571,6 +573,8 @@ def list_categories():
     return jsonify({"total": total, "offset": offset, "limit": limit, "items": items})
 
 @app.route("/api/v10/categories", methods=["POST"])
+@app.route("/categories", methods=["POST"])
+@app.route("/embedding/categories", methods=["POST"])
 def create_category():
     payload = request.get_json() or {}
     try:
@@ -580,6 +584,8 @@ def create_category():
     return _vector_upsert_response(category_store, label="category create", payload=payload)
 
 @app.route("/api/v10/categories/<category_id>", methods=["GET"])
+@app.route("/categories/<category_id>", methods=["GET"])
+@app.route("/embedding/categories/<category_id>", methods=["GET"])
 def get_category(category_id: str):
     if not category_id:
         return jsonify({"error": "category_id is required"}), 400
@@ -602,6 +608,8 @@ def get_category(category_id: str):
     return jsonify(entry)
 
 @app.route("/api/v10/categories/<category_id>", methods=["PUT", "PATCH"])
+@app.route("/categories/<category_id>", methods=["PUT", "PATCH"])
+@app.route("/embedding/categories/<category_id>", methods=["PUT", "PATCH"])
 def update_category(category_id: str):
     if not category_id:
         return jsonify({"error": "category_id is required"}), 400
@@ -626,6 +634,8 @@ def update_category(category_id: str):
     return _vector_upsert_response(category_store, label="category update", payload=payload)
 
 @app.route("/api/v10/categories/<category_id>", methods=["DELETE"])
+@app.route("/categories/<category_id>", methods=["DELETE"])
+@app.route("/embedding/categories/<category_id>", methods=["DELETE"])
 def delete_category(category_id: str):
     if not category_id:
         return jsonify({"error": "category_id is required"}), 400
