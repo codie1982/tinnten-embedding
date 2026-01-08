@@ -213,6 +213,12 @@ def _normalize_category_payload(payload: dict) -> dict:
         meta_payload = dict(meta_payload)
         meta_payload["parentId"] = str(parent_id)
 
+    # companyId desteği
+    company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
+    if company_id is not None:
+        meta_payload = dict(meta_payload)
+        meta_payload["companyId"] = str(company_id)
+
     payload["metadata"] = meta_payload
     return payload
 
@@ -226,6 +232,12 @@ def _normalize_attribute_payload(payload: dict) -> dict:
     if category_id is not None:
         meta_payload = dict(meta_payload)
         meta_payload["categoryId"] = str(category_id)
+
+    # companyId desteği
+    company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
+    if company_id is not None:
+        meta_payload = dict(meta_payload)
+        meta_payload["companyId"] = str(company_id)
 
     payload["metadata"] = meta_payload
     return payload
@@ -565,6 +577,12 @@ def list_categories():
         filter_arg = dict(filter_arg or {})
         filter_arg["text"] = str(text)
 
+    # companyId filter desteği
+    company_id = request.args.get("companyId") or request.args.get("company_id") or request.args.get("companyid")
+    if company_id is not None:
+        filter_arg = dict(filter_arg or {})
+        filter_arg["metadata.companyId"] = str(company_id)
+
     total, items = category_store.list_entries(
         offset=offset,
         limit=limit,
@@ -577,6 +595,12 @@ def list_categories():
 @app.route("/embedding/categories", methods=["POST"])
 def create_category():
     payload = request.get_json() or {}
+    
+    # companyId zorunluluğu
+    company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
+    if not company_id:
+        return jsonify({"error": "companyId is required"}), 400
+    
     try:
         payload = _normalize_category_payload(payload)
     except ValueError as exc:
@@ -584,12 +608,16 @@ def create_category():
 
     text = payload.get("text")
     if text:
-        # Check for duplicates by exact text match
-        total, exists = category_store.list_entries(limit=1, simple_filter={"text": text})
+        # Check for duplicates by exact text match within the same company
+        duplicate_filter = {
+            "text": text,
+            "metadata.companyId": str(company_id)
+        }
+        total, exists = category_store.list_entries(limit=1, simple_filter=duplicate_filter)
         if total > 0:
             return jsonify({
                 "error": "duplicate_entry",
-                "message": f"Category with name '{text}' already exists.",
+                "message": f"Category with name '{text}' already exists in this company.",
                 "existing_id": exists[0].get("id")
             }), 409
 
@@ -634,10 +662,20 @@ def update_category(category_id: str):
         return jsonify({"error": "multiple_matches", "count": len(ids)}), 409
 
     resolved_id = ids[0]
-    if not category_store.get_entry(resolved_id):
+    existing_entry = category_store.get_entry(resolved_id)
+    if not existing_entry:
         return jsonify({"error": "not_found"}), 404
 
     payload = request.get_json() or {}
+    
+    # companyId validasyonu
+    company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
+    existing_company_id = (existing_entry.get("metadata") or {}).get("companyId")
+    
+    # Eğer mevcut kategorinin companyId'si varsa, gönderilen companyId eşleşmeli
+    if existing_company_id and company_id and str(existing_company_id) != str(company_id):
+        return jsonify({"error": "forbidden", "message": "Bu kategoriyi düzenleme yetkiniz yok."}), 403
+    
     payload["id"] = payload.get("id") or resolved_id
     try:
         payload = _normalize_category_payload(payload)
@@ -652,10 +690,23 @@ def delete_category(category_id: str):
     if not category_id:
         return jsonify({"error": "category_id is required"}), 400
 
+    # companyId validasyonu (query parameter veya header)
+    company_id = request.args.get("companyId") or request.args.get("company_id") or request.args.get("companyid")
+
     use_external = _should_use_external_id()
     ids, id_kind = _resolve_ids_for_identifier(category_store, category_id, use_external)
     if not ids:
         return jsonify({"error": "not_found"}), 404
+    
+    # Her ID için companyId kontrolü
+    if company_id:
+        for fid in ids:
+            entry = category_store.get_entry(fid)
+            if entry:
+                existing_company_id = (entry.get("metadata") or {}).get("companyId")
+                if existing_company_id and str(existing_company_id) != str(company_id):
+                    return jsonify({"error": "forbidden", "message": "Bu kategoriyi silme yetkiniz yok."}), 403
+    
     try:
         removed = category_store.delete_by_ids(ids)
     except RuntimeError as exc:
@@ -707,6 +758,18 @@ def list_attributes():
         filter_arg = dict(filter_arg or {})
         filter_arg["text"] = str(text)
 
+    # companyId filter desteği
+    company_id = request.args.get("companyId") or request.args.get("company_id") or request.args.get("companyid")
+    if company_id is not None:
+        filter_arg = dict(filter_arg or {})
+        filter_arg["metadata.companyId"] = str(company_id)
+
+    # categoryId filter desteği
+    category_id = request.args.get("categoryId") or request.args.get("category_id") or request.args.get("categoryid")
+    if category_id is not None:
+        filter_arg = dict(filter_arg or {})
+        filter_arg["metadata.categoryId"] = str(category_id)
+
     total, items = attribute_store.list_entries(
         offset=offset,
         limit=limit,
@@ -717,6 +780,12 @@ def list_attributes():
 @app.route("/api/v10/attributes", methods=["POST"])
 def create_attribute():
     payload = request.get_json() or {}
+    
+    # companyId zorunluluğu
+    company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
+    if not company_id:
+        return jsonify({"error": "companyId is required"}), 400
+    
     try:
         payload = _normalize_attribute_payload(payload)
     except ValueError as exc:
@@ -724,12 +793,16 @@ def create_attribute():
 
     text = payload.get("text")
     if text:
-        # Check for duplicates by exact text match
-        total, exists = attribute_store.list_entries(limit=1, simple_filter={"text": text})
+        # Check for duplicates by exact text match within the same company
+        duplicate_filter = {
+            "text": text,
+            "metadata.companyId": str(company_id)
+        }
+        total, exists = attribute_store.list_entries(limit=1, simple_filter=duplicate_filter)
         if total > 0:
             return jsonify({
                 "error": "duplicate_entry",
-                "message": f"Attribute with name '{text}' already exists.",
+                "message": f"Attribute with name '{text}' already exists in this company.",
                 "existing_id": exists[0].get("id")
             }), 409
 
@@ -770,10 +843,20 @@ def update_attribute(attribute_id: str):
         return jsonify({"error": "multiple_matches", "count": len(ids)}), 409
 
     resolved_id = ids[0]
-    if not attribute_store.get_entry(resolved_id):
+    existing_entry = attribute_store.get_entry(resolved_id)
+    if not existing_entry:
         return jsonify({"error": "not_found"}), 404
 
     payload = request.get_json() or {}
+    
+    # companyId validasyonu
+    company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
+    existing_company_id = (existing_entry.get("metadata") or {}).get("companyId")
+    
+    # Eğer mevcut attribute'un companyId'si varsa, gönderilen companyId eşleşmeli
+    if existing_company_id and company_id and str(existing_company_id) != str(company_id):
+        return jsonify({"error": "forbidden", "message": "Bu attribute'ü düzenleme yetkiniz yok."}), 403
+    
     payload["id"] = payload.get("id") or resolved_id
     try:
         payload = _normalize_attribute_payload(payload)
@@ -786,10 +869,23 @@ def delete_attribute(attribute_id: str):
     if not attribute_id:
         return jsonify({"error": "attribute_id is required"}), 400
 
+    # companyId validasyonu (query parameter)
+    company_id = request.args.get("companyId") or request.args.get("company_id") or request.args.get("companyid")
+
     use_external = _should_use_external_id()
     ids, id_kind = _resolve_ids_for_identifier(attribute_store, attribute_id, use_external)
     if not ids:
         return jsonify({"error": "not_found"}), 404
+    
+    # Her ID için companyId kontrolü
+    if company_id:
+        for fid in ids:
+            entry = attribute_store.get_entry(fid)
+            if entry:
+                existing_company_id = (entry.get("metadata") or {}).get("companyId")
+                if existing_company_id and str(existing_company_id) != str(company_id):
+                    return jsonify({"error": "forbidden", "message": "Bu attribute'ü silme yetkiniz yok."}), 403
+    
     try:
         removed = attribute_store.delete_by_ids(ids)
     except RuntimeError as exc:
