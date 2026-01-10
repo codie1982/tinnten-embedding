@@ -704,10 +704,21 @@ class EmbeddingIndex:
                 if current is None or str(current) != str(val):
                     return False
                 continue
+            if key in {"parentId", "parent_id", "parentid"}:
+                # parentId is stored in metadata.parentId
+                current = (item_meta.get("metadata") or {}).get("parentId")
+                if current is None or str(current) != str(val):
+                    return False
+                continue
             if key.startswith("metadata."):
                 sub = key.split(".", 1)[1]
                 if sub in {"companyId", "company_id", "companyid"}:
                     current = item_meta.get("companyId") or (item_meta.get("metadata") or {}).get(sub)
+                    if current is None or str(current) != str(val):
+                        return False
+                    continue
+                if sub in {"parentId", "parent_id", "parentid"}:
+                    current = (item_meta.get("metadata") or {}).get("parentId")
                     if current is None or str(current) != str(val):
                         return False
                     continue

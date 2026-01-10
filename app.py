@@ -780,6 +780,15 @@ def list_categories():
     if filter_arg and "metadata.companyId" in filter_arg:
         filter_arg["companyId"] = str(filter_arg.pop("metadata.companyId"))
 
+    # parentId filter desteği (alt kategorileri getirmek için)
+    parent_id = request.args.get("parentId") or request.args.get("parent_id") or request.args.get("parentid")
+    if parent_id is not None:
+        filter_arg = dict(filter_arg or {})
+        filter_arg["parentId"] = str(parent_id)
+    # eski format filtre anahtarı gelirse normalize et
+    if filter_arg and "metadata.parentId" in filter_arg:
+        filter_arg["parentId"] = str(filter_arg.pop("metadata.parentId"))
+
     total, items = category_store.list_entries(
         offset=offset,
         limit=limit,
