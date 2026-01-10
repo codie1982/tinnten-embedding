@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timezone
 
 import numpy as np
+from bson import ObjectId
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -23,6 +24,7 @@ from services.embedding_engine import EmbeddingEngine
 from services.mongo_store import MongoStore
 from services.rabbit_publisher import RabbitPublisher
 from keycloak_service import get_keycloak_service, KeycloakError, KeycloakTokenError
+from init.db import get_database
 
 load_dotenv()
 
@@ -201,6 +203,55 @@ def _resolve_ids_for_identifier(target_store, identifier: str, use_external: boo
         ids = target_store.find_ids_by_external_id(str(identifier))
         return ids, "external_id"
     return [int(identifier)], "id"
+
+
+def _safe_object_id(value):
+    try:
+        return ObjectId(str(value))
+    except Exception:
+        return None
+
+
+def _validate_company_user(company_id: str | None, user_id: str | None):
+    if not company_id:
+        return False, "companyId is required"
+    if not user_id:
+        return False, "userId is required"
+
+    db = get_database()
+    companies = db["companies"]
+
+    company_filters = [{"companyId": str(company_id)}, {"companyid": str(company_id)}, {"id": str(company_id)}]
+    oid = _safe_object_id(company_id)
+    if oid:
+        company_filters.append({"_id": oid})
+
+    query = {
+        "$and": [
+            {"$or": company_filters},
+            {"active": True},
+            {"adminActive": True},
+        ]
+    }
+    company = companies.find_one(query, {"_id": 1, "userId": 1, "user_id": 1, "userid": 1, "active": 1, "adminActive": 1})
+    if not company:
+        return False, "company_not_found_or_inactive"
+
+    company_user = company.get("userId") or company.get("user_id") or company.get("userid")
+    if company_user is None:
+        return False, "company_user_missing"
+
+    def _match(a, b):
+        a_oid = _safe_object_id(a)
+        b_oid = _safe_object_id(b)
+        if a_oid and b_oid:
+            return a_oid == b_oid
+        return str(a) == str(b)
+
+    if not _match(company_user, user_id):
+        return False, "user_mismatch"
+
+    return True, None
 
 
 def _normalize_category_payload(payload: dict) -> dict:
@@ -668,11 +719,17 @@ def upsert_category_vector():
     JSON body:
         parentId (str, optional): Parent category identifier; stored under metadata.parentId.
         companyId (str, required): Firma kimliği; metadata yerine üst seviyede tutulur.
+        userId (str, required): Şirket sahibi kullanıcı.
     """
     payload = request.get_json() or {}
     company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
+    user_id = payload.get("userId") or payload.get("user_id") or payload.get("userid")
     if not company_id:
         return jsonify({"error": "companyId is required"}), 400
+    ok, reason = _validate_company_user(str(company_id), str(user_id) if user_id is not None else None)
+    if not ok:
+        status = 400 if reason in {"companyId is required", "userId is required"} else 403
+        return jsonify({"error": reason}), status
     try:
         payload = _normalize_category_payload(payload)
     except ValueError as exc:
@@ -740,8 +797,13 @@ def create_category():
     
     # companyId zorunluluğu
     company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
+    user_id = payload.get("userId") or payload.get("user_id") or payload.get("userid")
     if not company_id:
         return jsonify({"error": "companyId is required"}), 400
+    ok, reason = _validate_company_user(str(company_id), str(user_id) if user_id is not None else None)
+    if not ok:
+        status = 400 if reason in {"companyId is required", "userId is required"} else 403
+        return jsonify({"error": reason}), status
     
     try:
         payload = _normalize_category_payload(payload)
@@ -823,11 +885,17 @@ def update_category(category_id: str):
     
     # companyId validasyonu
     company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
+    user_id = payload.get("userId") or payload.get("user_id") or payload.get("userid")
     existing_company_id = existing_entry.get("companyId")
     
     # Eğer mevcut kategorinin companyId'si varsa, gönderilen companyId eşleşmeli
     if existing_company_id and company_id and str(existing_company_id) != str(company_id):
         return jsonify({"error": "forbidden", "message": "Bu kategoriyi düzenleme yetkiniz yok."}), 403
+    target_company_id = company_id or existing_company_id
+    ok, reason = _validate_company_user(str(target_company_id) if target_company_id is not None else None, str(user_id) if user_id is not None else None)
+    if not ok:
+        status = 400 if reason in {"companyId is required", "userId is required"} else 403
+        return jsonify({"error": reason}), status
     
     payload["id"] = payload.get("id") or resolved_id
     try:
@@ -890,11 +958,17 @@ def upsert_attribute_vector():
     JSON body:
         categoryId (str, optional): Link attribute to a category; stored under metadata.categoryId.
         companyId (str, required): Firma kimliği; metadata yerine üst seviyede tutulur.
+        userId (str, required): Şirket sahibi kullanıcı.
     """
     payload = request.get_json() or {}
     company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
+    user_id = payload.get("userId") or payload.get("user_id") or payload.get("userid")
     if not company_id:
         return jsonify({"error": "companyId is required"}), 400
+    ok, reason = _validate_company_user(str(company_id), str(user_id) if user_id is not None else None)
+    if not ok:
+        status = 400 if reason in {"companyId is required", "userId is required"} else 403
+        return jsonify({"error": reason}), status
     try:
         payload = _normalize_attribute_payload(payload)
     except ValueError as exc:
@@ -965,8 +1039,13 @@ def create_attribute():
     
     # companyId zorunluluğu
     company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
+    user_id = payload.get("userId") or payload.get("user_id") or payload.get("userid")
     if not company_id:
         return jsonify({"error": "companyId is required"}), 400
+    ok, reason = _validate_company_user(str(company_id), str(user_id) if user_id is not None else None)
+    if not ok:
+        status = 400 if reason in {"companyId is required", "userId is required"} else 403
+        return jsonify({"error": reason}), status
     
     try:
         payload = _normalize_attribute_payload(payload)
@@ -1040,11 +1119,17 @@ def update_attribute(attribute_id: str):
     
     # companyId validasyonu
     company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
+    user_id = payload.get("userId") or payload.get("user_id") or payload.get("userid")
     existing_company_id = existing_entry.get("companyId")
     
     # Eğer mevcut attribute'un companyId'si varsa, gönderilen companyId eşleşmeli
     if existing_company_id and company_id and str(existing_company_id) != str(company_id):
         return jsonify({"error": "forbidden", "message": "Bu attribute'ü düzenleme yetkiniz yok."}), 403
+    target_company_id = company_id or existing_company_id
+    ok, reason = _validate_company_user(str(target_company_id) if target_company_id is not None else None, str(user_id) if user_id is not None else None)
+    if not ok:
+        status = 400 if reason in {"companyId is required", "userId is required"} else 403
+        return jsonify({"error": reason}), status
     
     payload["id"] = payload.get("id") or resolved_id
     try:
