@@ -208,19 +208,104 @@ def _normalize_category_payload(payload: dict) -> dict:
     if meta_payload and not isinstance(meta_payload, dict):
         raise ValueError("metadata must be an object")
 
+    meta_payload = dict(meta_payload)
+    for key in ("companyId", "company_id", "companyid"):
+        meta_payload.pop(key, None)
+
     parent_id = payload.get("parentId") or payload.get("parent_id") or payload.get("parent")
     if parent_id is not None:
-        meta_payload = dict(meta_payload)
         meta_payload["parentId"] = str(parent_id)
 
-    # companyId desteği
+    description = payload.get("description") or payload.get("desc")
+    if description is not None:
+        meta_payload["description"] = str(description)
+
     company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
     if company_id is not None:
-        meta_payload = dict(meta_payload)
-        meta_payload["companyId"] = str(company_id)
+        payload["companyId"] = str(company_id)
 
     payload["metadata"] = meta_payload
     return payload
+
+
+def _map_category_entry_basic(entry: dict | None) -> dict | None:
+    if not entry:
+        return None
+    metadata = entry.get("metadata") or {}
+    out = {
+        "categoryId": entry.get("external_id"),
+        "text": entry.get("text"),
+        "companyId": entry.get("companyId"),
+        "description": metadata.get("description"),
+        "metadata": metadata,
+    }
+    if entry.get("score") is not None:
+        out["score"] = entry.get("score")
+    return out
+
+
+def _get_category_by_external_id(external_id: str | None):
+    if not external_id:
+        return None
+    ids = category_store.find_ids_by_external_id(str(external_id))
+    for cid in ids:
+        entry = category_store.get_entry(cid)
+        if entry:
+            return entry
+    return None
+
+
+def _build_category_parent_chain(entry: dict | None) -> list[dict]:
+    parents: list[dict] = []
+    if not entry:
+        return parents
+    seen: set[str] = set()
+    parent_id = (entry.get("metadata") or {}).get("parentId")
+    while parent_id:
+        if parent_id in seen:
+            break
+        seen.add(parent_id)
+        parent_entry = _get_category_by_external_id(parent_id)
+        mapped = _map_category_entry_basic(parent_entry)
+        if not mapped:
+            break
+        parents.append(mapped)
+        parent_id = (parent_entry.get("metadata") or {}).get("parentId")
+    # reverse to have root-first ordering
+    parents.reverse()
+    return parents
+
+
+def _map_category_entry(entry: dict | None, include_parents: bool = True, include_attributes: bool = False) -> dict | None:
+    base = _map_category_entry_basic(entry)
+    if not base:
+        return None
+
+    if include_parents:
+        parents = _build_category_parent_chain(entry)
+        if parents:
+            base["parents"] = parents
+        path_parts = [p.get("text") for p in (parents or []) if p.get("text")]
+        if entry and entry.get("text"):
+            path_parts.append(entry.get("text"))
+        if path_parts:
+            base["parentPath"] = ".".join(path_parts)
+
+    if include_attributes:
+        base["attributes"] = _fetch_attributes_for_category(base.get("categoryId"), base.get("companyId"))
+
+    return base
+
+
+def _fetch_attributes_for_category(category_external_id: str | None, company_id: str | None):
+    if not category_external_id:
+        return []
+    filt = {"metadata.categoryId": str(category_external_id)}
+    if company_id:
+        filt["companyId"] = str(company_id)
+    total, items = attribute_store.list_entries(limit=None, simple_filter=filt)
+    mapped = [_map_attribute_entry(item) for item in items]
+    return [m for m in mapped if m]
 
 
 def _normalize_attribute_payload(payload: dict) -> dict:
@@ -228,19 +313,34 @@ def _normalize_attribute_payload(payload: dict) -> dict:
     if meta_payload and not isinstance(meta_payload, dict):
         raise ValueError("metadata must be an object")
 
+    meta_payload = dict(meta_payload)
+    for key in ("companyId", "company_id", "companyid"):
+        meta_payload.pop(key, None)
+
     category_id = payload.get("categoryId") or payload.get("category_id") or payload.get("category")
     if category_id is not None:
-        meta_payload = dict(meta_payload)
         meta_payload["categoryId"] = str(category_id)
 
-    # companyId desteği
     company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
     if company_id is not None:
-        meta_payload = dict(meta_payload)
-        meta_payload["companyId"] = str(company_id)
+        payload["companyId"] = str(company_id)
 
     payload["metadata"] = meta_payload
     return payload
+
+
+def _map_attribute_entry(entry: dict | None) -> dict | None:
+    if not entry:
+        return None
+    out = {
+        "attributeId": entry.get("external_id"),
+        "text": entry.get("text"),
+        "companyId": entry.get("companyId"),
+        "metadata": entry.get("metadata") or {},
+    }
+    if entry.get("score") is not None:
+        out["score"] = entry.get("score")
+    return out
 
 
 def _resolve_upload_s3_location(upload_doc, file_doc):
@@ -271,21 +371,32 @@ def _resolve_upload_s3_location(upload_doc, file_doc):
     raise RuntimeError("Unable to resolve S3 object key for upload.")
 
 
-def _vector_upsert_response(target_store, label: str = "upsert", payload: dict | None = None):
+def _vector_upsert_response(
+    target_store,
+    label: str = "upsert",
+    payload: dict | None = None,
+    transform=None,
+):
     try:
         payload = payload if payload is not None else (request.get_json() or {})
         text = payload.get("text")
         vector = payload.get("vector")
         external_id = payload.get("external_id")
         metadata = payload.get("metadata") or {}
+        if metadata and not isinstance(metadata, dict):
+            raise ValueError("metadata must be an object")
+        company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
+        metadata = dict(metadata or {})
         int_id = payload.get("id")
-        out = target_store.upsert_vector(text, vector, external_id, metadata, int_id)
+        out = target_store.upsert_vector(text, vector, external_id, metadata, int_id, company_id)
+        if transform:
+            out = transform(out)
         return jsonify(out)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"{label} failed: {exc}"}), 400
 
 
-def _vector_search_response(target_store, label: str = "search", payload: dict | None = None):
+def _vector_search_response(target_store, label: str = "search", payload: dict | None = None, transform=None):
     try:
         payload = payload if payload is not None else (request.get_json() or {})
         text = payload.get("text")
@@ -293,6 +404,13 @@ def _vector_search_response(target_store, label: str = "search", payload: dict |
         k = int(payload.get("k") or 5)
         filt = payload.get("filter") or {}
         results = target_store.search(text, vector, k, filt)
+        if transform:
+            transformed = []
+            for item in results:
+                mapped = transform(item)
+                if mapped:
+                    transformed.append(mapped)
+            results = transformed
         return jsonify({"results": results})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"{label} failed: {exc}"}), 400
@@ -524,9 +642,19 @@ def search_vector():
     if target in {"chunk", "chunks", "content"}:
         return _chunk_search_response(payload)
     if target in {"category", "categories"}:
-        return _vector_search_response(category_store, label="category search", payload=payload)
+        return _vector_search_response(
+            category_store,
+            label="category search",
+            payload=payload,
+            transform=_map_category_entry,
+        )
     if target in {"attribute", "attributes"}:
-        return _vector_search_response(attribute_store, label="attribute search", payload=payload)
+        return _vector_search_response(
+            attribute_store,
+            label="attribute search",
+            payload=payload,
+            transform=_map_attribute_entry,
+        )
 
     # Fallback to legacy/vector search against the general index
     return _vector_search_response(store, label="vector search", payload=payload)
@@ -539,13 +667,22 @@ def upsert_category_vector():
 
     JSON body:
         parentId (str, optional): Parent category identifier; stored under metadata.parentId.
+        companyId (str, required): Firma kimliği; metadata yerine üst seviyede tutulur.
     """
     payload = request.get_json() or {}
+    company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
+    if not company_id:
+        return jsonify({"error": "companyId is required"}), 400
     try:
         payload = _normalize_category_payload(payload)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
-    return _vector_upsert_response(category_store, label="category upsert", payload=payload)
+    return _vector_upsert_response(
+        category_store,
+        label="category upsert",
+        payload=payload,
+        transform=lambda out: {"categoryId": out.get("external_id")},
+    )
 
 
 @app.route("/api/v10/categories/search", methods=["POST"])
@@ -553,7 +690,7 @@ def search_category_vector():
     """
     Run a similarity search on the category FAISS index.
     """
-    return _vector_search_response(category_store, label="category search")
+    return _vector_search_response(category_store, label="category search", transform=_map_category_entry)
 
 @app.route("/api/v10/categories", methods=["GET"])
 @app.route("/categories", methods=["GET"])
@@ -581,14 +718,19 @@ def list_categories():
     company_id = request.args.get("companyId") or request.args.get("company_id") or request.args.get("companyid")
     if company_id is not None:
         filter_arg = dict(filter_arg or {})
-        filter_arg["metadata.companyId"] = str(company_id)
+        filter_arg["companyId"] = str(company_id)
+    # eski format filtre anahtarı gelirse normalize et
+    if filter_arg and "metadata.companyId" in filter_arg:
+        filter_arg["companyId"] = str(filter_arg.pop("metadata.companyId"))
 
     total, items = category_store.list_entries(
         offset=offset,
         limit=limit,
         simple_filter=filter_arg,
     )
-    return jsonify({"total": total, "offset": offset, "limit": limit, "items": items})
+    mapped = [_map_category_entry(item) for item in items]
+    mapped = [m for m in mapped if m]
+    return jsonify({"total": total, "offset": offset, "limit": limit, "items": mapped})
 
 @app.route("/api/v10/categories", methods=["POST"])
 @app.route("/categories", methods=["POST"])
@@ -611,17 +753,21 @@ def create_category():
         # Check for duplicates by exact text match within the same company
         duplicate_filter = {
             "text": text,
-            "metadata.companyId": str(company_id)
+            "companyId": str(company_id)
         }
         total, exists = category_store.list_entries(limit=1, simple_filter=duplicate_filter)
         if total > 0:
             return jsonify({
                 "error": "duplicate_entry",
                 "message": f"Category with name '{text}' already exists in this company.",
-                "existing_id": exists[0].get("id")
+                "existing_categoryId": exists[0].get("external_id")
             }), 409
-
-    return _vector_upsert_response(category_store, label="category create", payload=payload)
+    return _vector_upsert_response(
+        category_store,
+        label="category create",
+        payload=payload,
+        transform=lambda out: {"categoryId": out.get("external_id")},
+    )
 
 @app.route("/api/v10/categories/<category_id>", methods=["GET"])
 @app.route("/categories/<category_id>", methods=["GET"])
@@ -639,13 +785,20 @@ def get_category(category_id: str):
         entries = [category_store.get_entry(fid) for fid in ids]
         entries = [entry for entry in entries if entry]
         if len(entries) == 1:
-            return jsonify(entries[0])
-        return jsonify({"items": entries, "count": len(entries)})
+            mapped = _map_category_entry(entries[0], include_attributes=True)
+            return jsonify(mapped)
+        mapped = []
+        for e in entries:
+            obj = _map_category_entry(e, include_attributes=True)
+            if obj:
+                mapped.append(obj)
+        return jsonify({"items": mapped, "count": len(mapped)})
 
     entry = category_store.get_entry(ids[0])
     if not entry:
         return jsonify({"error": "not_found"}), 404
-    return jsonify(entry)
+    mapped_entry = _map_category_entry(entry, include_attributes=True)
+    return jsonify(mapped_entry)
 
 @app.route("/api/v10/categories/<category_id>", methods=["PUT", "PATCH"])
 @app.route("/categories/<category_id>", methods=["PUT", "PATCH"])
@@ -670,7 +823,7 @@ def update_category(category_id: str):
     
     # companyId validasyonu
     company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
-    existing_company_id = (existing_entry.get("metadata") or {}).get("companyId")
+    existing_company_id = existing_entry.get("companyId")
     
     # Eğer mevcut kategorinin companyId'si varsa, gönderilen companyId eşleşmeli
     if existing_company_id and company_id and str(existing_company_id) != str(company_id):
@@ -681,7 +834,12 @@ def update_category(category_id: str):
         payload = _normalize_category_payload(payload)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
-    return _vector_upsert_response(category_store, label="category update", payload=payload)
+    return _vector_upsert_response(
+        category_store,
+        label="category update",
+        payload=payload,
+        transform=lambda out: {"categoryId": out.get("external_id")},
+    )
 
 @app.route("/api/v10/categories/<category_id>", methods=["DELETE"])
 @app.route("/categories/<category_id>", methods=["DELETE"])
@@ -698,21 +856,30 @@ def delete_category(category_id: str):
     if not ids:
         return jsonify({"error": "not_found"}), 404
     
+    external_ids: list[str | None] = []
     # Her ID için companyId kontrolü
     if company_id:
         for fid in ids:
             entry = category_store.get_entry(fid)
             if entry:
-                existing_company_id = (entry.get("metadata") or {}).get("companyId")
+                existing_company_id = entry.get("companyId")
                 if existing_company_id and str(existing_company_id) != str(company_id):
                     return jsonify({"error": "forbidden", "message": "Bu kategoriyi silme yetkiniz yok."}), 403
+                external_ids.append(entry.get("external_id"))
+            else:
+                external_ids.append(None)
+    else:
+        for fid in ids:
+            entry = category_store.get_entry(fid)
+            external_ids.append((entry or {}).get("external_id"))
     
     try:
         removed = category_store.delete_by_ids(ids)
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 500
 
-    return jsonify({"removed": removed, "ids": ids, "identifierType": id_kind})
+    clean_external = [eid for eid in external_ids if eid is not None]
+    return jsonify({"removed": removed, "categoryIds": clean_external, "identifierType": id_kind})
 
 
 @app.route("/api/v10/attributes/upsert", methods=["POST"])
@@ -722,13 +889,22 @@ def upsert_attribute_vector():
 
     JSON body:
         categoryId (str, optional): Link attribute to a category; stored under metadata.categoryId.
+        companyId (str, required): Firma kimliği; metadata yerine üst seviyede tutulur.
     """
     payload = request.get_json() or {}
+    company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
+    if not company_id:
+        return jsonify({"error": "companyId is required"}), 400
     try:
         payload = _normalize_attribute_payload(payload)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
-    return _vector_upsert_response(attribute_store, label="attribute upsert", payload=payload)
+    return _vector_upsert_response(
+        attribute_store,
+        label="attribute upsert",
+        payload=payload,
+        transform=lambda out: {"attributeId": out.get("external_id")},
+    )
 
 
 @app.route("/api/v10/attributes/search", methods=["POST"])
@@ -736,7 +912,7 @@ def search_attribute_vector():
     """
     Run a similarity search on the attribute FAISS index.
     """
-    return _vector_search_response(attribute_store, label="attribute search")
+    return _vector_search_response(attribute_store, label="attribute search", transform=_map_attribute_entry)
 
 @app.route("/api/v10/attributes", methods=["GET"])
 def list_attributes():
@@ -762,7 +938,7 @@ def list_attributes():
     company_id = request.args.get("companyId") or request.args.get("company_id") or request.args.get("companyid")
     if company_id is not None:
         filter_arg = dict(filter_arg or {})
-        filter_arg["metadata.companyId"] = str(company_id)
+        filter_arg["companyId"] = str(company_id)
 
     # categoryId filter desteği
     category_id = request.args.get("categoryId") or request.args.get("category_id") or request.args.get("categoryid")
@@ -770,12 +946,18 @@ def list_attributes():
         filter_arg = dict(filter_arg or {})
         filter_arg["metadata.categoryId"] = str(category_id)
 
+    # eski format filtre anahtarı gelirse normalize et
+    if filter_arg and "metadata.companyId" in filter_arg:
+        filter_arg["companyId"] = str(filter_arg.pop("metadata.companyId"))
+
     total, items = attribute_store.list_entries(
         offset=offset,
         limit=limit,
         simple_filter=filter_arg,
     )
-    return jsonify({"total": total, "offset": offset, "limit": limit, "items": items})
+    mapped = [_map_attribute_entry(item) for item in items]
+    mapped = [m for m in mapped if m]
+    return jsonify({"total": total, "offset": offset, "limit": limit, "items": mapped})
 
 @app.route("/api/v10/attributes", methods=["POST"])
 def create_attribute():
@@ -796,17 +978,22 @@ def create_attribute():
         # Check for duplicates by exact text match within the same company
         duplicate_filter = {
             "text": text,
-            "metadata.companyId": str(company_id)
+            "companyId": str(company_id)
         }
         total, exists = attribute_store.list_entries(limit=1, simple_filter=duplicate_filter)
         if total > 0:
             return jsonify({
                 "error": "duplicate_entry",
                 "message": f"Attribute with name '{text}' already exists in this company.",
-                "existing_id": exists[0].get("id")
+                "existing_attributeId": exists[0].get("external_id")
             }), 409
 
-    return _vector_upsert_response(attribute_store, label="attribute create", payload=payload)
+    return _vector_upsert_response(
+        attribute_store,
+        label="attribute create",
+        payload=payload,
+        transform=lambda out: {"attributeId": out.get("external_id")},
+    )
 
 @app.route("/api/v10/attributes/<attribute_id>", methods=["GET"])
 def get_attribute(attribute_id: str):
@@ -822,13 +1009,15 @@ def get_attribute(attribute_id: str):
         entries = [attribute_store.get_entry(fid) for fid in ids]
         entries = [entry for entry in entries if entry]
         if len(entries) == 1:
-            return jsonify(entries[0])
-        return jsonify({"items": entries, "count": len(entries)})
+            return jsonify(_map_attribute_entry(entries[0]))
+        mapped = [_map_attribute_entry(e) for e in entries]
+        mapped = [m for m in mapped if m]
+        return jsonify({"items": mapped, "count": len(mapped)})
 
     entry = attribute_store.get_entry(ids[0])
     if not entry:
         return jsonify({"error": "not_found"}), 404
-    return jsonify(entry)
+    return jsonify(_map_attribute_entry(entry))
 
 @app.route("/api/v10/attributes/<attribute_id>", methods=["PUT", "PATCH"])
 def update_attribute(attribute_id: str):
@@ -851,7 +1040,7 @@ def update_attribute(attribute_id: str):
     
     # companyId validasyonu
     company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
-    existing_company_id = (existing_entry.get("metadata") or {}).get("companyId")
+    existing_company_id = existing_entry.get("companyId")
     
     # Eğer mevcut attribute'un companyId'si varsa, gönderilen companyId eşleşmeli
     if existing_company_id and company_id and str(existing_company_id) != str(company_id):
@@ -862,7 +1051,12 @@ def update_attribute(attribute_id: str):
         payload = _normalize_attribute_payload(payload)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
-    return _vector_upsert_response(attribute_store, label="attribute update", payload=payload)
+    return _vector_upsert_response(
+        attribute_store,
+        label="attribute update",
+        payload=payload,
+        transform=lambda out: {"attributeId": out.get("external_id")},
+    )
 
 @app.route("/api/v10/attributes/<attribute_id>", methods=["DELETE"])
 def delete_attribute(attribute_id: str):
@@ -877,21 +1071,30 @@ def delete_attribute(attribute_id: str):
     if not ids:
         return jsonify({"error": "not_found"}), 404
     
+    external_ids: list[str | None] = []
     # Her ID için companyId kontrolü
     if company_id:
         for fid in ids:
             entry = attribute_store.get_entry(fid)
             if entry:
-                existing_company_id = (entry.get("metadata") or {}).get("companyId")
+                existing_company_id = entry.get("companyId")
                 if existing_company_id and str(existing_company_id) != str(company_id):
                     return jsonify({"error": "forbidden", "message": "Bu attribute'ü silme yetkiniz yok."}), 403
+                external_ids.append(entry.get("external_id"))
+            else:
+                external_ids.append(None)
+    else:
+        for fid in ids:
+            entry = attribute_store.get_entry(fid)
+            external_ids.append((entry or {}).get("external_id"))
     
     try:
         removed = attribute_store.delete_by_ids(ids)
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 500
 
-    return jsonify({"removed": removed, "ids": ids, "identifierType": id_kind})
+    clean_external = [eid for eid in external_ids if eid is not None]
+    return jsonify({"removed": removed, "attributeIds": clean_external, "identifierType": id_kind})
 
 
 @app.route("/api/v10/content/search", methods=["POST"])

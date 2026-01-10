@@ -75,15 +75,22 @@ class MetaRepository:
             "faiss_id": int(faiss_id),
             "external_id": meta.get("external_id"),
             "text": meta.get("text"),
+            "companyId": meta.get("companyId"),
             "metadata": meta.get("metadata") or {},
         }
 
     @staticmethod
     def _extract_meta(doc: Dict[str, Any]) -> Dict[str, Any]:
+        company_id = doc.get("companyId")
+        metadata = dict(doc.get("metadata") or {})
+        if company_id is None:
+            company_id = metadata.pop("companyId", None)
+            company_id = company_id or metadata.pop("company_id", None) or metadata.pop("companyid", None)
         return {
             "external_id": doc.get("external_id"),
             "text": doc.get("text"),
-            "metadata": doc.get("metadata") or {},
+            "companyId": company_id,
+            "metadata": metadata,
         }
 
 
@@ -138,6 +145,7 @@ class EmbeddingIndex:
         external_id: Optional[str],
         metadata: Optional[Dict[str, Any]],
         int_id: Optional[Any] = None,
+        company_id: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Tek bir vektörü FAISS'e ekler/günceller.
@@ -171,21 +179,37 @@ class EmbeddingIndex:
                 except Exception:
                     pass
 
+            cleaned_meta = dict(metadata or {})
+            cleaned_company = None
+            for key in ("companyId", "company_id", "companyid"):
+                if key in cleaned_meta:
+                    cleaned_company = cleaned_meta.pop(key)
+                    break
+            if cleaned_company is None and company_id is not None:
+                cleaned_company = company_id
+
             self.index.add_with_ids(v, np.array([int(faiss_id)], dtype=np.int64))
             existing_meta = self.meta.get(int(faiss_id), {})
+            existing_company = existing_meta.get("companyId")
+            resolved_company = cleaned_company if cleaned_company is not None else existing_company
             meta_entry = {
                 "external_id": external_id
                 or alias_source
                 or existing_meta.get("external_id")
                 or str(uuid.uuid4()),
                 "text": text if text else existing_meta.get("text"),
-                "metadata": metadata or {},
+                "companyId": str(resolved_company) if resolved_company is not None else None,
+                "metadata": cleaned_meta,
             }
             self.meta[int(faiss_id)] = meta_entry
             self._meta_repo.upsert_one(int(faiss_id), meta_entry)
             self._save_state()
 
-        return {"id": int(faiss_id), "external_id": self.meta[int(faiss_id)]["external_id"]}
+        return {
+            "id": int(faiss_id),
+            "external_id": self.meta[int(faiss_id)]["external_id"],
+            "companyId": self.meta[int(faiss_id)].get("companyId"),
+        }
 
     def search(
         self,
@@ -244,6 +268,7 @@ class EmbeddingIndex:
                     "score": float(score_list[i]),
                     "external_id": meta.get("external_id"),
                     "text": meta.get("text"),
+                    "companyId": meta.get("companyId"),
                     "metadata": meta.get("metadata", {}),
                 }
             )
@@ -621,14 +646,27 @@ class EmbeddingIndex:
 
         merged = dict(file_meta)
         merged.update(db_meta)
-        self.meta = merged
+
+        migrated: Dict[int, Dict[str, Any]] = {}
+        for fid, meta in merged.items():
+            fixed = dict(meta)
+            metadata = dict(fixed.get("metadata") or {})
+            company = fixed.get("companyId")
+            if company is None:
+                company = metadata.pop("companyId", None)
+                company = company or metadata.pop("company_id", None) or metadata.pop("companyid", None)
+            fixed["companyId"] = str(company) if company is not None else None
+            fixed["metadata"] = metadata
+            migrated[int(fid)] = fixed
+
+        self.meta = migrated
 
         if os.path.exists(self.index_path):
             self.index = faiss.read_index(self.index_path)
         else:
             self.index = None
 
-        missing_in_db = {fid: meta for fid, meta in merged.items() if fid not in db_meta}
+        missing_in_db = {fid: meta for fid, meta in self.meta.items() if fid not in db_meta}
         if missing_in_db:
             try:
                 self._meta_repo.bulk_upsert(missing_in_db)
@@ -661,8 +699,18 @@ class EmbeddingIndex:
     @staticmethod
     def _passes_filter(item_meta: Dict[str, Any], filt: Dict[str, Any]) -> bool:
         for key, val in (filt or {}).items():
+            if key in {"companyId", "company_id", "companyid"}:
+                current = item_meta.get("companyId")
+                if current is None or str(current) != str(val):
+                    return False
+                continue
             if key.startswith("metadata."):
                 sub = key.split(".", 1)[1]
+                if sub in {"companyId", "company_id", "companyid"}:
+                    current = item_meta.get("companyId") or (item_meta.get("metadata") or {}).get(sub)
+                    if current is None or str(current) != str(val):
+                        return False
+                    continue
                 if (item_meta.get("metadata") or {}).get(sub) != val:
                     return False
             else:
