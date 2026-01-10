@@ -343,20 +343,61 @@ def _map_category_entry(entry: dict | None, include_parents: bool = True, includ
             base["parentPath"] = ".".join(path_parts)
 
     if include_attributes:
-        base["attributes"] = _fetch_attributes_for_category(base.get("categoryId"), base.get("companyId"))
+        base["attributes"] = _fetch_attributes_for_category(base.get("categoryId"), base.get("companyId"), entry)
 
     return base
 
 
-def _fetch_attributes_for_category(category_external_id: str | None, company_id: str | None):
+def _fetch_attributes_for_category(category_external_id: str | None, company_id: str | None, entry: dict | None = None):
+    """
+    Fetch attributes for a category, including attributes from all parent categories.
+    Returns combined list: parent attributes first (root -> descendants), then current category's attributes.
+    """
     if not category_external_id:
         return []
-    filt = {"metadata.categoryId": str(category_external_id)}
-    if company_id:
-        filt["companyId"] = str(company_id)
-    total, items = attribute_store.list_entries(limit=None, simple_filter=filt)
-    mapped = [_map_attribute_entry(item) for item in items]
-    return [m for m in mapped if m]
+    
+    # Collect all category IDs to fetch attributes for (parents + current)
+    category_ids = []
+    
+    # If entry is provided, use parent chain
+    if entry:
+        parents = _build_category_parent_chain(entry)
+        for parent in parents:
+            parent_id = parent.get("categoryId")
+            if parent_id:
+                category_ids.append(str(parent_id))
+    
+    # Add current category at the end
+    category_ids.append(str(category_external_id))
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_category_ids = []
+    for cid in category_ids:
+        if cid not in seen:
+            seen.add(cid)
+            unique_category_ids.append(cid)
+    
+    # Fetch attributes for all categories
+    all_attributes = []
+    seen_attribute_codes = set()
+    
+    for cat_id in unique_category_ids:
+        filt = {"metadata.categoryId": str(cat_id)}
+        if company_id:
+            filt["companyId"] = str(company_id)
+        total, items = attribute_store.list_entries(limit=None, simple_filter=filt)
+        for item in items:
+            mapped = _map_attribute_entry(item)
+            if mapped:
+                # Use code as unique identifier to avoid duplicates
+                code = mapped.get("code") or mapped.get("text")
+                if code and code not in seen_attribute_codes:
+                    seen_attribute_codes.add(code)
+                    all_attributes.append(mapped)
+    
+    return all_attributes
+
 
 
 def _normalize_attribute_payload(payload: dict) -> dict:
