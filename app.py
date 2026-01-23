@@ -29,6 +29,8 @@ from init.db import get_database
 
 load_dotenv()
 
+BASE_DIR = os.path.dirname(__file__) or "."
+
 
 def _path_from_env(*keys, default: str) -> str:
     for key in keys:
@@ -84,7 +86,7 @@ DEFAULT_INDEX_CHUNK_OVERLAP = int(os.getenv("EMBED_CHUNK_OVERLAP") or 200)
 DEFAULT_INDEX_MIN_CHARS = int(os.getenv("EMBED_MIN_CHARS") or 80)
 DEFAULT_WEBSEARCH_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 WEBSEARCH_MODEL_NAME = os.getenv("WEBSEARCH_MODEL") or os.getenv("CHUNK_MODEL_NAME") or DEFAULT_WEBSEARCH_MODEL
-WEBSEARCH_INDEX_PATH = os.getenv("WEBSEARCH_INDEX_PATH") or "websearch.index"
+WEBSEARCH_INDEX_PATH = os.getenv("WEBSEARCH_INDEX_PATH") or os.path.join(BASE_DIR, "websearch.index")
 REQUIRE_KEYCLOAK_AUTH = (os.getenv("REQUIRE_KEYCLOAK_AUTH") or "true").strip().lower() not in {"0", "false", "no", "off"}
 CONTENT_INDEX_PUBLISH_RETRIES = int(os.getenv("CONTENT_INDEX_PUBLISH_RETRIES") or 3)
 CONTENT_INDEX_PUBLISH_RETRY_DELAY_SECONDS = float(os.getenv("CONTENT_INDEX_PUBLISH_RETRY_DELAY_SECONDS") or 2.0)
