@@ -425,6 +425,9 @@ class IngestWorker:
         index_path = payload.get("index_path") or self.index_path
 
         store = self._get_store()
+
+        # Idempotency handled later via replace_embeddings
+
         store.create_document(doc_id=doc_id, doc_type=doc_type, source=source, metadata=metadata)
         store.update_document_status(doc_id, status="processing", error=None)
 
@@ -440,9 +443,25 @@ class IngestWorker:
         if embeddings_arr.shape[0] != len(chunks):
             raise ValueError("embeddings length must match chunks length")
 
+        store = self._get_store()
         faiss_ids = store.reserve_faiss_ids(len(chunks))
+        
+        # Idempotency: check for existing chunks
+        existing_chunks = store.get_chunks_by_doc(doc_id)
+        old_faiss_ids = []
+        if existing_chunks:
+            old_faiss_ids = [c["faiss_id"] for c in existing_chunks if "faiss_id" in c]
+            deleted_count = store.delete_chunks_by_doc(doc_id)
+            log(f"Removed {deleted_count} old chunks for doc_id={doc_id}")
+
         engine = self._get_engine_for_index(index_path)
-        engine.add_embeddings(embeddings_arr, faiss_ids)
+        
+        if old_faiss_ids:
+            # Optimize: use replace_embeddings to save to disk only once
+            engine.replace_embeddings(old_faiss_ids, embeddings_arr, faiss_ids)
+            log(f"Replaced {len(old_faiss_ids)} old vectors with {len(faiss_ids)} new vectors for doc_id={doc_id}")
+        else:
+            engine.add_embeddings(embeddings_arr, faiss_ids)
 
         now = datetime.now(timezone.utc)
         chunk_docs: List[Dict[str, Any]] = []

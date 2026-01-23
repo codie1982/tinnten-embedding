@@ -144,6 +144,44 @@ class EmbeddingEngine:
                 self._index.add_with_ids(embeddings, id_array)
                 self._save_index()
 
+    def replace_embeddings(
+        self,
+        old_ids: Sequence[int],
+        new_embeddings: np.ndarray,
+        new_ids: Sequence[int],
+    ) -> int:
+        """
+        Atomically remove old_ids and add new_embeddings/new_ids, saving the index only once.
+        Returns the number of removed IDs.
+        """
+        if new_embeddings.ndim != 2:
+            raise ValueError("new_embeddings must be 2D")
+        if len(new_ids) != new_embeddings.shape[0]:
+            raise ValueError("new_ids length must match new_embeddings rows")
+
+        old_id_list = [int(i) for i in old_ids if i is not None]
+        
+        with self._lock:
+            with self._write_lock():
+                self.reload_if_updated_locked()
+                self._maybe_refresh_index(expected_dim=new_embeddings.shape[1])
+                self._ensure_index(new_embeddings.shape[1])
+                
+                # 1. Remove old
+                if old_id_list and self._index is not None:
+                    old_id_array = np.asarray(old_id_list, dtype=np.int64)
+                    self._index.remove_ids(old_id_array)
+                
+                # 2. Add new
+                faiss.normalize_L2(new_embeddings)
+                new_id_array = np.asarray(list(new_ids), dtype=np.int64)
+                self._index.add_with_ids(new_embeddings, new_id_array)
+                
+                # 3. Save once
+                self._save_index()
+                
+        return len(old_id_list)
+
     def search(self, query_vectors: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         if query_vectors.ndim != 2:
             raise ValueError("query_vectors must be 2D")

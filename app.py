@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import time
 import uuid
@@ -30,6 +31,9 @@ from init.db import get_database
 load_dotenv()
 
 BASE_DIR = os.path.dirname(__file__) or "."
+logger = logging.getLogger("tinnten.embedding")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 
 def _path_from_env(*keys, default: str) -> str:
@@ -675,6 +679,15 @@ def _websearch_faiss_search(query: str, k: int, model_name: str, index_path: str
     return scores[0].tolist(), [int(i) for i in ids[0]]
 
 
+def _short_text_for_log(text: str | None, max_len: int = 160) -> str:
+    if not text:
+        return ""
+    collapsed = " ".join(str(text).split())
+    if len(collapsed) <= max_len:
+        return collapsed
+    return collapsed[: max_len - 3] + "..."
+
+
 def _deactivate_index_state(company_id: str | None, document_id: str, state: str) -> None:
     if not company_id:
         return
@@ -869,6 +882,27 @@ def search_web_index():
                 "source": chunk.get("source"),
                 "radius": radius,
             }
+        )
+
+    if results:
+        log_items = []
+        for item in results[:5]:
+            text_snippet = _short_text_for_log(item.get("text"))
+            log_items.append(
+                {
+                    "id": item.get("id"),
+                    "score": float(item.get("score", 0)),
+                    "doc_id": item.get("doc_id"),
+                    "source": item.get("source"),
+                    "text": text_snippet,
+                }
+            )
+        logger.info(
+            "websearch response count=%s index=%s model=%s items=%s",
+            len(results),
+            index_path,
+            model_name,
+            log_items,
         )
 
     return jsonify({"results": results})
