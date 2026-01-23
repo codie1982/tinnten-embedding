@@ -261,6 +261,5 @@ def main() -> None:
             print(f"   url: {url}")
         print(f"   text: {text_snippet}\n")
 
-
 if __name__ == "__main__":
     main()

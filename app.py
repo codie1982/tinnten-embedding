@@ -47,6 +47,17 @@ def _default_meta_path(index_path: str, fallback: str) -> str:
     return os.path.join(base_dir, fallback)
 
 
+def _resolve_index_path(raw_path: str | None, default: str, *, base_dir: str = BASE_DIR) -> str:
+    """
+    Normalize index paths so they consistently resolve relative to the service base dir.
+    """
+    candidate = (raw_path or "").strip() or default
+    candidate = os.path.expanduser(candidate)
+    if not os.path.isabs(candidate):
+        candidate = os.path.abspath(os.path.join(base_dir, candidate))
+    return candidate
+
+
 CHUNK_INDEX_PATH = _path_from_env(
     "CHUNK_INDEX_PATH",
     "CONTENT_INDEX_PATH",
@@ -86,7 +97,7 @@ DEFAULT_INDEX_CHUNK_OVERLAP = int(os.getenv("EMBED_CHUNK_OVERLAP") or 200)
 DEFAULT_INDEX_MIN_CHARS = int(os.getenv("EMBED_MIN_CHARS") or 80)
 DEFAULT_WEBSEARCH_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 WEBSEARCH_MODEL_NAME = os.getenv("WEBSEARCH_MODEL") or os.getenv("CHUNK_MODEL_NAME") or DEFAULT_WEBSEARCH_MODEL
-WEBSEARCH_INDEX_PATH = os.getenv("WEBSEARCH_INDEX_PATH") or os.path.join(BASE_DIR, "websearch.index")
+WEBSEARCH_INDEX_PATH = _resolve_index_path(os.getenv("WEBSEARCH_INDEX_PATH"), os.path.join(BASE_DIR, "websearch.index"))
 REQUIRE_KEYCLOAK_AUTH = (os.getenv("REQUIRE_KEYCLOAK_AUTH") or "true").strip().lower() not in {"0", "false", "no", "off"}
 CONTENT_INDEX_PUBLISH_RETRIES = int(os.getenv("CONTENT_INDEX_PUBLISH_RETRIES") or 3)
 CONTENT_INDEX_PUBLISH_RETRY_DELAY_SECONDS = float(os.getenv("CONTENT_INDEX_PUBLISH_RETRY_DELAY_SECONDS") or 2.0)
@@ -792,11 +803,15 @@ def search_web_index():
         return jsonify({"error": "filter must be an object"}), 400
 
     model_name = payload.get("model_name") or payload.get("modelName") or WEBSEARCH_MODEL_NAME
-    index_path = payload.get("index_path") or payload.get("indexPath") or WEBSEARCH_INDEX_PATH
+    index_path = _resolve_index_path(payload.get("index_path") or payload.get("indexPath"), WEBSEARCH_INDEX_PATH)
+    if not os.path.exists(index_path):
+        return jsonify({"error": "websearch index not found", "index_path": index_path}), 400
 
     try:
         scores, ids = _websearch_faiss_search(text, k, model_name, index_path)
+        app.logger.info("Websearch: text='%s' k=%d model='%s' index='%s' -> found %d IDs", text, k, model_name, index_path, len(ids))
     except Exception as exc:  # noqa: BLE001
+        app.logger.error("Websearch failed: %s", exc)
         return jsonify({"error": f"websearch failed: {exc}"}), 400
 
     faiss_ids = [int(i) for i in ids if i != -1]
@@ -810,11 +825,15 @@ def search_web_index():
             continue
         chunk = chunk_docs.get(int(idx))
         if not chunk:
+            app.logger.warning("Websearch: Chunk not found for FAISS ID %d", idx)
             continue
         doc_info = doc_status_map.get(chunk.get("doc_id"))
-        if doc_info and str(doc_info.get("status")).lower() in {"disabled", "removed"}:
+        status = str(doc_info.get("status") if doc_info else "unknown").lower()
+        if doc_info and status in {"disabled", "removed"}:
+            app.logger.info("Websearch: Skipping chunk %d (doc_id=%s status=%s)", idx, chunk.get("doc_id"), status)
             continue
         if filters and not _passes_chunk_filters(chunk, filters):
+            app.logger.info("Websearch: Skipping chunk %d (doc_id=%s) due to filters (metadata=%s)", idx, chunk.get("doc_id"), chunk.get("metadata"))
             continue
 
         combined_text = chunk.get("text")

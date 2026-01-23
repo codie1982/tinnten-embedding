@@ -67,6 +67,7 @@ class EmbeddingEngine:
         self._lock = threading.RLock()
         self._model = SentenceTransformer(self.model_name)
         self._index: faiss.IndexIDMap2 | None = None
+        self._backing_index: Any = None
         self._dimension: int | None = None
         self._model_dimension: int | None = None
         self._index_mtime: float | None = None
@@ -245,6 +246,7 @@ class EmbeddingEngine:
                 if not isinstance(index, faiss.IndexIDMap):
                     # Wrap plain indices to support explicit IDs
                     index = faiss.IndexIDMap(index)
+                self._backing_index = index
                 self._index = faiss.downcast_index(index)
                 self._dimension = int(self._index.d)
                 if self._dimension <= 0 or self._dimension > self.max_index_dimension:
