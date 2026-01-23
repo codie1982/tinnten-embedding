@@ -1,10 +1,9 @@
 import json
 import os
-import subprocess
-import sys
 import time
 import uuid
 from datetime import datetime, timezone
+from functools import lru_cache
 
 import numpy as np
 from bson import ObjectId
@@ -127,6 +126,11 @@ job_publisher = RabbitPublisher()
 # Worker’la aynı FAISS + Mongo chunk akışı üzerinden arama için
 chunk_engine = EmbeddingEngine(model_name=CHUNK_MODEL_NAME, index_path=CHUNK_INDEX_PATH)
 chunk_store = MongoStore()
+
+
+@lru_cache(maxsize=4)
+def _get_websearch_engine(model_name: str, index_path: str) -> EmbeddingEngine:
+    return EmbeddingEngine(model_name=model_name, index_path=index_path)
 def _should_require_auth() -> bool:
     if not REQUIRE_KEYCLOAK_AUTH:
         return False
@@ -651,43 +655,11 @@ def _chunk_search_response(payload: dict):
     return jsonify({"results": results})
 
 
-def _websearch_faiss_search_subprocess(query: str, k: int, model_name: str, index_path: str):
-    payload = json.dumps(
-        {
-            "query": query,
-            "model": model_name,
-            "index_path": os.path.abspath(index_path),
-            "k": int(k),
-        }
-    )
-    code = (
-        "import json, sys;"
-        "import numpy as np;"
-        "import faiss;"
-        "from sentence_transformers import SentenceTransformer;"
-        "payload=json.loads(sys.stdin.read());"
-        "model=SentenceTransformer(payload['model']);"
-        "vec=model.encode([payload['query']], normalize_embeddings=True);"
-        "vec=np.asarray(vec, dtype=np.float32);"
-        "faiss.normalize_L2(vec);"
-        "index=faiss.read_index(payload['index_path']);"
-        "scores, ids = index.search(vec, int(payload['k']));"
-        "out={'scores': scores[0].tolist(), 'ids': [int(i) for i in ids[0]]};"
-        "print(json.dumps(out))"
-    )
-    output = subprocess.check_output(
-        [sys.executable, "-c", code],
-        input=payload,
-        text=True,
-    )
-    data = json.loads(output)
-    if not isinstance(data, dict):
-        raise ValueError("search output is not a JSON object")
-    scores = data.get("scores") or []
-    ids = data.get("ids") or []
-    if not isinstance(scores, list) or not isinstance(ids, list):
-        raise ValueError("search output is invalid")
-    return scores, ids
+def _websearch_faiss_search(query: str, k: int, model_name: str, index_path: str):
+    engine = _get_websearch_engine(model_name, os.path.abspath(index_path))
+    query_vec = engine.encode([query], batch_size=1)
+    scores, ids = engine.search(query_vec, int(k))
+    return scores[0].tolist(), [int(i) for i in ids[0]]
 
 
 def _deactivate_index_state(company_id: str | None, document_id: str, state: str) -> None:
@@ -821,7 +793,7 @@ def search_web_index():
     index_path = payload.get("index_path") or payload.get("indexPath") or WEBSEARCH_INDEX_PATH
 
     try:
-        scores, ids = _websearch_faiss_search_subprocess(text, k, model_name, index_path)
+        scores, ids = _websearch_faiss_search(text, k, model_name, index_path)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"websearch failed: {exc}"}), 400
 
