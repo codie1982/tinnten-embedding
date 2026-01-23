@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pika
 import requests
 import uuid
+import numpy as np
 
 # Ensure project-root imports work when executed as `python workers/ingest_worker.py`.
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -114,6 +115,7 @@ class IngestWorker:
         self._loader_lock = threading.RLock()
         self.engine: EmbeddingEngine | None = None
         self._engine_lock = threading.RLock()
+        self._engine_cache: Dict[str, EmbeddingEngine] = {}
         self.connection: pika.BlockingConnection | None = None
         self.channel: pika.adapters.blocking_connection.BlockingChannel | None = None
         self._stop_event = threading.Event()
@@ -170,6 +172,20 @@ class IngestWorker:
 
                 self.engine = EmbeddingEngine(model_name=self.model_name, index_path=self.index_path)
             return self.engine
+
+    def _get_engine_for_index(self, index_path: Optional[str]) -> EmbeddingEngine:
+        if not index_path or index_path == self.index_path:
+            return self._get_engine()
+        with self._engine_lock:
+            cached = self._engine_cache.get(index_path)
+            if cached is not None:
+                return cached
+            log("Initialising embedding engine (model=%s index_path=%s)...", self.model_name, index_path)
+            from services.embedding_engine import EmbeddingEngine  # local import for faster startup
+
+            engine = EmbeddingEngine(model_name=self.model_name, index_path=index_path)
+            self._engine_cache[index_path] = engine
+            return engine
 
     # ------------------------------------------------------------------
     def start(self) -> None:
@@ -255,17 +271,36 @@ class IngestWorker:
 
     # ------------------------------------------------------------------
     def _process_payload(self, payload: Dict[str, Any]) -> None:
-        if self._is_content_index_message(payload):
+        if self._is_embedded_chunks_message(payload):
+            log("Received embedded-chunks payload")
+            self._process_embedded_chunks(payload)
+        elif self._is_content_index_message(payload):
             log(f"Received content-index message")
             self._process_content_index_message(payload)
         else:
             log("Received legacy ingest payload")
             self._process_legacy_payload(payload)
 
+    def _is_embedded_chunks_message(self, payload: Dict[str, Any]) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        return payload.get("payload_type") == "embedded_chunks"
+
     def _is_content_index_message(self, payload: Dict[str, Any]) -> bool:
         if not isinstance(payload, dict):
             return False
         return any(key in payload for key in ("documentIds", "document_ids", "documentids"))
+
+    def _get_existing_ready_docs(self, doc_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+        if not doc_ids:
+            return {}
+        docs = self._get_store().get_documents_by_ids(doc_ids)
+        ready_docs: Dict[str, Dict[str, Any]] = {}
+        for doc_id, doc in docs.items():
+            status = str(doc.get("status") or "").lower()
+            if status in {"ready", "processing"}:
+                ready_docs[doc_id] = doc
+        return ready_docs
 
     def _process_content_index_message(self, payload: Dict[str, Any]) -> None:
         company_id = self._coalesce(payload, "companyId", "company_id", "companyid")
@@ -351,6 +386,87 @@ class IngestWorker:
                 self._process_single_document(document, context)
             except Exception as exc:  # noqa: BLE001
                 log(f"Failed to process document {doc_id}: {exc}")
+
+    def _process_embedded_chunks(self, payload: Dict[str, Any]) -> None:
+        doc_id = payload.get("doc_id")
+        if not doc_id:
+            raise ValueError("payload missing 'doc_id'")
+
+        existing_docs = self._get_existing_ready_docs([doc_id])
+        if doc_id in existing_docs:
+            status = str(existing_docs[doc_id].get("status") or "").lower()
+            log(f"Skipping embedded chunks doc_id={doc_id} because status={status}")
+            return
+
+        chunks = payload.get("chunks") or []
+        embeddings = payload.get("embeddings") or []
+        if not isinstance(chunks, list) or not isinstance(embeddings, list):
+            raise TypeError("payload 'chunks' and 'embeddings' must be lists")
+
+        doc_type = (payload.get("doc_type") or "web").lower()
+        source = payload.get("source") or "web"
+        metadata = payload.get("metadata") or {}
+        options = normalize_index_options(
+            payload.get("options") or {},
+            default_chunk_size=self.chunk_size,
+            default_chunk_overlap=self.chunk_overlap,
+            default_min_chars=80,
+        )
+        index_path = payload.get("index_path") or self.index_path
+
+        store = self._get_store()
+        store.create_document(doc_id=doc_id, doc_type=doc_type, source=source, metadata=metadata)
+        store.update_document_status(doc_id, status="processing", error=None)
+
+        if not chunks:
+            store.update_document_status(doc_id, status="ready", chunk_count=0)
+            return
+
+        embeddings_arr = np.asarray(embeddings, dtype=np.float32)
+        if embeddings_arr.ndim == 1:
+            embeddings_arr = embeddings_arr.reshape(1, -1)
+        if embeddings_arr.ndim != 2:
+            raise ValueError("embeddings must be 2D")
+        if embeddings_arr.shape[0] != len(chunks):
+            raise ValueError("embeddings length must match chunks length")
+
+        faiss_ids = store.reserve_faiss_ids(len(chunks))
+        engine = self._get_engine_for_index(index_path)
+        engine.add_embeddings(embeddings_arr, faiss_ids)
+
+        now = datetime.now(timezone.utc)
+        chunk_docs: List[Dict[str, Any]] = []
+        for idx, (chunk, faiss_id) in enumerate(zip(chunks, faiss_ids)):
+            chunk_text = chunk.get("text") or ""
+            chunk_index = chunk.get("chunk_index")
+            if chunk_index is None:
+                chunk_index = idx
+            chunk_metadata = dict(metadata)
+            if isinstance(chunk.get("metadata"), dict):
+                chunk_metadata.update(chunk["metadata"])
+            chunk_metadata.setdefault("chunk_index", chunk_index)
+            chunk_metadata.setdefault("source", source)
+            chunk_docs.append(
+                {
+                    "chunk_id": str(uuid.uuid4()),
+                    "doc_id": doc_id,
+                    "company_id": None,
+                    "chunk_index": int(chunk_index),
+                    "faiss_id": int(faiss_id),
+                    "text": chunk_text,
+                    "char_start": chunk.get("char_start"),
+                    "char_end": chunk.get("char_end"),
+                    "doc_type": doc_type,
+                    "source": source,
+                    "metadata": chunk_metadata,
+                    "options": dict(options),
+                    "created_at": now,
+                }
+            )
+
+        store.insert_chunks(chunk_docs)
+        store.update_document_status(doc_id, status="ready", chunk_count=len(chunk_docs))
+        log(f"Processed embedded chunks doc_id={doc_id} chunks={len(chunk_docs)}")
 
     # ------------------------------------------------------------------
     def _process_single_document(self, document: Dict[str, Any], context: DocumentJobContext) -> None:

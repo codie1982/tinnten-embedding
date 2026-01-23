@@ -119,6 +119,7 @@ class EmbeddingEngine:
         with self._lock:
             with self._write_lock():
                 self.reload_if_updated_locked()
+                self._maybe_refresh_index(expected_dim=embeddings.shape[1])
                 self._ensure_index(embeddings.shape[1])
                 faiss.normalize_L2(embeddings)
                 id_array = np.asarray(list(ids), dtype=np.int64)
@@ -133,15 +134,28 @@ class EmbeddingEngine:
         with self._lock:
             self.reload_if_updated_locked()
             if self._index is None or self._index.ntotal == 0:
+                # Fallback to a fresh on-disk read if the in-memory index was invalidated.
+                disk_index = self._read_index_from_disk()
+                if disk_index is not None:
+                    if disk_index.d != query_vectors.shape[1]:
+                        raise ValueError(f"Query dim {query_vectors.shape[1]} != index dim {disk_index.d}")
+                    if disk_index.ntotal > 0:
+                        faiss.normalize_L2(query_vectors)
+                        return disk_index.search(query_vectors, k)
                 raise RuntimeError("FAISS index is empty.")
             if self._index.d <= 0 or self._index.d > self.max_index_dimension:
+                disk_index = self._read_index_from_disk()
+                if disk_index is not None and disk_index.d == query_vectors.shape[1] and disk_index.ntotal > 0:
+                    faiss.normalize_L2(query_vectors)
+                    return disk_index.search(query_vectors, k)
                 reason = f"invalid FAISS index dimension: {self._index.d}"
                 print(f"[embedding-engine] {reason}", flush=True)
-                with self._write_lock():
-                    self._quarantine_index_file(reason=reason)
-                self._index = None
-                self._dimension = None
-                self._index_mtime = None
+                if self.auto_reset_on_error:
+                    with self._write_lock():
+                        self._quarantine_index_file(reason=reason)
+                    self._index = None
+                    self._dimension = None
+                    self._index_mtime = None
                 raise RuntimeError("FAISS index is empty.")
             if self._index.d != query_vectors.shape[1]:
                 raise ValueError(f"Query dim {query_vectors.shape[1]} != index dim {self._index.d}")
@@ -262,6 +276,56 @@ class EmbeddingEngine:
             self._index_mtime = os.path.getmtime(self.index_path)
         except OSError:
             self._index_mtime = None
+
+    def _read_index_from_disk(self) -> faiss.IndexIDMap2 | None:
+        if not os.path.exists(self.index_path):
+            return None
+        try:
+            index = faiss.read_index(self.index_path)
+        except Exception:
+            return None
+        if not isinstance(index, faiss.IndexIDMap):
+            index = faiss.IndexIDMap(index)
+        return faiss.downcast_index(index)
+
+    def _maybe_refresh_index(self, expected_dim: int) -> None:
+        if self._index is None:
+            return
+        dim = int(getattr(self._index, "d", 0) or 0)
+        needs_reload = dim <= 0 or dim > self.max_index_dimension or dim != expected_dim
+        if needs_reload:
+            disk_index = self._read_index_from_disk()
+            if disk_index is not None:
+                self._index = disk_index
+                self._dimension = int(disk_index.d)
+                try:
+                    self._index_mtime = os.path.getmtime(self.index_path)
+                except OSError:
+                    self._index_mtime = None
+                dim = int(self._index.d)
+        if self._index is None:
+            return
+        if dim <= 0 or dim > self.max_index_dimension:
+            reason = f"invalid FAISS index dimension: {dim}"
+            print(f"[embedding-engine] {reason}", flush=True)
+            if self.auto_reset_on_error:
+                self._quarantine_index_file(reason=reason)
+                self._index = None
+                self._dimension = None
+                self._index_mtime = None
+            return
+        if dim != expected_dim:
+            reason = (
+                f"FAISS index dim mismatch for {self.index_path}: index_dim={dim} expected={expected_dim}"
+            )
+            print(f"[embedding-engine] {reason}", flush=True)
+            if self.auto_reset_on_dim_mismatch:
+                self._quarantine_index_file(reason=reason)
+                self._index = None
+                self._dimension = None
+                self._index_mtime = None
+            else:
+                raise ValueError(f"Embedding dimension mismatch: {expected_dim} != {dim}")
 
     def _ensure_index(self, dimension: int) -> None:
         if self._index is None:

@@ -1,5 +1,7 @@
 import json
 import os
+import subprocess
+import sys
 import time
 import uuid
 from datetime import datetime, timezone
@@ -81,6 +83,9 @@ ATTRIBUTE_META_COLLECTION = os.getenv("ATTRIBUTE_META_COLLECTION", "attribute_fa
 DEFAULT_INDEX_CHUNK_SIZE = int(os.getenv("EMBED_CHUNK_SIZE") or 1200)
 DEFAULT_INDEX_CHUNK_OVERLAP = int(os.getenv("EMBED_CHUNK_OVERLAP") or 200)
 DEFAULT_INDEX_MIN_CHARS = int(os.getenv("EMBED_MIN_CHARS") or 80)
+DEFAULT_WEBSEARCH_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+WEBSEARCH_MODEL_NAME = os.getenv("WEBSEARCH_MODEL") or os.getenv("CHUNK_MODEL_NAME") or DEFAULT_WEBSEARCH_MODEL
+WEBSEARCH_INDEX_PATH = os.getenv("WEBSEARCH_INDEX_PATH") or "websearch.index"
 REQUIRE_KEYCLOAK_AUTH = (os.getenv("REQUIRE_KEYCLOAK_AUTH") or "true").strip().lower() not in {"0", "false", "no", "off"}
 CONTENT_INDEX_PUBLISH_RETRIES = int(os.getenv("CONTENT_INDEX_PUBLISH_RETRIES") or 3)
 CONTENT_INDEX_PUBLISH_RETRY_DELAY_SECONDS = float(os.getenv("CONTENT_INDEX_PUBLISH_RETRY_DELAY_SECONDS") or 2.0)
@@ -646,6 +651,45 @@ def _chunk_search_response(payload: dict):
     return jsonify({"results": results})
 
 
+def _websearch_faiss_search_subprocess(query: str, k: int, model_name: str, index_path: str):
+    payload = json.dumps(
+        {
+            "query": query,
+            "model": model_name,
+            "index_path": os.path.abspath(index_path),
+            "k": int(k),
+        }
+    )
+    code = (
+        "import json, sys;"
+        "import numpy as np;"
+        "import faiss;"
+        "from sentence_transformers import SentenceTransformer;"
+        "payload=json.loads(sys.stdin.read());"
+        "model=SentenceTransformer(payload['model']);"
+        "vec=model.encode([payload['query']], normalize_embeddings=True);"
+        "vec=np.asarray(vec, dtype=np.float32);"
+        "faiss.normalize_L2(vec);"
+        "index=faiss.read_index(payload['index_path']);"
+        "scores, ids = index.search(vec, int(payload['k']));"
+        "out={'scores': scores[0].tolist(), 'ids': [int(i) for i in ids[0]]};"
+        "print(json.dumps(out))"
+    )
+    output = subprocess.check_output(
+        [sys.executable, "-c", code],
+        input=payload,
+        text=True,
+    )
+    data = json.loads(output)
+    if not isinstance(data, dict):
+        raise ValueError("search output is not a JSON object")
+    scores = data.get("scores") or []
+    ids = data.get("ids") or []
+    if not isinstance(scores, list) or not isinstance(ids, list):
+        raise ValueError("search output is invalid")
+    return scores, ids
+
+
 def _deactivate_index_state(company_id: str | None, document_id: str, state: str) -> None:
     if not company_id:
         return
@@ -750,6 +794,91 @@ def search_vector():
 
     # Fallback to legacy/vector search against the general index
     return _vector_search_response(store, label="vector search", payload=payload)
+
+
+@app.route("/api/v10/websearch/search", methods=["POST"])
+def search_web_index():
+    """
+    Run a similarity search against the websearch FAISS index built from tur_Latn.
+    """
+    payload = request.get_json() or {}
+    text = (payload.get("text") or payload.get("query") or "").strip()
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+
+    k = int(payload.get("k") or 5)
+    if k <= 0:
+        return jsonify({"error": "k must be positive"}), 400
+    radius = int(payload.get("radius") or 0)
+    if radius < 0:
+        return jsonify({"error": "radius must be >= 0"}), 400
+
+    filters = payload.get("filter") or {}
+    if filters and not isinstance(filters, dict):
+        return jsonify({"error": "filter must be an object"}), 400
+
+    model_name = payload.get("model_name") or payload.get("modelName") or WEBSEARCH_MODEL_NAME
+    index_path = payload.get("index_path") or payload.get("indexPath") or WEBSEARCH_INDEX_PATH
+
+    try:
+        scores, ids = _websearch_faiss_search_subprocess(text, k, model_name, index_path)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"websearch failed: {exc}"}), 400
+
+    faiss_ids = [int(i) for i in ids if i != -1]
+    chunk_docs = chunk_store.get_chunks_by_faiss_ids(faiss_ids)
+    doc_status_map = chunk_store.get_documents_by_ids({c.get("doc_id") for c in chunk_docs.values() if c})
+    doc_chunk_cache: dict[str, list[dict]] = {}
+
+    results = []
+    for idx, score in zip(ids, scores):
+        if idx == -1:
+            continue
+        chunk = chunk_docs.get(int(idx))
+        if not chunk:
+            continue
+        doc_info = doc_status_map.get(chunk.get("doc_id"))
+        if doc_info and str(doc_info.get("status")).lower() in {"disabled", "removed"}:
+            continue
+        if filters and not _passes_chunk_filters(chunk, filters):
+            continue
+
+        combined_text = chunk.get("text")
+        if radius > 0:
+            doc_id = str(chunk.get("doc_id") or "")
+            chunk_index = chunk.get("chunk_index") if "chunk_index" in chunk else chunk.get("index")
+            if doc_id and chunk_index is not None:
+                if doc_id not in doc_chunk_cache:
+                    doc_chunk_cache[doc_id] = chunk_store.get_chunks_by_doc(doc_id)
+                all_chunks = doc_chunk_cache.get(doc_id) or []
+                try:
+                    target_idx = next(
+                        i for i, c in enumerate(all_chunks) if int(c.get("chunk_index", -1)) == int(chunk_index)
+                    )
+                    start = max(0, target_idx - radius)
+                    end = min(len(all_chunks), target_idx + radius + 1)
+                    combined_text = _reconstruct_from_chunks(all_chunks[start:end])
+                except StopIteration:
+                    combined_text = chunk.get("text")
+
+        results.append(
+            {
+                "type": "websearch",
+                "id": int(idx),
+                "score": float(score),
+                "chunk_id": chunk.get("chunk_id"),
+                "doc_id": chunk.get("doc_id"),
+                "text": combined_text,
+                "metadata": chunk.get("metadata") or {},
+                "char_start": chunk.get("char_start"),
+                "char_end": chunk.get("char_end"),
+                "doc_type": chunk.get("doc_type"),
+                "source": chunk.get("source"),
+                "radius": radius,
+            }
+        )
+
+    return jsonify({"results": results})
 
 
 @app.route("/api/v10/categories/upsert", methods=["POST"])

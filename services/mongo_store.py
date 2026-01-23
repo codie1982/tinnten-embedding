@@ -79,17 +79,10 @@ class MongoStore:
         now = datetime.now(timezone.utc)
         doc_id = doc_id or str(uuid.uuid4())
         on_insert = {
-            "doc_id": doc_id,
-            "doc_type": doc_type,
-            "source": source,
-            "metadata": metadata or {},
-            "status": "pending",
-            "chunk_count": 0,
             "created_at": now,
-            "updated_at": now,
-            "error": None,
         }
         update_fields = {
+            "doc_id": doc_id,
             "doc_type": doc_type,
             "source": source,
             "metadata": metadata or {},
