@@ -30,23 +30,39 @@ class EmbeddingEngine:
         self,
         model_name: str,
         index_path: str = "faiss.index",
+        fail_on_load_error: bool | None = None,
+        auto_reset_on_error: bool | None = None,
+        auto_reset_on_dim_mismatch: bool | None = None,
     ) -> None:
         self.model_name = model_name
         self.index_path = index_path
-        self.auto_reset_on_error = (os.getenv("FAISS_AUTO_RESET_ON_ERROR") or "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "y",
-            "on",
-        }
-        self.auto_reset_on_dim_mismatch = (os.getenv("FAISS_AUTO_RESET_ON_DIM_MISMATCH") or "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "y",
-            "on",
-        }
+        if auto_reset_on_error is None:
+            auto_reset_on_error = (os.getenv("FAISS_AUTO_RESET_ON_ERROR") or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            }
+        if auto_reset_on_dim_mismatch is None:
+            auto_reset_on_dim_mismatch = (
+                (os.getenv("FAISS_AUTO_RESET_ON_DIM_MISMATCH") or "").strip().lower()
+                in {"1", "true", "yes", "y", "on"}
+            )
+        self.auto_reset_on_error = bool(auto_reset_on_error)
+        self.auto_reset_on_dim_mismatch = bool(auto_reset_on_dim_mismatch)
+        if fail_on_load_error is None:
+            fail_on_load_error = (os.getenv("FAISS_FAIL_ON_LOAD_ERROR") or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            }
+        self.fail_on_load_error = bool(fail_on_load_error)
+        cleanup_env = (os.getenv("FAISS_CLEANUP_TMP") or "").strip().lower()
+        self.cleanup_tmp = cleanup_env not in {"0", "false", "no", "off"}
+        self.tmp_ttl_seconds = int(os.getenv("FAISS_TMP_TTL_SECONDS") or 3600)
         self.max_index_dimension = int(os.getenv("FAISS_MAX_INDEX_DIMENSION") or 16384)
         self._lock = threading.RLock()
         self._model = SentenceTransformer(self.model_name)
@@ -54,6 +70,7 @@ class EmbeddingEngine:
         self._dimension: int | None = None
         self._model_dimension: int | None = None
         self._index_mtime: float | None = None
+        self._cleanup_tmp_files()
         self._load_index()
 
     # ------------------------------------------------------------------
@@ -245,6 +262,8 @@ class EmbeddingEngine:
                         self._dimension = None
                         self._index_mtime = None
                         return
+                    if self.fail_on_load_error:
+                        raise RuntimeError(msg)
                 try:
                     self._index_mtime = os.path.getmtime(self.index_path)
                 except OSError:
@@ -253,8 +272,16 @@ class EmbeddingEngine:
                 # If the index file is corrupt or not a FAISS index, avoid crashing the service.
                 # Optionally move it aside so ingest can rebuild a fresh one.
                 print(f"[embedding-engine] failed to load index {self.index_path}: {exc}", flush=True)
-                if self.auto_reset_on_error or "invalid FAISS index dimension" in str(exc):
+                if self.auto_reset_on_error:
                     self._quarantine_index_file(reason=str(exc))
+                    self._index = None
+                    self._dimension = None
+                    self._index_mtime = None
+                    return
+                if self.fail_on_load_error:
+                    raise RuntimeError(
+                        f"Failed to load FAISS index {self.index_path}: {exc}"
+                    ) from exc
                 self._index = None
                 self._dimension = None
                 self._index_mtime = None
@@ -288,6 +315,32 @@ class EmbeddingEngine:
             index = faiss.IndexIDMap(index)
         return faiss.downcast_index(index)
 
+    def _cleanup_tmp_files(self) -> None:
+        if not self.cleanup_tmp:
+            return
+        directory = os.path.dirname(self.index_path) or "."
+        prefix = os.path.basename(self.index_path) + ".tmp."
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            return
+        now = time.time()
+        with self._write_lock():
+            for name in entries:
+                if not name.startswith(prefix):
+                    continue
+                path = os.path.join(directory, name)
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+                if self.tmp_ttl_seconds > 0 and now - mtime < self.tmp_ttl_seconds:
+                    continue
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
     def _maybe_refresh_index(self, expected_dim: int) -> None:
         if self._index is None:
             return
@@ -313,6 +366,8 @@ class EmbeddingEngine:
                 self._index = None
                 self._dimension = None
                 self._index_mtime = None
+            elif self.fail_on_load_error:
+                raise RuntimeError(reason)
             return
         if dim != expected_dim:
             reason = (
@@ -378,7 +433,11 @@ class EmbeddingEngine:
                 self._index_mtime = mtime
             except Exception as exc:  # noqa: BLE001
                 print(f"[embedding-engine] failed to reload index {self.index_path}: {exc}", flush=True)
-                if self.auto_reset_on_error or "invalid FAISS index dimension" in str(exc):
+                if self.fail_on_load_error:
+                    raise RuntimeError(
+                        f"Failed to reload FAISS index {self.index_path}: {exc}"
+                    ) from exc
+                if self.auto_reset_on_error:
                     self._quarantine_index_file(reason=str(exc))
                 self._index = None
                 self._dimension = None

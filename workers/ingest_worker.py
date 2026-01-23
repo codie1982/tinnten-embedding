@@ -170,7 +170,12 @@ class IngestWorker:
                 log("Initialising embedding engine (model=%s index_path=%s)...", self.model_name, self.index_path)
                 from services.embedding_engine import EmbeddingEngine  # local import for faster startup
 
-                self.engine = EmbeddingEngine(model_name=self.model_name, index_path=self.index_path)
+                self.engine = EmbeddingEngine(
+                    model_name=self.model_name,
+                    index_path=self.index_path,
+                    auto_reset_on_error=False,
+                    auto_reset_on_dim_mismatch=False,
+                )
             return self.engine
 
     def _get_engine_for_index(self, index_path: Optional[str]) -> EmbeddingEngine:
@@ -183,7 +188,12 @@ class IngestWorker:
             log("Initialising embedding engine (model=%s index_path=%s)...", self.model_name, index_path)
             from services.embedding_engine import EmbeddingEngine  # local import for faster startup
 
-            engine = EmbeddingEngine(model_name=self.model_name, index_path=index_path)
+            engine = EmbeddingEngine(
+                model_name=self.model_name,
+                index_path=index_path,
+                auto_reset_on_error=False,
+                auto_reset_on_dim_mismatch=False,
+            )
             self._engine_cache[index_path] = engine
             return engine
 

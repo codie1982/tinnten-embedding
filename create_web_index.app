@@ -11,14 +11,13 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from dotenv import load_dotenv
 import pyarrow.parquet as pq
 from sentence_transformers import SentenceTransformer
 
 from services.chunker import chunk_text
-from services.embedding_engine import EmbeddingEngine
 from services.mongo_store import MongoStore
 from services.rabbit_publisher import RabbitPublisher
 
@@ -75,9 +74,9 @@ def _parse_args() -> argparse.Namespace:
     )
     build.add_argument(
         "--write-mode",
-        choices=("direct", "queue"),
-        default="direct",
-        help="Write embeddings directly or enqueue them for the worker.",
+        choices=("queue",),
+        default="queue",
+        help="Sadece embed edip kuyruğa gönderir (FAISS yazmaz).",
     )
     build.add_argument(
         "--queue-name",
@@ -87,8 +86,8 @@ def _parse_args() -> argparse.Namespace:
     build.add_argument(
         "--skip-existing",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Skip rows whose doc_id already exists in MongoDB.",
+        default=False,
+        help="Doc_id mevcutsa atla. Varsayılan: atlama (False).",
     )
     build.add_argument(
         "--skip-batch-size",
@@ -114,12 +113,22 @@ def _find_first_parquet_file(directory: Path) -> Optional[Path]:
     return None
 
 
+def _list_parquet_files(directory: Path) -> List[Path]:
+    if directory.is_file() and directory.suffix == ".parquet":
+        return [directory]
+    if not directory.exists():
+        return []
+    return [candidate for candidate in sorted(directory.rglob("*.parquet")) if candidate.is_file()]
+
+
 def _iter_parquet_records(
     directory: Path,
     limit: Optional[int] = None,
     *,
     start: int = 0,
     end: Optional[int] = None,
+    parquet_files: Optional[List[Path]] = None,
+    progress: Optional[Callable[[Path, int, int], None]] = None,
 ) -> Iterable[Dict[str, Any]]:
     def _scan_file(parquet_file: Path) -> Iterable[Dict[str, Any]]:
         reader = pq.ParquetFile(parquet_file)
@@ -151,23 +160,14 @@ def _iter_parquet_records(
             return output
         return output
 
-    if directory.is_file() and directory.suffix == ".parquet":
-        for record in _scan_file(directory):
-            maybe = _maybe_yield(record)
-            if maybe is not None:
-                yield maybe
-                if limit and returned >= limit:
-                    return
-            if end is not None and current_index >= end:
-                return
+    parquet_files = parquet_files or _list_parquet_files(directory)
+    if not parquet_files:
         return
+    total_files = len(parquet_files)
 
-    if not directory.exists():
-        return
-
-    for parquet_file in sorted(directory.rglob("*.parquet")):
-        if not parquet_file.is_file():
-            continue
+    for file_index, parquet_file in enumerate(parquet_files, start=1):
+        if progress is not None:
+            progress(parquet_file, file_index, total_files)
         for record in _scan_file(parquet_file):
             maybe = _maybe_yield(record)
             if maybe is not None:
@@ -273,13 +273,18 @@ def _run_build(args: argparse.Namespace) -> None:
         raise SystemExit(f"{dataset_dir!r} does not exist.")
 
     total_records = _count_parquet_rows(dataset_dir)
-    print(f"Toplam veri sayısı: {total_records}")
+    parquet_files = _list_parquet_files(dataset_dir)
+    if not parquet_files:
+        raise SystemExit(f"No parquet shards found under {dataset_dir!r}.")
+    print(f"Toplam veri sayısı: {total_records} (parquet dosya sayısı: {len(parquet_files)})")
 
-    use_queue = args.write_mode == "queue"
-    engine = None if use_queue else EmbeddingEngine(model_name=args.model_name, index_path=str(args.index_path))
-    embedder = SentenceTransformer(args.model_name) if use_queue else None
-    publisher = RabbitPublisher(queue_name=args.queue_name or None) if use_queue else None
+    use_queue = True
+    embedder = SentenceTransformer(args.model_name)
+    publisher = RabbitPublisher(queue_name=args.queue_name or None)
     store = MongoStore()
+    if not args.silent:
+        print(f"Kuyruk modu aktif. Hedef kuyruk: {publisher.queue_name}")
+        print(f"Worker için: EMBED_QUEUE_NAME={publisher.queue_name}")
 
     chunk_options: Dict[str, Any] = {
         "chunkSize": args.chunk_size,
@@ -304,8 +309,33 @@ def _run_build(args: argparse.Namespace) -> None:
     if start_index or end_index is not None:
         end_desc = end_index if end_index is not None else "son"
         print(f"İşlenecek kayıt aralığı: {start_index}..{end_desc} (bitiş hariç)")
+    effective_end = end_index if end_index is not None else total_records
+    if total_records:
+        effective_end = min(effective_end, total_records)
+    if start_index >= effective_end:
+        print("Başlangıç indeksi veri sonunu aşıyor; işlem yapılmadı.")
+        return
+    range_total = max(0, effective_end - start_index)
+    total_to_process = range_total if max_records is None else min(max_records, range_total)
+    if total_to_process <= 0:
+        print("İşlenecek kayıt yok.")
+        return
+    print(f"İşlenecek toplam kayıt: {total_to_process}")
     limit_desc = max_records if max_records is not None else "sınırsız"
     print(f"İşlenecek kayıt limiti: {limit_desc}")
+
+    def _progress_label() -> str:
+        remaining = max(0, total_to_process - processed)
+        label = f"{processed}/{total_to_process} kalan={remaining}"
+        if start_index:
+            label += f" sira={start_index + processed - 1}"
+        return f"[{label}]"
+
+    def _file_progress(path: Path, index: int, total: int) -> None:
+        if args.silent:
+            return
+        remaining = total - index
+        print(f"Parquet dosyası {index}/{total} (kalan {remaining}): {path}")
 
     def _process_batch(records: List[Dict[str, Any]]) -> None:
         nonlocal processed, chunked, queued, queued_chunks, skipped, skipped_existing
@@ -318,7 +348,7 @@ def _run_build(args: argparse.Namespace) -> None:
             if not doc_text:
                 skipped += 1
                 if not args.silent:
-                    print(f"Skipping record {processed} because the text is empty.")
+                    print(f"{_progress_label()} Boş metin, kayıt atlandı.")
                 continue
             doc_url = record.get("url") or ""
             doc_id = _safe_doc_id(record.get("id") or doc_url)
@@ -347,7 +377,7 @@ def _run_build(args: argparse.Namespace) -> None:
             if args.skip_existing and doc_id in existing_docs:
                 skipped_existing += 1
                 if not args.silent:
-                    print(f"[{processed}] Skipping existing doc_id={doc_id}")
+                    print(f"{_progress_label()} Var olan doc_id atlandı: {doc_id}")
                 continue
 
             if not use_queue:
@@ -368,86 +398,51 @@ def _run_build(args: argparse.Namespace) -> None:
                     continue
 
                 chunk_texts = [chunk.text for chunk in chunks]
-                if use_queue:
-                    store.create_document(doc_id=doc_id, doc_type="web", source="web", metadata=metadata)
-                    embeddings = embedder.encode(
-                        chunk_texts,
-                        batch_size=args.batch_size,
-                        normalize_embeddings=True,
-                    )
-                    payload = {
-                        "payload_type": "embedded_chunks",
-                        "doc_id": doc_id,
-                        "doc_type": "web",
-                        "source": "web",
-                        "metadata": metadata,
-                        "chunks": [
-                            {
-                                "text": chunk.text,
-                                "char_start": chunk.char_start,
-                                "char_end": chunk.char_end,
-                                "chunk_index": chunk.index,
-                            }
-                            for chunk in chunks
-                        ],
-                        "embeddings": embeddings.tolist(),
-                        "options": dict(chunk_options),
-                        "index_path": str(args.index_path),
-                    }
-                    publisher.publish(payload)
-                    store.update_document_status(doc_id, status="queued", chunk_count=len(chunks))
-                    queued += 1
-                    queued_chunks += len(chunks)
-                    if not args.silent:
-                        print(f"[{processed}] Queued {len(chunks)} chunks for doc_id={doc_id}")
-                else:
-                    embeddings = engine.encode(chunk_texts, batch_size=args.batch_size)
-                    faiss_ids = store.reserve_faiss_ids(len(chunks))
-                    engine.add_embeddings(embeddings, faiss_ids)
-
-                    now = datetime.now(timezone.utc)
-                    chunk_docs = []
-                    total_tokens = 0
-                    total_chars = 0
-                    for chunk, faiss_id in zip(chunks, faiss_ids):
-                        total_chars += len(chunk.text)
-                        total_tokens += _estimate_tokens(chunk.text)
-                        chunk_metadata = dict(metadata)
-                        chunk_metadata.setdefault("chunk_index", chunk.index)
-                        chunk_metadata.setdefault("source", "web")
-                        chunk_docs.append(
-                            {
-                                "chunk_id": str(uuid.uuid4()),
-                                "doc_id": doc_id,
-                                "company_id": None,
-                                "chunk_index": chunk.index,
-                                "faiss_id": int(faiss_id),
-                                "text": chunk.text,
-                                "char_start": chunk.char_start,
-                                "char_end": chunk.char_end,
-                                "doc_type": "web",
-                                "source": "web",
-                                "metadata": chunk_metadata,
-                                "options": dict(chunk_options),
-                                "created_at": now,
-                            }
-                        )
-
-                    store.insert_chunks(chunk_docs)
-                    store.update_document_status(doc_id, status="ready", chunk_count=len(chunk_docs))
-                    chunked += len(chunk_docs)
-                    if not args.silent:
-                        print(
-                            f"[{processed}] Indexed {len(chunk_docs)} chunks "
-                            f"(tokens={total_tokens}, chars={total_chars}) for doc_id={doc_id}"
-                        )
+                store.create_document(doc_id=doc_id, doc_type="web", source="web", metadata=metadata)
+                embeddings = embedder.encode(
+                    chunk_texts,
+                    batch_size=args.batch_size,
+                    normalize_embeddings=True,
+                )
+                payload = {
+                    "payload_type": "embedded_chunks",
+                    "doc_id": doc_id,
+                    "doc_type": "web",
+                    "source": "web",
+                    "metadata": metadata,
+                    "chunks": [
+                        {
+                            "text": chunk.text,
+                            "char_start": chunk.char_start,
+                            "char_end": chunk.char_end,
+                            "chunk_index": chunk.index,
+                        }
+                        for chunk in chunks
+                    ],
+                    "embeddings": embeddings.tolist(),
+                    "options": dict(chunk_options),
+                    "index_path": str(args.index_path),
+                }
+                publisher.publish(payload)
+                store.update_document_status(doc_id, status="queued", chunk_count=len(chunks))
+                queued += 1
+                queued_chunks += len(chunks)
+                if not args.silent:
+                    print(f"{_progress_label()} Kuyruğa alındı: {len(chunks)} chunk doc_id={doc_id}")
             except Exception as exc:  # noqa: BLE001
                 store.update_document_status(doc_id, status="failed", error=str(exc))
                 print(f"Failed to index document {doc_id}: {exc}")
 
     batch: List[Dict[str, Any]] = []
     batch_size = max(1, int(args.skip_batch_size))
-    for record in _iter_parquet_records(dataset_dir, limit=max_records, start=start_index, end=end_index):
+    for record in _iter_parquet_records(
+        dataset_dir,
+        limit=max_records,
+        start=start_index,
+        end=end_index,
+        parquet_files=parquet_files,
+        progress=_file_progress,
+    ):
         batch.append(record)
         if len(batch) >= batch_size:
             _process_batch(batch)
