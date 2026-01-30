@@ -7,7 +7,7 @@ from flask import Flask, jsonify, request, g
 from flask_cors import CORS
 from dotenv import load_dotenv
 
-from keycloak_service import KeycloakError, KeycloakTokenError, get_keycloak_service
+from services.keycloak_service import KeycloakError, KeycloakTokenError, get_keycloak_service
 from services.embedding_engine import EmbeddingEngine
 from services.mongo_store import MongoStore
 from services.rabbit_publisher import RabbitPublisher

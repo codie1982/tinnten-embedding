@@ -25,7 +25,7 @@ from services import (
 from services.embedding_engine import EmbeddingEngine
 from services.mongo_store import MongoStore
 from services.rabbit_publisher import RabbitPublisher
-from keycloak_service import get_keycloak_service, KeycloakError, KeycloakTokenError
+from services.keycloak_service import get_keycloak_service, KeycloakError, KeycloakTokenError
 from init.db import get_database
 
 load_dotenv()
