@@ -51,10 +51,11 @@ def get_mongo_client(uri: Optional[str] = None, *, refresh: bool = False) -> Mon
         if _client is not None and not refresh:
             return _client
         try:
+            timeout = int(os.getenv("MONGO_TIMEOUT_MS") or 30000)
             client = MongoClient(
                 mongo_uri,
                 appname="tinnten-embedding",
-                serverSelectionTimeoutMS=5000,
+                serverSelectionTimeoutMS=timeout,
             )
             # Trigger a roundtrip to validate the connection.
             client.admin.command("ping")

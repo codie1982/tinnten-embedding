@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import signal
 import textwrap
 import time
 import uuid
@@ -285,6 +286,20 @@ def _run_build(args: argparse.Namespace) -> None:
     import sys
     sys.stdout.reconfigure(line_buffering=True)
     
+    shutdown_requested = False
+
+    def handle_signal(sig, frame):
+        nonlocal shutdown_requested
+        if not shutdown_requested:
+            print("\n[GRACEFUL SHUTDOWN] Kesinti sinyali alındı. Mevcut batch bitiriliyor, lütfen bekleyin...", flush=True)
+            shutdown_requested = True
+        else:
+            print("\n[FORCE QUIT] İkinci kesinti sinyali. Zorla kapatılıyor...", flush=True)
+            sys.exit(1)
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
     print(f"Starting build process (Mode: {args.write_mode})...")
 
     dataset_dir = args.dataset_dir.expanduser()
@@ -660,10 +675,32 @@ def _run_build(args: argparse.Namespace) -> None:
                         "created_at": now
                     })
                 if mongo_chunks:
-                    result = store.insert_chunks(mongo_chunks)
-                    if not args.silent and len(mongo_chunks) > 0:
-                         print(f"    [DB] Inserted {len(mongo_chunks)} chunks for doc {doc_id} into MongoDB.", flush=True)
-                store.update_document_status(doc_id, status="ready", chunk_count=num_chunks)
+                    retry_db = 0
+                    while retry_db < 3:
+                        try:
+                            result = store.insert_chunks(mongo_chunks)
+                            if not args.silent and len(mongo_chunks) > 0:
+                                 print(f"    [DB] Inserted {len(mongo_chunks)} chunks for doc {doc_id} into MongoDB.", flush=True)
+                            break
+                        except Exception as exc:
+                            if "pymongo" in str(type(exc)).lower():
+                                retry_db += 1
+                                print(f"    [DB RETRY {retry_db}/3] Mongo insert failed: {exc}. Retrying...")
+                                time.sleep(2)
+                            else:
+                                raise
+                
+                retry_db = 0
+                while retry_db < 3:
+                    try:
+                        store.update_document_status(doc_id, status="ready", chunk_count=num_chunks)
+                        break
+                    except Exception as exc:
+                        if "pymongo" in str(type(exc)).lower():
+                            retry_db += 1
+                            time.sleep(2)
+                        else:
+                            raise
                 queued += 1
                 queued_chunks += num_chunks
             
@@ -680,20 +717,55 @@ def _run_build(args: argparse.Namespace) -> None:
 
     batch: List[Dict[str, Any]] = []
     batch_size = max(1, int(args.skip_batch_size))
-    for record in _iter_parquet_records(
+    max_retries = 3
+    retry_delay = 5
+
+    iterator = _iter_parquet_records(
         dataset_dir,
         limit=max_records,
         start=start_index,
         end=end_index,
         parquet_files=parquet_files,
         progress=_file_progress,
-    ):
-        batch.append(record)
-        if len(batch) >= batch_size:
-            _process_batch(batch)
-            batch = []
+    )
+
+    while True:
+        if shutdown_requested:
+            print("[SHUTDOWN] İşlem kullanıcı isteğiyle durduruldu.", flush=True)
+            break
+        try:
+            record = next(iterator)
+            batch.append(record)
+            if len(batch) >= batch_size:
+                retry_count = 0
+                while retry_count < max_retries:
+                    try:
+                        _process_batch(batch)
+                        break
+                    except Exception as exc:
+                        if "pymongo" in str(type(exc)).lower():
+                            retry_count += 1
+                            print(f"[RETRY {retry_count}/{max_retries}] MongoDB error: {exc}. Retrying in {retry_delay}s...")
+                            time.sleep(retry_delay)
+                        else:
+                            raise
+                batch = []
+        except StopIteration:
+            break
+
     if batch:
-        _process_batch(batch)
+        retry_count = 0
+        while retry_count < max_retries:
+            try:
+                _process_batch(batch)
+                break
+            except Exception as exc:
+                if "pymongo" in str(type(exc)).lower():
+                    retry_count += 1
+                    print(f"[RETRY {retry_count}/{max_retries}] MongoDB error: {exc}. Retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                else:
+                    raise
 
     elapsed = time.time() - start_time
     summary = (
