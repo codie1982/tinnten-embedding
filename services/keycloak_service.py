@@ -71,6 +71,18 @@ class KeycloakService:
         """
         return self.get_service_token_info(scope=scope, use_cache=use_cache)["access_token"]
 
+    def get_auth_header(
+        self,
+        scope: Union[str, Sequence[str], None] = None,
+        *,
+        use_cache: bool = True,
+    ) -> Dict[str, str]:
+        """
+        Returns a dictionary containing the Authorization header with a Bearer token.
+        """
+        token = self.get_service_token(scope=scope, use_cache=use_cache)
+        return {"Authorization": f"Bearer {token}"}
+
     def get_service_token_info(
         self,
         scope: Union[str, Sequence[str], None] = None,
