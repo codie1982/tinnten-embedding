@@ -104,8 +104,7 @@ class ContentDocumentStore:
 
     def __init__(self, db_name: Optional[str] = None) -> None:
         name = (
-            (db_name or os.getenv("CONTENT_DB_NAME") or "").strip()
-            or (os.getenv("DB_TINNTEN") or "").strip()
+            (db_name or os.getenv("DB_TINNTEN") or "").strip()
             or DEFAULT_CONTENT_DB_NAME
         )
         self.db = get_database(name)
