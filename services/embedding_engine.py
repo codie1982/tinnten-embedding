@@ -26,6 +26,19 @@ class EmbeddingEngine:
     Safe to share across threads via internal locking.
     """
 
+    _process_locks: dict[str, threading.RLock] = {}
+    _process_locks_guard = threading.Lock()
+
+    @classmethod
+    def _resolve_process_lock(cls, index_path: str) -> threading.RLock:
+        normalized = os.path.abspath(os.path.expanduser(index_path or "faiss.index"))
+        with cls._process_locks_guard:
+            lock = cls._process_locks.get(normalized)
+            if lock is None:
+                lock = threading.RLock()
+                cls._process_locks[normalized] = lock
+            return lock
+
     def __init__(
         self,
         model_name: str,
@@ -64,7 +77,7 @@ class EmbeddingEngine:
         self.cleanup_tmp = cleanup_env not in {"0", "false", "no", "off"}
         self.tmp_ttl_seconds = int(os.getenv("FAISS_TMP_TTL_SECONDS") or 3600)
         self.max_index_dimension = int(os.getenv("FAISS_MAX_INDEX_DIMENSION") or 16384)
-        self._lock = threading.RLock()
+        self._lock = self._resolve_process_lock(self.index_path)
         self._model = SentenceTransformer(self.model_name)
         self._index: faiss.IndexIDMap2 | None = None
         self._backing_index: Any = None

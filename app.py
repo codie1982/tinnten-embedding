@@ -113,6 +113,9 @@ ALLOW_UNAUTH_CONTENT_INDEX = (os.getenv("ALLOW_UNAUTH_CONTENT_INDEX") or "false"
     "y",
     "on",
 }
+CONTENT_REMOVE_MODE = (os.getenv("CONTENT_REMOVE_MODE") or "soft").strip().lower()
+if CONTENT_REMOVE_MODE not in {"soft", "hard"}:
+    CONTENT_REMOVE_MODE = "soft"
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -1839,11 +1842,19 @@ def reconstruct_document(doc_id: str):
 @app.route("/api/v10/content/index/remove", methods=["POST"])
 def remove_document():
     """
-    Hard-delete a document's embeddings from FAISS and Mongo.
+    Remove a document from content search.
+
+    Default mode is `soft`:
+    - does NOT mutate FAISS
+    - removes chunk metadata from Mongo
+    - marks document/index state as removed
+
+    Optional hard mode (`mode=hard` in query/body) also removes FAISS IDs.
 
     JSON body:
         documentId (str, required)
         companyId (str, optional): Used to update contentdocuments.index.state
+        mode (str, optional): soft|hard
     """
     payload = request.get_json() or {}
     document_id = _get_payload_value(payload, "documentId", "document_id", "documentid")
@@ -1851,27 +1862,46 @@ def remove_document():
     if not document_id:
         return jsonify({"error": "documentId is required"}), 400
 
+    raw_mode = (
+        request.args.get("mode")
+        or _get_payload_value(payload, "mode", "removeMode", "remove_mode")
+        or CONTENT_REMOVE_MODE
+    )
+    remove_mode = str(raw_mode or "").strip().lower()
+    if remove_mode not in {"soft", "hard"}:
+        return jsonify({"error": "mode must be one of: soft, hard"}), 400
+
     doc_id_str = str(document_id)
     chunks = chunk_store.get_chunks_by_doc(doc_id_str)
     faiss_ids = sorted({int(c["faiss_id"]) for c in chunks if "faiss_id" in c})
 
-    removed_count = 0
-    try:
-        chunk_engine.remove_ids(faiss_ids)
-        removed_count = len(faiss_ids)
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": f"failed to remove from FAISS: {exc}"}), 500
+    faiss_removed = 0
+    if remove_mode == "hard":
+        app.logger.info("Hard remove requested for documentId=%s faiss_ids=%s", doc_id_str, len(faiss_ids))
+        try:
+            chunk_engine.remove_ids(faiss_ids)
+            faiss_removed = len(faiss_ids)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": f"failed to remove from FAISS: {exc}"}), 500
+    else:
+        app.logger.warning(
+            "Soft remove applied for documentId=%s (skipping FAISS mutation, pending_faiss_ids=%s)",
+            doc_id_str,
+            len(faiss_ids),
+        )
 
-    # Clean Mongo collections
+    # Clean Mongo chunk metadata so removed docs do not appear in search results.
     deleted_chunks = chunk_store.delete_chunks_by_doc(doc_id_str)
-    chunk_store.delete_document(doc_id_str)
+    chunk_store.update_document_status(doc_id_str, status="removed", chunk_count=0, error=None)
 
     _deactivate_index_state(company_id, doc_id_str, state="removed")
 
     return jsonify(
         {
             "documentId": doc_id_str,
-            "faissRemoved": removed_count,
+            "mode": remove_mode,
+            "faissRemoved": faiss_removed,
+            "faissPendingCleanup": max(0, len(faiss_ids) - faiss_removed),
             "chunksDeleted": deleted_chunks,
             "state": "removed",
             "timestamp": datetime.now(timezone.utc).isoformat(),

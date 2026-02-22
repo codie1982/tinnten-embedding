@@ -40,6 +40,8 @@ from services.mongo_store import MongoStore
 from services.content_store import ContentDocumentStore, normalize_index_options
 from services.upload_store import UploadStore, UploadNotFoundError
 from services.fetcher_store import FetcherStore
+from services.document_loader import DocumentDownloadError, DocumentParseError
+from services.email_queue_events import EmbeddingEmailEvents
 from init.aws import get_s3_client
 
 
@@ -132,6 +134,7 @@ class IngestWorker:
         self.connection: pika.BlockingConnection | None = None
         self.channel: pika.adapters.blocking_connection.BlockingChannel | None = None
         self._stop_event = threading.Event()
+        self.email_events = EmbeddingEmailEvents()
 
     def _get_store(self) -> MongoStore:
         if self.store is not None:
@@ -279,23 +282,45 @@ class IngestWorker:
                     doc_id = payload.get("doc_id")
                     if doc_id:
                         self._get_store().update_document_status(doc_id, status="failed", error=str(exc))
+                        company_id = self._coalesce(payload, "companyId", "company_id", "companyid")
+                        if company_id:
+                            self.email_events.send_index_failed(
+                                company_id=company_id,
+                                document_id=str(doc_id),
+                                job_id=str(payload.get("jobId") or payload.get("job_id") or uuid.uuid4()),
+                                source=str(payload.get("source") or "unknown"),
+                                stage="message_processing",
+                                reason=str(exc),
+                            )
                     else:
                         document_ids = self._coalesce(payload, "documentIds", "document_ids", "documentids")
                         company_id = self._coalesce(payload, "companyId", "company_id", "companyid")
                         if company_id and document_ids:
                             ids = document_ids if isinstance(document_ids, Sequence) else [document_ids]
                             for document_id in ids:
+                                document_id_str = str(document_id)
+                                job_id_value = str(
+                                    payload.get("jobId") or payload.get("job_id") or uuid.uuid4()
+                                )
                                 self._safe_update_index_state(
                                     DocumentJobContext(
                                         company_id=company_id,
-                                        document_id=str(document_id),
-                                        job_id=str(payload.get("jobId") or payload.get("job_id") or uuid.uuid4()),
+                                        document_id=document_id_str,
+                                        job_id=job_id_value,
                                         user_id=self._coalesce(payload, "userId", "userid", "user_id"),
                                         trigger=self._coalesce(payload, "trigger"),
                                         options={},
                                     ),
                                     state="failed",
                                     error=str(exc),
+                                )
+                                self.email_events.send_index_failed(
+                                    company_id=company_id,
+                                    document_id=document_id_str,
+                                    job_id=job_id_value,
+                                    source="unknown",
+                                    stage="message_processing",
+                                    reason=str(exc),
                                 )
             except Exception:
                 pass
@@ -389,6 +414,14 @@ class IngestWorker:
                 log(msg)
                 self._log_document_event(ctx, level="error", message=msg, state="failed")
                 self._safe_update_index_state(ctx, state="failed", error="document not found")
+                self.email_events.send_index_failed(
+                    company_id=ctx.company_id,
+                    document_id=ctx.document_id,
+                    job_id=ctx.job_id,
+                    source="unknown",
+                    stage="document_lookup",
+                    reason="document not found",
+                )
 
         for doc_id, document in documents.items():
             doc_index = document.get("index") if isinstance(document, dict) else None
@@ -524,6 +557,8 @@ class IngestWorker:
         started_at = datetime.now(timezone.utc)
         log(f"Begin document doc_id={context.document_id} company_id={context.company_id} job_id={context.job_id}")
         options = context.options
+        resolved_source = self._resolve_document_source(document, options)
+        source_name = str(resolved_source.get("source") or "-")
         base_stats = self._initial_stats(options)
         self._safe_update_index_state(
             context,
@@ -539,8 +574,13 @@ class IngestWorker:
             state="processing",
             details={"options": options},
         )
-
-        resolved_source = self._resolve_document_source(document, options)
+        self.email_events.send_index_started(
+            company_id=context.company_id,
+            document_id=context.document_id,
+            job_id=context.job_id,
+            source=source_name,
+            trigger=context.trigger,
+        )
         try:
             text, metadata = self._load_document_content(document, resolved_source, context)
         except Exception as exc:  # noqa: BLE001
@@ -554,6 +594,12 @@ class IngestWorker:
                 extra={"index.finishedAt": finished_at},
             )
             self._log_document_event(context, level="error", message=error_msg, state="failed")
+            self._notify_index_failure(
+                context=context,
+                source=source_name,
+                stage="content_load",
+                exc=exc,
+            )
             raise
 
         self._log_document_event(
@@ -595,6 +641,12 @@ class IngestWorker:
                 extra={"index.finishedAt": finished_at},
             )
             self._log_document_event(context, level="error", message=error_msg, state="failed")
+            self._notify_index_failure(
+                context=context,
+                source=source_name,
+                stage="embedding",
+                exc=exc,
+            )
             raise
 
         finished_at = datetime.now(timezone.utc)
@@ -632,6 +684,14 @@ class IngestWorker:
             message="Indexing job completed.",
             state="completed",
             details={"stats": stats_with_flags},
+        )
+        self.email_events.send_index_completed(
+            company_id=context.company_id,
+            document_id=context.document_id,
+            job_id=context.job_id,
+            source=source_name,
+            stats=stats_with_flags,
+            finished_at=finished_at,
         )
 
     # ------------------------------------------------------------------
@@ -682,8 +742,6 @@ class IngestWorker:
         metadata: Dict[str, Any],
         context: DocumentJobContext,
     ) -> Tuple[str, Dict[str, Any]]:
-        from services.document_loader import DocumentDownloadError, DocumentParseError
-
         try:
             upload_doc = self._get_upload_store().get_upload_by_id(upload_id)
         except UploadNotFoundError as exc:
@@ -778,20 +836,28 @@ class IngestWorker:
 
         fetcher_store = self._get_fetcher_store()
         domain_doc = fetcher_store.get_domain(domain)
-        if not domain_doc:
-            raise RuntimeError(f"fetcher domain not found: {domain}")
+        if not isinstance(domain_doc, dict):
+            domain_doc = {}
+            log(
+                "Fetcher domain metadata not found for %s; continuing without source/company constraints.",
+                domain,
+            )
 
+        domain_config = domain_doc.get("config") if isinstance(domain_doc.get("config"), dict) else {}
         domain_company = (
             domain_doc.get("companyId")
             or domain_doc.get("companyid")
-            or (domain_doc.get("config") or {}).get("companyId")
-            or (domain_doc.get("config") or {}).get("companyid")
+            or domain_config.get("companyId")
+            or domain_config.get("companyid")
         )
-        if not domain_company:
-            raise RuntimeError(f"fetcher domain has no companyId: {domain}")
-        if str(domain_company) != str(context.company_id):
+        if domain_company and str(domain_company) != str(context.company_id):
             raise RuntimeError(
                 f"fetcher domain company mismatch: domain={domain} expected={context.company_id} got={domain_company}"
+            )
+        if not domain_company:
+            log(
+                "Fetcher domain %s has no companyId metadata; skipping domain company match.",
+                domain,
             )
 
         site_profile = domain_doc.get("site_profile") if isinstance(domain_doc.get("site_profile"), dict) else {}
@@ -1637,6 +1703,55 @@ class IngestWorker:
             self._get_content_store().update_index_fields(**update_kwargs)
         except Exception as exc:  # noqa: BLE001
             log(f"Failed to update index state for {context.document_id}: {exc}")
+
+    def _notify_index_failure(
+        self,
+        *,
+        context: DocumentJobContext,
+        source: str,
+        stage: str,
+        exc: Exception,
+    ) -> None:
+        reason = str(exc or "unknown error")
+        normalized_source = str(source or "").strip().lower()
+
+        if normalized_source == "upload":
+            if isinstance(exc, DocumentDownloadError):
+                self.email_events.send_upload_access_failed(
+                    company_id=context.company_id,
+                    document_id=context.document_id,
+                    job_id=context.job_id,
+                    reason=reason,
+                )
+                return
+
+            if isinstance(exc, DocumentParseError):
+                self.email_events.send_upload_format_unsupported(
+                    company_id=context.company_id,
+                    document_id=context.document_id,
+                    job_id=context.job_id,
+                    reason=reason,
+                )
+                return
+
+            lowered = reason.lower()
+            if "unsupported file extension" in lowered or "unknown document format" in lowered:
+                self.email_events.send_upload_format_unsupported(
+                    company_id=context.company_id,
+                    document_id=context.document_id,
+                    job_id=context.job_id,
+                    reason=reason,
+                )
+                return
+
+        self.email_events.send_index_failed(
+            company_id=context.company_id,
+            document_id=context.document_id,
+            job_id=context.job_id,
+            source=source,
+            stage=stage,
+            reason=reason,
+        )
 
     # ------------------------------------------------------------------
     def _coalesce(self, data: Dict[str, Any], *candidates: str) -> Optional[Any]:

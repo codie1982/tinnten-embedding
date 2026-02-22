@@ -147,12 +147,37 @@ class MongoStore:
     # ------------------------------------------------------------------
     # Counter helpers
     # ------------------------------------------------------------------
+    def _max_existing_faiss_id(self, *, session=None) -> int:
+        row = self.chunks.find_one(
+            {"faiss_id": {"$type": "number"}},
+            {"faiss_id": 1},
+            sort=[("faiss_id", -1)],
+            session=session,
+        )
+        if not row:
+            return 0
+        try:
+            return int(row.get("faiss_id") or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def reserve_faiss_ids(self, count: int, *, session=None) -> List[int]:
         """
         Atomically reserve a block of FAISS IDs.
         """
         if count <= 0:
             raise ValueError("count must be positive")
+
+        # Keep the counter aligned with existing chunk metadata so restarts or
+        # dropped counter docs do not reuse an already persisted faiss_id.
+        max_existing = self._max_existing_faiss_id(session=session)
+        self.counters.update_one(
+            {"_id": FAISS_COUNTER_KEY},
+            {"$max": {"seq": max_existing}},
+            upsert=True,
+            session=session,
+        )
+
         result = self.counters.find_one_and_update(
             {"_id": FAISS_COUNTER_KEY},
             {"$inc": {"seq": count}},
