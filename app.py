@@ -199,6 +199,18 @@ def _parse_int(value, default: int, minimum: int | None = None) -> int:
     return parsed
 
 
+def _coerce_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
 def _parse_filter_arg(raw_value):
     if raw_value is None:
         return None
@@ -296,6 +308,11 @@ def _normalize_category_payload(payload: dict) -> dict:
     description = payload.get("description") or payload.get("desc")
     if description is not None:
         meta_payload["description"] = str(description)
+
+    if "isSystem" in payload:
+        meta_payload["isSystem"] = _coerce_bool(payload.get("isSystem"), False)
+    elif "is_system" in payload:
+        meta_payload["isSystem"] = _coerce_bool(payload.get("is_system"), False)
 
     company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
     if company_id is not None:
@@ -439,6 +456,11 @@ def _normalize_attribute_payload(payload: dict) -> dict:
     if category_id is not None:
         meta_payload["categoryId"] = str(category_id)
 
+    if "isSystem" in payload:
+        meta_payload["isSystem"] = _coerce_bool(payload.get("isSystem"), False)
+    elif "is_system" in payload:
+        meta_payload["isSystem"] = _coerce_bool(payload.get("is_system"), False)
+
     company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
     if company_id is not None:
         payload["companyId"] = str(company_id)
@@ -529,7 +551,9 @@ def _vector_search_response(target_store, label: str = "search", payload: dict |
                 if mapped:
                     transformed.append(mapped)
             results = transformed
-        return jsonify({"results": results})
+        # Include multiple keys for backward compatibility with clients
+        # that expect either `results`, `items`, raw list-like wrappers, or `data`.
+        return jsonify({"results": results, "items": results, "data": results})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"{label} failed: {exc}"}), 400
 
@@ -573,6 +597,23 @@ def _reconstruct_from_chunks(chunks: list[dict]) -> str:
             buffer.append(text[overlap:])
             current_len += len(text) - overlap
     return "".join(buffer)
+
+
+def _serialize_chunk_document(doc: dict) -> dict:
+    out = {k: v for k, v in doc.items() if k != "_id"}
+    for key in ("created_at", "updated_at"):
+        value = out.get(key)
+        if hasattr(value, "isoformat"):
+            out[key] = value.isoformat()
+    return out
+
+
+def _serialize_chunk_entry(chunk: dict) -> dict:
+    out = {k: v for k, v in chunk.items() if k != "_id"}
+    value = out.get("created_at")
+    if hasattr(value, "isoformat"):
+        out["created_at"] = value.isoformat()
+    return out
 
 
 def _chunk_search_response(payload: dict):
@@ -921,12 +962,11 @@ def upsert_category_vector():
     payload = request.get_json() or {}
     company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
     user_id = payload.get("userId") or payload.get("user_id") or payload.get("userid")
-    if not company_id:
-        return jsonify({"error": "companyId is required"}), 400
-    ok, reason = _validate_company_user(str(company_id), str(user_id) if user_id is not None else None)
-    if not ok:
-        status = 400 if reason in {"companyId is required", "userId is required"} else 403
-        return jsonify({"error": reason}), status
+    if company_id is not None and user_id is not None:
+        ok, reason = _validate_company_user(str(company_id), str(user_id))
+        if not ok:
+            status = 400 if reason in {"companyId is required", "userId is required"} else 403
+            return jsonify({"error": reason}), status
     try:
         payload = _normalize_category_payload(payload)
     except ValueError as exc:
@@ -986,6 +1026,12 @@ def list_categories():
     if filter_arg and "metadata.parentId" in filter_arg:
         filter_arg["parentId"] = str(filter_arg.pop("metadata.parentId"))
 
+    # slug filter desteği
+    slug = request.args.get("slug")
+    if slug is not None:
+        filter_arg = dict(filter_arg or {})
+        filter_arg["metadata.slug"] = str(slug)
+
     total, items = category_store.list_entries(
         offset=offset,
         limit=limit,
@@ -994,6 +1040,110 @@ def list_categories():
     mapped = [_map_category_entry(item) for item in items]
     mapped = [m for m in mapped if m]
     return jsonify({"total": total, "offset": offset, "limit": limit, "items": mapped})
+
+@app.route("/api/v10/categories/stats", methods=["GET"])
+def category_stats():
+    """
+    Category stats endpoint.
+    Compatible with legacy shape and extended with additional breakdowns.
+    """
+    filter_arg = _parse_filter_arg(request.args.get("filter"))
+    if filter_arg == "__invalid__":
+        return jsonify({"error": "filter must be valid JSON"}), 400
+    if filter_arg is not None and not isinstance(filter_arg, dict):
+        return jsonify({"error": "filter must be an object"}), 400
+
+    company_id = request.args.get("companyId") or request.args.get("company_id") or request.args.get("companyid")
+    if company_id is not None:
+        filter_arg = dict(filter_arg or {})
+        filter_arg["companyId"] = str(company_id)
+
+    parent_id = request.args.get("parentId") or request.args.get("parent_id") or request.args.get("parentid")
+    if parent_id is not None:
+        filter_arg = dict(filter_arg or {})
+        filter_arg["parentId"] = str(parent_id)
+
+    slug = request.args.get("slug")
+    if slug is not None:
+        filter_arg = dict(filter_arg or {})
+        filter_arg["metadata.slug"] = str(slug)
+
+    text = request.args.get("text")
+    if text is not None:
+        filter_arg = dict(filter_arg or {})
+        filter_arg["text"] = str(text)
+
+    total, items = category_store.list_entries(offset=0, limit=None, simple_filter=filter_arg)
+
+    by_company: dict[str, int] = {}
+    by_type: dict[str, int] = {"product": 0, "service": 0, "general": 0}
+    by_status: dict[str, int] = {}
+
+    active_count = 0
+    inactive_count = 0
+    featured_count = 0
+    public_count = 0
+    private_count = 0
+    system_count = 0
+    user_count = 0
+    root_count = 0
+    child_count = 0
+
+    for item in items:
+        metadata = item.get("metadata") or {}
+
+        company_val = item.get("companyId") or metadata.get("companyId")
+        if company_val is not None and str(company_val).strip():
+            key = str(company_val).strip()
+            by_company[key] = by_company.get(key, 0) + 1
+
+        category_type = metadata.get("categoryType") or metadata.get("type") or "general"
+        type_key = str(category_type).strip().lower() or "general"
+        by_type[type_key] = by_type.get(type_key, 0) + 1
+
+        status = metadata.get("status") or item.get("status") or "unknown"
+        status_key = str(status).strip().lower() or "unknown"
+        by_status[status_key] = by_status.get(status_key, 0) + 1
+        if status_key == "active":
+            active_count += 1
+        elif status_key == "inactive":
+            inactive_count += 1
+
+        if _coerce_bool(metadata.get("featured"), False):
+            featured_count += 1
+
+        is_public = _coerce_bool(metadata.get("isPublic"), False)
+        if is_public:
+            public_count += 1
+        else:
+            private_count += 1
+
+        is_system = _coerce_bool(metadata.get("isSystem"), False)
+        if is_system:
+            system_count += 1
+        else:
+            user_count += 1
+
+        parent_id = metadata.get("parentId")
+        if parent_id is None or str(parent_id).strip() == "":
+            root_count += 1
+        else:
+            child_count += 1
+
+    return jsonify(
+        {
+            "total": int(total),
+            "active": int(active_count),
+            "inactive": int(inactive_count),
+            "featured": int(featured_count),
+            "byType": by_type,
+            "byCompany": by_company,
+            "byStatus": by_status,
+            "byVisibility": {"public": int(public_count), "private": int(private_count)},
+            "system": {"system": int(system_count), "user": int(user_count)},
+            "hierarchy": {"root": int(root_count), "child": int(child_count)},
+        }
+    )
 
 @app.route("/api/v10/categories", methods=["POST"])
 @app.route("/categories", methods=["POST"])
@@ -1004,12 +1154,11 @@ def create_category():
     # companyId zorunluluğu
     company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
     user_id = payload.get("userId") or payload.get("user_id") or payload.get("userid")
-    if not company_id:
-        return jsonify({"error": "companyId is required"}), 400
-    ok, reason = _validate_company_user(str(company_id), str(user_id) if user_id is not None else None)
-    if not ok:
-        status = 400 if reason in {"companyId is required", "userId is required"} else 403
-        return jsonify({"error": reason}), status
+    if company_id is not None and user_id is not None:
+        ok, reason = _validate_company_user(str(company_id), str(user_id))
+        if not ok:
+            status = 400 if reason in {"companyId is required", "userId is required"} else 403
+            return jsonify({"error": reason}), status
     
     try:
         payload = _normalize_category_payload(payload)
@@ -1019,10 +1168,9 @@ def create_category():
     text = payload.get("text")
     if text:
         # Check for duplicates by exact text match within the same company
-        duplicate_filter = {
-            "text": text,
-            "companyId": str(company_id)
-        }
+        duplicate_filter = {"text": text}
+        if company_id is not None:
+            duplicate_filter["companyId"] = str(company_id)
         total, exists = category_store.list_entries(limit=1, simple_filter=duplicate_filter)
         if total > 0:
             return jsonify({
@@ -1098,10 +1246,11 @@ def update_category(category_id: str):
     if existing_company_id and company_id and str(existing_company_id) != str(company_id):
         return jsonify({"error": "forbidden", "message": "Bu kategoriyi düzenleme yetkiniz yok."}), 403
     target_company_id = company_id or existing_company_id
-    ok, reason = _validate_company_user(str(target_company_id) if target_company_id is not None else None, str(user_id) if user_id is not None else None)
-    if not ok:
-        status = 400 if reason in {"companyId is required", "userId is required"} else 403
-        return jsonify({"error": reason}), status
+    if target_company_id is not None and user_id is not None:
+        ok, reason = _validate_company_user(str(target_company_id), str(user_id))
+        if not ok:
+            status = 400 if reason in {"companyId is required", "userId is required"} else 403
+            return jsonify({"error": reason}), status
     
     payload["id"] = payload.get("id") or resolved_id
     try:
@@ -1169,12 +1318,11 @@ def upsert_attribute_vector():
     payload = request.get_json() or {}
     company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
     user_id = payload.get("userId") or payload.get("user_id") or payload.get("userid")
-    if not company_id:
-        return jsonify({"error": "companyId is required"}), 400
-    ok, reason = _validate_company_user(str(company_id), str(user_id) if user_id is not None else None)
-    if not ok:
-        status = 400 if reason in {"companyId is required", "userId is required"} else 403
-        return jsonify({"error": reason}), status
+    if company_id is not None and user_id is not None:
+        ok, reason = _validate_company_user(str(company_id), str(user_id))
+        if not ok:
+            status = 400 if reason in {"companyId is required", "userId is required"} else 403
+            return jsonify({"error": reason}), status
     try:
         payload = _normalize_attribute_payload(payload)
     except ValueError as exc:
@@ -1246,12 +1394,11 @@ def create_attribute():
     # companyId zorunluluğu
     company_id = payload.get("companyId") or payload.get("company_id") or payload.get("companyid")
     user_id = payload.get("userId") or payload.get("user_id") or payload.get("userid")
-    if not company_id:
-        return jsonify({"error": "companyId is required"}), 400
-    ok, reason = _validate_company_user(str(company_id), str(user_id) if user_id is not None else None)
-    if not ok:
-        status = 400 if reason in {"companyId is required", "userId is required"} else 403
-        return jsonify({"error": reason}), status
+    if company_id is not None and user_id is not None:
+        ok, reason = _validate_company_user(str(company_id), str(user_id))
+        if not ok:
+            status = 400 if reason in {"companyId is required", "userId is required"} else 403
+            return jsonify({"error": reason}), status
     
     try:
         payload = _normalize_attribute_payload(payload)
@@ -1261,10 +1408,9 @@ def create_attribute():
     text = payload.get("text")
     if text:
         # Check for duplicates by exact text match within the same company
-        duplicate_filter = {
-            "text": text,
-            "companyId": str(company_id)
-        }
+        duplicate_filter = {"text": text}
+        if company_id is not None:
+            duplicate_filter["companyId"] = str(company_id)
         total, exists = attribute_store.list_entries(limit=1, simple_filter=duplicate_filter)
         if total > 0:
             return jsonify({
@@ -1332,10 +1478,11 @@ def update_attribute(attribute_id: str):
     if existing_company_id and company_id and str(existing_company_id) != str(company_id):
         return jsonify({"error": "forbidden", "message": "Bu attribute'ü düzenleme yetkiniz yok."}), 403
     target_company_id = company_id or existing_company_id
-    ok, reason = _validate_company_user(str(target_company_id) if target_company_id is not None else None, str(user_id) if user_id is not None else None)
-    if not ok:
-        status = 400 if reason in {"companyId is required", "userId is required"} else 403
-        return jsonify({"error": reason}), status
+    if target_company_id is not None and user_id is not None:
+        ok, reason = _validate_company_user(str(target_company_id), str(user_id))
+        if not ok:
+            status = 400 if reason in {"companyId is required", "userId is required"} else 403
+            return jsonify({"error": reason}), status
     
     payload["id"] = payload.get("id") or resolved_id
     try:
@@ -1401,6 +1548,159 @@ def search_content_chunks():
     """
     payload = request.get_json() or {}
     return _chunk_search_response(payload)
+
+
+@app.route("/api/v10/vector/ingest-web", methods=["POST"])
+def ingest_web_legacy():
+    """
+    Backward-compatible ingest endpoint used by the previous embedding.py service.
+    """
+    payload = request.get_json() or {}
+    text = str(_get_payload_value(payload, "text") or "").strip()
+    url = str(_get_payload_value(payload, "url") or "").strip()
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+    if not url:
+        return jsonify({"error": "url is required"}), 400
+
+    chunk_size = _parse_int(
+        _get_payload_value(payload, "chunk_size", "target_chars"),
+        DEFAULT_INDEX_CHUNK_SIZE,
+        minimum=1,
+    )
+    chunk_overlap = _parse_int(
+        _get_payload_value(payload, "chunk_overlap", "overlap_chars"),
+        DEFAULT_INDEX_CHUNK_OVERLAP,
+        minimum=0,
+    )
+    min_chars = _parse_int(_get_payload_value(payload, "min_chars"), DEFAULT_INDEX_MIN_CHARS, minimum=1)
+    if chunk_overlap >= chunk_size:
+        return jsonify({"error": "chunk_overlap must be >=0 and smaller than chunk_size"}), 400
+
+    metadata = payload.get("metadata") or {}
+    if metadata and not isinstance(metadata, dict):
+        return jsonify({"error": "metadata must be an object"}), 400
+    metadata = dict(metadata)
+    metadata.setdefault("url", url)
+    metadata.setdefault("source", "web")
+
+    doc_id = chunk_store.create_document(
+        doc_id=_get_payload_value(payload, "doc_id", "docId"),
+        doc_type="web",
+        source="web",
+        metadata=metadata,
+    )
+
+    message = {
+        "ingest_type": "web",
+        "doc_id": doc_id,
+        "doc_type": "web",
+        "text": text,
+        "url": url,
+        "metadata": metadata,
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+        "min_chars": min_chars,
+    }
+    try:
+        job_publisher.publish(message)
+    except Exception as exc:  # noqa: BLE001
+        chunk_store.update_document_status(doc_id, status="failed", error=str(exc))
+        return jsonify({"error": "failed_to_enqueue", "message": str(exc)}), 500
+
+    return jsonify({"doc_id": doc_id, "status": "queued"})
+
+
+@app.route("/api/v10/vector/ingest-upload", methods=["POST"])
+def ingest_upload_legacy():
+    """
+    Backward-compatible upload ingest endpoint used by the previous embedding.py service.
+    """
+    payload = request.get_json() or {}
+    upload_id = str(_get_payload_value(payload, "upload_id", "uploadId") or "").strip()
+    if not upload_id:
+        return jsonify({"error": "upload_id is required"}), 400
+
+    try:
+        upload_doc = upload_store.get_upload_by_id(upload_id)
+    except UploadNotFoundError as exc:
+        return jsonify({"error": "upload_not_found", "message": str(exc)}), 404
+
+    chunk_size = _parse_int(
+        _get_payload_value(payload, "chunk_size", "target_chars"),
+        DEFAULT_INDEX_CHUNK_SIZE,
+        minimum=1,
+    )
+    chunk_overlap = _parse_int(
+        _get_payload_value(payload, "chunk_overlap", "overlap_chars"),
+        DEFAULT_INDEX_CHUNK_OVERLAP,
+        minimum=0,
+    )
+    min_chars = _parse_int(_get_payload_value(payload, "min_chars"), DEFAULT_INDEX_MIN_CHARS, minimum=1)
+    if chunk_overlap >= chunk_size:
+        return jsonify({"error": "chunk_overlap must be >=0 and smaller than chunk_size"}), 400
+
+    metadata = payload.get("metadata") or {}
+    if metadata and not isinstance(metadata, dict):
+        return jsonify({"error": "metadata must be an object"}), 400
+    metadata = dict(metadata)
+    metadata.setdefault("upload_id", upload_id)
+    metadata.setdefault("upload_type", upload_doc.get("uploadType"))
+
+    doc_id = chunk_store.create_document(
+        doc_id=_get_payload_value(payload, "doc_id", "docId"),
+        doc_type="document",
+        source="upload",
+        metadata=metadata,
+    )
+    upload_store.update_upload_status(
+        upload_id,
+        index_status="pending",
+        is_file_opened=False,
+        file_open_error=None,
+        embedding_doc_id=doc_id,
+    )
+
+    message = {
+        "ingest_type": "upload",
+        "doc_id": doc_id,
+        "doc_type": "document",
+        "upload_id": upload_id,
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+        "min_chars": min_chars,
+        "metadata": metadata,
+    }
+    try:
+        job_publisher.publish(message)
+    except Exception as exc:  # noqa: BLE001
+        chunk_store.update_document_status(doc_id, status="failed", error=str(exc))
+        upload_store.update_upload_status(
+            upload_id,
+            index_status="failed",
+            is_file_opened=False,
+            file_open_error=str(exc),
+        )
+        return jsonify({"error": "failed_to_enqueue", "message": str(exc)}), 500
+
+    return jsonify({"doc_id": doc_id, "status": "queued"})
+
+
+@app.route("/api/v10/vector/document/<doc_id>", methods=["GET"])
+def get_vector_document_legacy(doc_id: str):
+    """
+    Backward-compatible document status endpoint used by the previous embedding.py service.
+    """
+    doc = chunk_store.get_document(doc_id)
+    if not doc:
+        return jsonify({"error": "not_found"}), 404
+
+    response = _serialize_chunk_document(doc)
+    include_chunks = (request.args.get("include_chunks") or "").strip().lower() in {"1", "true", "yes"}
+    if include_chunks:
+        chunks = chunk_store.get_chunks_by_doc(doc_id)
+        response["chunks"] = [_serialize_chunk_entry(chunk) for chunk in chunks]
+    return jsonify(response)
 
 
 @app.route("/api/v10/content/index/deactivate", methods=["POST"])

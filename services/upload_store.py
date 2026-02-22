@@ -21,6 +21,9 @@ class UploadNotFoundError(RuntimeError):
     """Raised when an upload document cannot be located."""
 
 
+_UNSET = object()
+
+
 class UploadStore:
     def __init__(self, db_name: Optional[str] = None) -> None:
         name = (
@@ -53,7 +56,7 @@ class UploadStore:
         *,
         index_status: Optional[str] = None,
         is_file_opened: Optional[bool] = None,
-        file_open_error: Optional[str] = None,
+        file_open_error: Optional[str] | object = _UNSET,
         embedding_doc_id: Optional[str] = None,
         session=None,
     ) -> Optional[Dict[str, Any]]:
@@ -62,7 +65,7 @@ class UploadStore:
             update["index_status"] = index_status
         if is_file_opened is not None:
             update["is_file_opened"] = is_file_opened
-        if file_open_error is not None:
+        if file_open_error is not _UNSET:
             update["file_open_error"] = file_open_error
         if embedding_doc_id is not None:
             update["embedding_doc_id"] = embedding_doc_id

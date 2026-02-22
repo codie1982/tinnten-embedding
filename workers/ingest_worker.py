@@ -9,6 +9,7 @@ import signal
 import sys
 import threading
 import time
+from urllib.parse import unquote, urlparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -73,11 +74,13 @@ UPDATE_UNSET = object()
 
 class IngestWorker:
     def __init__(self) -> None:
-        queue_env = (os.getenv("CONTENT_INDEX_QUEUE_NAME") or os.getenv("EMBED_QUEUE_NAME") or "").strip()
-        if queue_env:
-            queues = [q.strip() for q in queue_env.split(",") if q.strip()]
-        else:
-            queues = [DEFAULT_PRIMARY_QUEUE_NAME]
+        queue_env_primary = (os.getenv("CONTENT_INDEX_QUEUE_NAME") or "").strip()
+        queue_env_legacy = (os.getenv("EMBED_QUEUE_NAME") or "").strip()
+        queues = [DEFAULT_PRIMARY_QUEUE_NAME]
+        for raw in (queue_env_primary, queue_env_legacy):
+            if not raw:
+                continue
+            queues.extend([q.strip() for q in raw.split(",") if q.strip()])
 
         # Optional legacy queue support for backward compatibility.
         legacy_flag = (os.getenv("ENABLE_LEGACY_EMBED_QUEUE") or "").strip().lower()
@@ -1200,13 +1203,8 @@ class IngestWorker:
         for blob in candidates:
             if not isinstance(blob, dict):
                 continue
-            bucket = (
-                blob.get("bucket")
-                or blob.get("Bucket")
-                or blob.get("bucket_name")
-                or bucket_default
-            )
-            key = blob.get("key") or blob.get("Key") or blob.get("path") or blob.get("s3Key")
+            bucket = self._extract_bucket(blob, bucket_default)
+            key = self._extract_s3_key(blob, bucket)
             if key:
                 filename = blob.get("filename") or blob.get("originalname") or os.path.basename(key)
                 return bucket, key, filename
@@ -1214,6 +1212,78 @@ class IngestWorker:
         if not bucket_default:
             raise RuntimeError("Unable to determine S3 bucket and no AWS_S3_BUCKET set.")
         raise RuntimeError("Unable to resolve S3 object key for upload.")
+
+    @staticmethod
+    def _extract_bucket(blob: Dict[str, Any], bucket_default: Optional[str]) -> Optional[str]:
+        metadata = blob.get("metadata") if isinstance(blob.get("metadata"), dict) else {}
+        return (
+            blob.get("bucket")
+            or blob.get("Bucket")
+            or blob.get("bucket_name")
+            or metadata.get("bucket")
+            or metadata.get("Bucket")
+            or bucket_default
+        )
+
+    def _extract_s3_key(self, blob: Dict[str, Any], bucket: Optional[str]) -> Optional[str]:
+        metadata = blob.get("metadata") if isinstance(blob.get("metadata"), dict) else {}
+        direct_key = (
+            blob.get("key")
+            or blob.get("Key")
+            or blob.get("s3Key")
+            or metadata.get("key")
+            or metadata.get("Key")
+            or metadata.get("s3Key")
+        )
+        if isinstance(direct_key, str) and direct_key.strip():
+            return direct_key.strip()
+
+        path_like = (
+            blob.get("path")
+            or blob.get("url")
+            or blob.get("location")
+            or metadata.get("path")
+            or metadata.get("url")
+            or metadata.get("location")
+        )
+        if not isinstance(path_like, str) or not path_like.strip():
+            return None
+        return self._normalise_s3_key_from_path(path_like.strip(), bucket)
+
+    @staticmethod
+    def _normalise_s3_key_from_path(path_like: str, bucket: Optional[str]) -> Optional[str]:
+        # Accept plain object keys.
+        if "://" not in path_like and not path_like.startswith("s3://"):
+            return path_like.lstrip("/")
+
+        if path_like.startswith("s3://"):
+            without = path_like[5:]
+            if "/" not in without:
+                return None
+            _, key = without.split("/", 1)
+            return unquote(key.lstrip("/"))
+
+        parsed = urlparse(path_like)
+        host = (parsed.netloc or "").lower()
+        path = unquote((parsed.path or "").lstrip("/"))
+        if not path:
+            return None
+
+        # path-style URL: s3.<region>.amazonaws.com/<bucket>/<key>
+        if host.startswith("s3.") or host == "s3.amazonaws.com":
+            if "/" in path:
+                bucket_from_path, key = path.split("/", 1)
+                if bucket and bucket_from_path == bucket:
+                    return key
+                return key if bucket_from_path else path
+            return None
+
+        # virtual-host style URL: <bucket>.s3.<region>.amazonaws.com/<key>
+        if ".s3." in host and path:
+            return path
+
+        # CDN/custom domain fallback: use URL path as key.
+        return path
 
 
 def _install_signal_handlers(worker: IngestWorker) -> None:

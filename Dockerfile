@@ -19,5 +19,5 @@ COPY . .
 
 EXPOSE 5003
 
-# Production: Gunicorn ile başlat
-CMD ["gunicorn", "--bind", "0.0.0.0:5003", "--workers=2", "--timeout=600", "embedding:app"]
+# Production: API + background workers through wsgi entrypoint
+CMD ["gunicorn", "--bind", "0.0.0.0:5003", "--workers", "1", "--timeout", "600", "wsgi:app"]

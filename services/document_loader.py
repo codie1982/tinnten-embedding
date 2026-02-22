@@ -7,6 +7,7 @@ import io
 import os
 import tempfile
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
 from botocore.exceptions import ClientError
@@ -21,9 +22,13 @@ SUPPORTED_EXTENSIONS = {
     ".md",
     ".csv",
     ".json",
+    ".html",
+    ".htm",
     ".pdf",
     ".doc",
     ".docx",
+    ".xlsx",
+    ".pptx",
 }
 
 TEXTUAL_MIME_PREFIXES = ("text/", "application/json", "application/xml")
@@ -31,6 +36,27 @@ DOCX_MIME_TYPES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/msword",
 }
+XLSX_MIME_TYPES = {
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel",
+}
+PPTX_MIME_TYPES = {
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.ms-powerpoint",
+}
+
+
+class _SimpleHTMLTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        if data and data.strip():
+            self._parts.append(data.strip())
+
+    def text(self) -> str:
+        return "\n".join(self._parts).strip()
 
 
 class DocumentDownloadError(RuntimeError):
@@ -87,11 +113,20 @@ class DocumentLoader:
         if suffix in {".txt", ".md", ".csv", ".json"} or self._is_plain_text(content_type):
             return data.decode("utf-8", errors="replace")
 
+        if suffix in {".html", ".htm"} or content_type in {"text/html", "application/xhtml+xml"}:
+            return self._read_html(data)
+
         if suffix == ".pdf" or content_type == "application/pdf":
             return self._read_pdf(data)
 
         if suffix in {".docx"} or content_type in DOCX_MIME_TYPES:
             return self._read_docx(data)
+
+        if suffix == ".xlsx" or content_type in XLSX_MIME_TYPES:
+            return self._read_xlsx(data)
+
+        if suffix == ".pptx" or content_type in PPTX_MIME_TYPES:
+            return self._read_pptx(data)
 
         if suffix == ".doc":
             return self._read_doc_binary(data)
@@ -121,6 +156,60 @@ class DocumentLoader:
             return "\n".join(texts).strip()
         except Exception as exc:  # noqa: BLE001
             raise DocumentParseError(f"Failed to parse DOCX: {exc}") from exc
+
+    @staticmethod
+    def _read_html(data: bytes) -> str:
+        try:
+            parser = _SimpleHTMLTextExtractor()
+            parser.feed(data.decode("utf-8", errors="replace"))
+            parser.close()
+            return parser.text()
+        except Exception as exc:  # noqa: BLE001
+            raise DocumentParseError(f"Failed to parse HTML: {exc}") from exc
+
+    @staticmethod
+    def _read_xlsx(data: bytes) -> str:
+        try:
+            from openpyxl import load_workbook  # type: ignore
+        except ImportError as exc:
+            raise DocumentParseError(
+                "openpyxl package is required to parse .xlsx files."
+            ) from exc
+
+        try:
+            workbook = load_workbook(filename=io.BytesIO(data), data_only=True, read_only=True)
+            lines: list[str] = []
+            for sheet in workbook.worksheets:
+                lines.append(f"[sheet] {sheet.title}")
+                for row in sheet.iter_rows(values_only=True):
+                    values = [str(cell).strip() for cell in row if cell is not None and str(cell).strip()]
+                    if values:
+                        lines.append(" | ".join(values))
+            return "\n".join(lines).strip()
+        except Exception as exc:  # noqa: BLE001
+            raise DocumentParseError(f"Failed to parse XLSX: {exc}") from exc
+
+    @staticmethod
+    def _read_pptx(data: bytes) -> str:
+        try:
+            from pptx import Presentation  # type: ignore
+        except ImportError as exc:
+            raise DocumentParseError(
+                "python-pptx package is required to parse .pptx files."
+            ) from exc
+
+        try:
+            presentation = Presentation(io.BytesIO(data))
+            lines: list[str] = []
+            for slide_idx, slide in enumerate(presentation.slides, start=1):
+                lines.append(f"[slide] {slide_idx}")
+                for shape in slide.shapes:
+                    text = getattr(shape, "text", None)
+                    if isinstance(text, str) and text.strip():
+                        lines.append(text.strip())
+            return "\n".join(lines).strip()
+        except Exception as exc:  # noqa: BLE001
+            raise DocumentParseError(f"Failed to parse PPTX: {exc}") from exc
 
     @staticmethod
     def _read_doc_binary(data: bytes) -> str:
