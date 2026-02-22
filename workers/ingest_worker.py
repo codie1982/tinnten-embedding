@@ -9,6 +9,8 @@ import signal
 import sys
 import threading
 import time
+import gzip
+import io
 from urllib.parse import unquote, urlparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -37,6 +39,8 @@ from services.chunker import chunk_text
 from services.mongo_store import MongoStore
 from services.content_store import ContentDocumentStore, normalize_index_options
 from services.upload_store import UploadStore, UploadNotFoundError
+from services.fetcher_store import FetcherStore
+from init.aws import get_s3_client
 
 
 DEFAULT_PRIMARY_QUEUE_NAME = "content_indexing_queue"
@@ -48,6 +52,10 @@ DEFAULT_CONTENT_DOC_LOOKUP_RETRIES = 3
 DEFAULT_CONTENT_DOC_LOOKUP_DELAY_SECONDS = 2.0
 DEFAULT_UPLOAD_DOWNLOAD_RETRIES = 5
 DEFAULT_UPLOAD_DOWNLOAD_RETRY_DELAY_SECONDS = 10.0
+DEFAULT_FETCHER_PAGE_LIMIT = 50
+DEFAULT_FETCHER_MAX_TEXT_CHARS = 1_500_000
+DEFAULT_FETCHER_MEDIA_PER_PAGE = 20
+DEFAULT_FETCHER_MEDIA_TEXT_CHARS = 2_000
 
 
 def log(msg: str, *args: object) -> None:
@@ -114,6 +122,8 @@ class IngestWorker:
         self._content_store_lock = threading.RLock()
         self.upload_store: UploadStore | None = None
         self._upload_store_lock = threading.RLock()
+        self.fetcher_store: FetcherStore | None = None
+        self._fetcher_store_lock = threading.RLock()
         self.loader: DocumentLoader | None = None
         self._loader_lock = threading.RLock()
         self.engine: EmbeddingEngine | None = None
@@ -149,6 +159,15 @@ class IngestWorker:
                 log("Initialising UploadStore...")
                 self.upload_store = UploadStore()
             return self.upload_store
+
+    def _get_fetcher_store(self) -> FetcherStore:
+        if self.fetcher_store is not None:
+            return self.fetcher_store
+        with self._fetcher_store_lock:
+            if self.fetcher_store is None:
+                log("Initialising FetcherStore...")
+                self.fetcher_store = FetcherStore()
+            return self.fetcher_store
 
     def _get_loader(self) -> DocumentLoader:
         if self.loader is not None:
@@ -639,6 +658,9 @@ class IngestWorker:
                 raise ValueError("upload source missing upload_id")
             return self._load_upload_text(upload_id, metadata, context)
 
+        if source_type in {"fetcher_crawl", "crawler", "fetcher"}:
+            return self._load_fetcher_crawl_text(resolved_source, metadata, context)
+
         if source_type in {"import_url", "url", "web"}:
             url = resolved_source.get("url")
             if not url:
@@ -738,6 +760,396 @@ class IngestWorker:
             file_open_error=None,
         )
         return document.text, combined_metadata
+
+    def _load_fetcher_crawl_text(
+        self,
+        resolved_source: Dict[str, Any],
+        metadata: Dict[str, Any],
+        context: DocumentJobContext,
+    ) -> Tuple[str, Dict[str, Any]]:
+        domain = str(
+            resolved_source.get("domain")
+            or resolved_source.get("domain_id")
+            or metadata.get("domain")
+            or ""
+        ).strip().lower()
+        if not domain:
+            raise ValueError("fetcher_crawl source missing domain")
+
+        fetcher_store = self._get_fetcher_store()
+        domain_doc = fetcher_store.get_domain(domain)
+        if not domain_doc:
+            raise RuntimeError(f"fetcher domain not found: {domain}")
+
+        domain_company = (
+            domain_doc.get("companyId")
+            or domain_doc.get("companyid")
+            or (domain_doc.get("config") or {}).get("companyId")
+            or (domain_doc.get("config") or {}).get("companyid")
+        )
+        if not domain_company:
+            raise RuntimeError(f"fetcher domain has no companyId: {domain}")
+        if str(domain_company) != str(context.company_id):
+            raise RuntimeError(
+                f"fetcher domain company mismatch: domain={domain} expected={context.company_id} got={domain_company}"
+            )
+
+        site_profile = domain_doc.get("site_profile") if isinstance(domain_doc.get("site_profile"), dict) else {}
+        source_hint = str(site_profile.get("source") or "").strip().lower()
+        blocked_sources = {
+            "system",
+            "discovered",
+            "crawler_discovered",
+            "sitemap_discovered",
+            "auto_discovered",
+        }
+        if source_hint in blocked_sources:
+            raise RuntimeError(f"fetcher domain source is not user-provided: {source_hint}")
+
+        try:
+            page_limit = int(
+                resolved_source.get("pageLimit")
+                or resolved_source.get("limit")
+                or resolved_source.get("maxPages")
+                or DEFAULT_FETCHER_PAGE_LIMIT
+            )
+        except Exception:
+            page_limit = DEFAULT_FETCHER_PAGE_LIMIT
+        page_limit = max(1, min(page_limit, 500))
+
+        fetched_from = self._parse_optional_datetime(
+            resolved_source.get("fetchedFrom")
+            or resolved_source.get("from")
+            or resolved_source.get("startDate")
+        )
+        fetched_to = self._parse_optional_datetime(
+            resolved_source.get("fetchedTo")
+            or resolved_source.get("to")
+            or resolved_source.get("endDate")
+        )
+        requested_storage = self._normalize_storage_preferences(
+            resolved_source.get("storagePreference")
+            or resolved_source.get("preferStorage")
+            or resolved_source.get("storage")
+        )
+        requested_page_urls = self._normalize_fetcher_page_urls(
+            resolved_source.get("pageUrls")
+            or resolved_source.get("page_urls")
+            or resolved_source.get("urls")
+            or resolved_source.get("pages")
+            or resolved_source.get("crawlPages")
+        )
+        if requested_page_urls:
+            page_limit = max(page_limit, len(requested_page_urls))
+
+        results = fetcher_store.list_crawl_results(
+            domain=domain,
+            limit=page_limit,
+            fetched_from=fetched_from,
+            fetched_to=fetched_to,
+            urls=requested_page_urls,
+        )
+        if not results:
+            if requested_page_urls:
+                raise RuntimeError(
+                    f"no crawl_results found for domain={domain} and requested URLs"
+                )
+            raise RuntimeError(f"no crawl_results found for domain={domain}")
+
+        logs_by_url = fetcher_store.latest_logs_by_urls([str(row.get("url") or "").strip() for row in results])
+        media_by_url = fetcher_store.list_crawl_media_by_parent_urls(
+            [str(row.get("url") or "").strip() for row in results],
+            limit_per_url=int(os.getenv("FETCHER_MEDIA_LIMIT_PER_URL") or DEFAULT_FETCHER_MEDIA_PER_PAGE),
+        )
+        s3_bucket = (
+            os.getenv("FETCHER_S3_BUCKET_RAW")
+            or os.getenv("S3_BUCKET_RAW")
+            or os.getenv("AWS_S3_BUCKET")
+            or ""
+        ).strip()
+        max_chars = int(os.getenv("FETCHER_CRAWL_MAX_TEXT_CHARS") or DEFAULT_FETCHER_MAX_TEXT_CHARS)
+
+        selected_blocks: List[str] = []
+        selected_urls: List[str] = []
+        total_chars = 0
+        for row in results:
+            page_url = str(row.get("url") or "").strip()
+            if not page_url:
+                continue
+            row_storage = requested_storage or self._normalize_storage_preferences(
+                ((row.get("content_preferences") or {}).get("storage") if isinstance(row.get("content_preferences"), dict) else None)
+            )
+            if not row_storage:
+                row_storage = ["db", "s3", "disk"]
+            media_entries = media_by_url.get(page_url) or []
+
+            text_value = self._resolve_fetcher_page_text(
+                row=row,
+                log_entry=logs_by_url.get(page_url),
+                media_entries=media_entries,
+                storage_preferences=row_storage,
+                s3_bucket=s3_bucket,
+            )
+            if not text_value:
+                continue
+
+            title = str(row.get("title") or "").strip()
+            header = f"[url] {page_url}"
+            if title:
+                header = f"{header}\n[title] {title}"
+            block = f"{header}\n{text_value.strip()}"
+            if not block.strip():
+                continue
+
+            if total_chars + len(block) > max_chars:
+                if total_chars == 0:
+                    block = block[:max_chars]
+                else:
+                    break
+            selected_blocks.append(block)
+            selected_urls.append(page_url)
+            total_chars += len(block)
+            if total_chars >= max_chars:
+                break
+
+        if not selected_blocks:
+            raise RuntimeError(
+                f"crawl content unavailable for domain={domain} (storage={requested_storage or ['db','s3','disk']})"
+            )
+
+        combined_metadata = dict(metadata)
+        combined_metadata.setdefault("source", "fetcher_crawl")
+        combined_metadata.setdefault("fetcherDomain", domain)
+        combined_metadata.setdefault("fetcherPageCount", len(selected_blocks))
+        combined_metadata.setdefault("fetcherTextChars", total_chars)
+        if requested_page_urls:
+            combined_metadata.setdefault("requestedPageCount", len(requested_page_urls))
+        if selected_urls:
+            combined_metadata.setdefault("firstUrl", selected_urls[0])
+
+        return "\n\n---\n\n".join(selected_blocks), combined_metadata
+
+    def _resolve_fetcher_page_text(
+        self,
+        *,
+        row: Dict[str, Any],
+        log_entry: Optional[Dict[str, Any]],
+        media_entries: Optional[List[Dict[str, Any]]],
+        storage_preferences: List[str],
+        s3_bucket: str,
+    ) -> str:
+        markdown = str(row.get("markdown") or "").strip()
+        html = str(row.get("html") or "").strip()
+        media_text = self._serialize_fetcher_media(media_entries)
+
+        for target in storage_preferences:
+            if target == "db":
+                if markdown:
+                    return self._join_fetcher_text_with_media(markdown, media_text)
+                if html:
+                    return self._join_fetcher_text_with_media(html, media_text)
+            elif target == "s3":
+                text_value = self._load_fetcher_content_from_s3(log_entry, s3_bucket)
+                if text_value:
+                    return self._join_fetcher_text_with_media(text_value, media_text)
+            elif target == "disk":
+                text_value = self._load_fetcher_content_from_disk(log_entry)
+                if text_value:
+                    return self._join_fetcher_text_with_media(text_value, media_text)
+
+        # Final fallback when preferences are missing/invalid.
+        base_text = markdown or html
+        return self._join_fetcher_text_with_media(base_text, media_text)
+
+    def _load_fetcher_content_from_s3(self, log_entry: Optional[Dict[str, Any]], s3_bucket: str) -> str:
+        if not log_entry or not s3_bucket:
+            return ""
+        s3_client = get_s3_client()
+
+        json_key = str(log_entry.get("s3_key_json") or "").strip()
+        if json_key:
+            payload = self._read_s3_text(s3_client, s3_bucket, json_key)
+            if payload:
+                try:
+                    data = json.loads(payload)
+                    if isinstance(data, dict):
+                        markdown = str(data.get("markdown") or "").strip()
+                        html = str(data.get("html") or "").strip()
+                        if markdown:
+                            return markdown
+                        if html:
+                            return html
+                except Exception:
+                    pass
+
+        html_key = str(log_entry.get("s3_key") or "").strip()
+        if html_key:
+            return self._read_s3_text(s3_client, s3_bucket, html_key)
+        return ""
+
+    def _read_s3_text(self, s3_client, bucket: str, key: str) -> str:
+        try:
+            response = s3_client.get_object(Bucket=bucket, Key=key)
+            raw_bytes = response["Body"].read()
+            encoding = str(response.get("ContentEncoding") or "").strip().lower()
+            should_unzip = encoding == "gzip" or str(key).endswith(".gz")
+            if should_unzip:
+                try:
+                    with gzip.GzipFile(fileobj=io.BytesIO(raw_bytes), mode="rb") as gz:
+                        raw_bytes = gz.read()
+                except Exception:
+                    return ""
+            return raw_bytes.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _load_fetcher_content_from_disk(log_entry: Optional[Dict[str, Any]]) -> str:
+        if not log_entry:
+            return ""
+        disk_paths = log_entry.get("disk_paths")
+        if not isinstance(disk_paths, list):
+            return ""
+        for path in disk_paths:
+            path_str = str(path or "").strip()
+            if not path_str:
+                continue
+            if not os.path.exists(path_str):
+                continue
+            try:
+                with open(path_str, "r", encoding="utf-8", errors="replace") as file:
+                    text = file.read().strip()
+                if text:
+                    return text
+            except Exception:
+                continue
+        return ""
+
+    @staticmethod
+    def _join_fetcher_text_with_media(base_text: str, media_text: str) -> str:
+        base = str(base_text or "").strip()
+        media = str(media_text or "").strip()
+        if base and media:
+            return f"{base}\n\n[media]\n{media}"
+        return base or media
+
+    @staticmethod
+    def _serialize_fetcher_media(entries: Optional[List[Dict[str, Any]]]) -> str:
+        if not entries:
+            return ""
+        max_chars = int(os.getenv("FETCHER_MEDIA_MAX_TEXT_CHARS") or DEFAULT_FETCHER_MEDIA_TEXT_CHARS)
+        chunks: List[str] = []
+        total_chars = 0
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            media_type = str(entry.get("type") or "").strip()
+            src = str(entry.get("src") or "").strip()
+            alt = str(entry.get("alt") or "").strip()
+            metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+            title = str(metadata.get("title") or metadata.get("name") or "").strip()
+            caption = str(metadata.get("caption") or "").strip()
+            line_parts = []
+            if media_type:
+                line_parts.append(f"type={media_type}")
+            if src:
+                line_parts.append(f"src={src}")
+            if alt:
+                line_parts.append(f"alt={alt}")
+            if title:
+                line_parts.append(f"title={title}")
+            if caption:
+                line_parts.append(f"caption={caption}")
+            if not line_parts:
+                continue
+            line = " | ".join(line_parts)
+            if total_chars + len(line) + 1 > max_chars:
+                break
+            chunks.append(line)
+            total_chars += len(line) + 1
+        return "\n".join(chunks)
+
+    @staticmethod
+    def _parse_optional_datetime(raw_value: Any) -> Optional[datetime]:
+        if raw_value is None:
+            return None
+        if isinstance(raw_value, datetime):
+            return raw_value
+        value = str(raw_value).strip()
+        if not value:
+            return None
+        try:
+            # Accept both `...Z` and timezone-aware ISO8601.
+            value = value.replace("Z", "+00:00")
+            return datetime.fromisoformat(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_storage_preferences(raw_value: Any) -> List[str]:
+        allowed = {"db", "s3", "disk"}
+        values: List[str] = []
+        if raw_value is None:
+            return values
+        if isinstance(raw_value, str):
+            chunks = [v.strip().lower() for v in raw_value.split(",")]
+        elif isinstance(raw_value, list):
+            chunks = [str(v).strip().lower() for v in raw_value]
+        else:
+            return values
+        for item in chunks:
+            if item and item in allowed and item not in values:
+                values.append(item)
+        return values
+
+    @staticmethod
+    def _normalize_fetcher_page_urls(raw_value: Any) -> List[str]:
+        if raw_value is None:
+            return []
+        values: List[Any]
+        if isinstance(raw_value, str):
+            candidate = raw_value.strip()
+            if not candidate:
+                return []
+            if candidate.startswith("["):
+                try:
+                    parsed = json.loads(candidate)
+                    values = parsed if isinstance(parsed, list) else [candidate]
+                except Exception:
+                    values = [candidate]
+            else:
+                values = [part.strip() for part in candidate.split(",") if part.strip()]
+        elif isinstance(raw_value, dict):
+            values = [raw_value]
+        elif isinstance(raw_value, list):
+            values = raw_value
+        else:
+            return []
+
+        normalized: List[str] = []
+        seen = set()
+        for item in values:
+            if isinstance(item, dict):
+                value = (
+                    item.get("url")
+                    or item.get("href")
+                    or item.get("link")
+                    or item.get("pageUrl")
+                    or item.get("page_url")
+                )
+            else:
+                value = item
+            text = str(value or "").strip()
+            if not text:
+                continue
+            if "#" in text:
+                text = text.split("#", 1)[0].strip()
+            if text in seen:
+                continue
+            seen.add(text)
+            normalized.append(text)
+        return normalized
 
     # ------------------------------------------------------------------
     def _chunk_and_embed(
@@ -1056,6 +1468,58 @@ class IngestWorker:
             resolved["url"] = url
         if text:
             resolved["text"] = text
+
+        fetcher_domain = (
+            source_info.get("domain")
+            or source_info.get("domain_id")
+            or payload_section.get("domain")
+            or payload_section.get("domain_id")
+            or document.get("domain")
+            or document.get("domain_id")
+            or metadata.get("domain")
+        )
+        if fetcher_domain:
+            resolved["domain"] = str(fetcher_domain).strip().lower()
+
+        for key in (
+            "pageLimit",
+            "limit",
+            "maxPages",
+            "fetchedFrom",
+            "fetchedTo",
+            "startDate",
+            "endDate",
+            "pageUrls",
+            "page_urls",
+            "urls",
+            "pages",
+            "crawlPages",
+        ):
+            value = (
+                source_info.get(key)
+                if key in source_info
+                else payload_section.get(key)
+                if key in payload_section
+                else document.get(key)
+                if key in document
+                else metadata.get(key)
+            )
+            if value is not None:
+                resolved[key] = value
+
+        storage_pref = (
+            source_info.get("storagePreference")
+            or source_info.get("preferStorage")
+            or source_info.get("storage")
+            or payload_section.get("storagePreference")
+            or payload_section.get("preferStorage")
+            or payload_section.get("storage")
+            or metadata.get("storagePreference")
+            or metadata.get("preferStorage")
+            or metadata.get("storage")
+        )
+        if storage_pref is not None:
+            resolved["storagePreference"] = storage_pref
         return resolved
 
     @staticmethod

@@ -5,6 +5,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from functools import lru_cache
+from urllib.parse import urlparse
 
 import numpy as np
 from bson import ObjectId
@@ -148,12 +149,18 @@ chunk_store = MongoStore()
 @lru_cache(maxsize=4)
 def _get_websearch_engine(model_name: str, index_path: str) -> EmbeddingEngine:
     return EmbeddingEngine(model_name=model_name, index_path=index_path)
+
+
 def _should_require_auth() -> bool:
     if not REQUIRE_KEYCLOAK_AUTH:
         return False
     if request.method == "OPTIONS":
         return False
-    if ALLOW_UNAUTH_CONTENT_INDEX and request.path == "/api/v10/content/index":
+    if ALLOW_UNAUTH_CONTENT_INDEX and request.path in {
+        "/api/v10/content/index",
+        "/api/v10/content/index/fetcher",
+        "/api/v10/content/index/fetcher/pages",
+    }:
         return False
     return True
 
@@ -187,6 +194,83 @@ def _get_payload_value(data: dict, *keys: str):
         if stripped in lowered:
             return lowered[stripped]
     return None
+
+
+def _normalize_domain_value(raw_value) -> str:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return ""
+    candidate = raw
+    parsed = urlparse(candidate if "://" in candidate else f"https://{candidate}")
+    host = (parsed.netloc or parsed.path or "").strip().lower()
+    if not host:
+        return ""
+    if "@" in host:
+        host = host.rsplit("@", 1)[-1]
+    if ":" in host:
+        host = host.split(":", 1)[0]
+    return host.strip(".")
+
+
+def _normalize_page_url_value(raw_value) -> str:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return ""
+    if "#" in raw:
+        raw = raw.split("#", 1)[0].strip()
+    parsed = urlparse(raw)
+    if parsed.scheme and parsed.netloc:
+        scheme = parsed.scheme.lower()
+        netloc = parsed.netloc.lower()
+        path = parsed.path or "/"
+        out = f"{scheme}://{netloc}{path}"
+        if parsed.query:
+            out = f"{out}?{parsed.query}"
+        return out
+    return raw
+
+
+def _extract_page_urls(raw_value) -> list[str]:
+    values = raw_value
+    if values is None:
+        return []
+    if isinstance(values, str):
+        maybe_json = values.strip()
+        if not maybe_json:
+            return []
+        if maybe_json.startswith("["):
+            try:
+                values = json.loads(maybe_json)
+            except Exception:
+                values = [maybe_json]
+        else:
+            values = [part.strip() for part in maybe_json.split(",") if part.strip()]
+    elif isinstance(values, dict):
+        values = [values]
+    elif not isinstance(values, list):
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if isinstance(item, dict):
+            raw_url = (
+                item.get("url")
+                or item.get("href")
+                or item.get("link")
+                or item.get("pageUrl")
+                or item.get("page_url")
+            )
+        else:
+            raw_url = item
+        normalized_url = _normalize_page_url_value(raw_url)
+        if not normalized_url:
+            continue
+        if normalized_url in seen:
+            continue
+        seen.add(normalized_url)
+        normalized.append(normalized_url)
+    return normalized
 
 
 def _parse_int(value, default: int, minimum: int | None = None) -> int:
@@ -1795,164 +1879,15 @@ def remove_document():
     )
 
 
-@app.route("/api/v10/content/index", methods=["POST"])
-def queue_content_index():
-    """
-    Queue a content document for indexing.
-
-    JSON body:
-        companyId (str, required)
-        documentId (str, optional - generates UUID if omitted)
-        uploadId (str, optional)
-        text (str, optional)
-        url (str, optional)
-        indexOptions / options (dict, optional)
-        metadata (dict, optional)
-        trigger (str, optional)
-        userId (str, optional)
-    """
-    try:
-        payload = request.get_json(force=True) or {}
-    except Exception:
-        return jsonify({"error": "invalid JSON payload"}), 400
-
-    company_id = _get_payload_value(payload, "companyId", "company_id", "companyid")
-    if not company_id:
-        return jsonify({"error": "companyId is required"}), 400
-    company_id = str(company_id)
-
-    document_id = _get_payload_value(payload, "documentId", "document_id", "documentid")
-    if document_id:
-        document_id = str(document_id)
-    else:
-        document_id = str(uuid.uuid4())
-
-    user_id = _get_payload_value(payload, "userId", "user_id", "userid")
-    if user_id is not None:
-        user_id = str(user_id)
-
-    trigger = _get_payload_value(payload, "trigger") or "api"
-    job_id = _get_payload_value(payload, "jobId", "job_id")
-    if job_id:
-        job_id = str(job_id)
-    else:
-        job_id = str(uuid.uuid4())
-    app.logger.info(
-        "Content index request received (companyId=%s documentId=%s jobId=%s)",
-        company_id,
-        document_id,
-        job_id,
-    )
-
-    raw_options = payload.get("indexOptions") or payload.get("options") or {}
-    try:
-        options = normalize_index_options(
-            raw_options,
-            default_chunk_size=DEFAULT_INDEX_CHUNK_SIZE,
-            default_chunk_overlap=DEFAULT_INDEX_CHUNK_OVERLAP,
-            default_min_chars=DEFAULT_INDEX_MIN_CHARS,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": f"invalid index options: {exc}"}), 400
-
-    metadata_payload = payload.get("metadata") or {}
-    if metadata_payload and not isinstance(metadata_payload, dict):
-        return jsonify({"error": "metadata must be an object"}), 400
-
-    existing_doc = content_store.get_document(company_id, document_id)
-    metadata = {}
-    if isinstance(existing_doc, dict) and isinstance(existing_doc.get("metadata"), dict):
-        metadata.update(existing_doc["metadata"])
-    metadata.update(metadata_payload)
-    metadata.setdefault("companyId", company_id)
-    metadata.setdefault("documentId", document_id)
-
-    upload_id = _get_payload_value(payload, "uploadId", "upload_id", "uploadid")
-    if not upload_id and isinstance(existing_doc, dict):
-        upload_id = _get_payload_value(existing_doc, "uploadId", "upload_id", "uploadid")
-    if upload_id:
-        upload_id = str(upload_id)
-        metadata.setdefault("uploadId", upload_id)
-
-    text = payload.get("text")
-    if text is not None and not isinstance(text, str):
-        return jsonify({"error": "text must be a string"}), 400
-    url = payload.get("url")
-    if url is not None and not isinstance(url, str):
-        return jsonify({"error": "url must be a string"}), 400
-    if not url and isinstance(existing_doc, dict):
-        existing_url = existing_doc.get("url")
-        if isinstance(existing_url, str) and existing_url.strip():
-            url = existing_url
-
-    source = None
-    if upload_id:
-        source = {"type": "upload", "uploadId": upload_id}
-    elif text:
-        cleaned_text = text.strip()
-        if not cleaned_text:
-            return jsonify({"error": "text cannot be empty"}), 400
-        source = {"type": "text", "text": text}
-        metadata.setdefault("textSize", len(text))
-    elif url:
-        trimmed_url = url.strip()
-        if not trimmed_url:
-            return jsonify({"error": "url cannot be empty"}), 400
-        source = {"type": "import_url", "url": trimmed_url}
-        metadata.setdefault("url", trimmed_url)
-    elif isinstance(existing_doc, dict) and isinstance(existing_doc.get("source"), dict):
-        source = dict(existing_doc["source"])
-    else:
-        return jsonify({"error": "uploadId, text, or url is required for new documents"}), 400
-
-    source_type = source.get("type") or source.get("source")
-    if source_type:
-        source["type"] = str(source_type).lower()
-        source["source"] = source["type"]
-
-    doc_type = options.get("scope")
-    if not doc_type and isinstance(existing_doc, dict):
-        doc_type = existing_doc.get("docType") or existing_doc.get("type")
-    if doc_type:
-        source.setdefault("docType", doc_type)
-        metadata.setdefault("scope", doc_type)
-
-    title = payload.get("title") or metadata.get("title")
-    if not title and isinstance(existing_doc, dict):
-        title = existing_doc.get("title") or existing_doc.get("name")
-
-    try:
-        doc = content_store.upsert_document_with_source(
-            company_id=company_id,
-            document_id=document_id,
-            source=source,
-            metadata=metadata,
-            options=options,
-            job_id=job_id,
-            user_id=user_id,
-            trigger=trigger,
-            title=title,
-            doc_type=doc_type,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": f"failed to prepare document: {exc}"}), 500
-
-    try:
-        content_store.append_log_entry(
-            company_id=company_id,
-            document_id=document_id,
-            job_id=job_id,
-            level="info",
-            message="Index job queued via API.",
-            state="queued",
-            user_id=user_id,
-            trigger=trigger,
-            details={"source": source.get("type"), "options": options},
-        )
-    except Exception:
-        # Logging failure should not block the request; it will be visible in stdout.
-        pass
-
+def _publish_content_index_message(
+    *,
+    company_id: str,
+    document_id: str,
+    options: dict,
+    trigger: str,
+    job_id: str,
+    user_id: str | None,
+) -> str | None:
     message = {
         "companyId": company_id,
         "documentIds": [document_id],
@@ -1962,6 +1897,7 @@ def queue_content_index():
     }
     if user_id:
         message["userId"] = user_id
+
     app.logger.info(
         "Publishing content index job (queue=%s companyId=%s documentId=%s jobId=%s)",
         getattr(job_publisher, "queue_name", None),
@@ -1997,13 +1933,246 @@ def queue_content_index():
                 )
                 time.sleep(publish_delay)
 
-    if last_exc is not None:
-        error_msg = f"failed to enqueue indexing job: {last_exc}"
+    if last_exc is None:
+        return None
+    return f"failed to enqueue indexing job: {last_exc}"
+
+
+def _queue_content_index_payload(payload: dict, *, default_trigger: str) -> tuple:
+    company_id = _get_payload_value(payload, "companyId", "company_id", "companyid")
+    if not company_id:
+        return jsonify({"error": "companyId is required"}), 400
+    company_id = str(company_id)
+
+    document_id = _get_payload_value(payload, "documentId", "document_id", "documentid")
+    if document_id:
+        document_id = str(document_id)
+    else:
+        document_id = str(uuid.uuid4())
+
+    user_id = _get_payload_value(payload, "userId", "user_id", "userid")
+    if user_id is not None:
+        user_id = str(user_id)
+
+    trigger = _get_payload_value(payload, "trigger") or default_trigger
+    job_id = _get_payload_value(payload, "jobId", "job_id")
+    if job_id:
+        job_id = str(job_id)
+    else:
+        job_id = str(uuid.uuid4())
+
+    raw_options = payload.get("indexOptions") or payload.get("options") or {}
+    try:
+        options = normalize_index_options(
+            raw_options,
+            default_chunk_size=DEFAULT_INDEX_CHUNK_SIZE,
+            default_chunk_overlap=DEFAULT_INDEX_CHUNK_OVERLAP,
+            default_min_chars=DEFAULT_INDEX_MIN_CHARS,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"invalid index options: {exc}"}), 400
+
+    metadata_payload = payload.get("metadata") or {}
+    if metadata_payload and not isinstance(metadata_payload, dict):
+        return jsonify({"error": "metadata must be an object"}), 400
+
+    existing_doc = content_store.get_document(company_id, document_id)
+    metadata = {}
+    if isinstance(existing_doc, dict) and isinstance(existing_doc.get("metadata"), dict):
+        metadata.update(existing_doc["metadata"])
+    metadata.update(metadata_payload)
+    metadata.setdefault("companyId", company_id)
+    metadata.setdefault("documentId", document_id)
+
+    upload_id = _get_payload_value(payload, "uploadId", "upload_id", "uploadid")
+    if not upload_id and isinstance(existing_doc, dict):
+        upload_id = _get_payload_value(existing_doc, "uploadId", "upload_id", "uploadid")
+    if upload_id:
+        upload_id = str(upload_id)
+        metadata.setdefault("uploadId", upload_id)
+
+    text = payload.get("text")
+    if text is not None and not isinstance(text, str):
+        return jsonify({"error": "text must be a string"}), 400
+
+    url = payload.get("url")
+    if url is not None and not isinstance(url, str):
+        return jsonify({"error": "url must be a string"}), 400
+    if not url and isinstance(existing_doc, dict):
+        existing_url = existing_doc.get("url")
+        if isinstance(existing_url, str) and existing_url.strip():
+            url = existing_url
+
+    source_payload = payload.get("source")
+    if source_payload is not None and not isinstance(source_payload, dict):
+        return jsonify({"error": "source must be an object"}), 400
+
+    source = None
+    if isinstance(source_payload, dict) and source_payload:
+        source = dict(source_payload)
+    elif upload_id:
+        source = {"type": "upload", "uploadId": upload_id}
+    elif text:
+        cleaned_text = text.strip()
+        if not cleaned_text:
+            return jsonify({"error": "text cannot be empty"}), 400
+        source = {"type": "text", "text": text}
+        metadata.setdefault("textSize", len(text))
+    elif url:
+        trimmed_url = url.strip()
+        if not trimmed_url:
+            return jsonify({"error": "url cannot be empty"}), 400
+        source = {"type": "import_url", "url": trimmed_url}
+        metadata.setdefault("url", trimmed_url)
+    elif isinstance(existing_doc, dict) and isinstance(existing_doc.get("source"), dict):
+        source = dict(existing_doc["source"])
+    else:
+        return jsonify({"error": "uploadId, text, url, or source is required for new documents"}), 400
+
+    source_type = source.get("type") or source.get("source")
+    source_type = str(source_type or "text").lower()
+    if source_type in {"fetcher", "crawler"}:
+        source_type = "fetcher_crawl"
+    source["type"] = source_type
+    source["source"] = source_type
+
+    if source_type in {"import_url", "url", "web"}:
+        source["type"] = "import_url"
+        source["source"] = "import_url"
+        source_url = source.get("url") or url
+        source_url = str(source_url or "").strip()
+        if not source_url:
+            return jsonify({"error": "url source requires url"}), 400
+        source["url"] = source_url
+        metadata.setdefault("url", source_url)
+
+    if source_type == "upload":
+        source_upload_id = (
+            source.get("uploadId")
+            or source.get("upload_id")
+            or source.get("uploadid")
+            or upload_id
+        )
+        source_upload_id = str(source_upload_id or "").strip()
+        if not source_upload_id:
+            return jsonify({"error": "upload source requires uploadId"}), 400
+        source["uploadId"] = source_upload_id
+        metadata.setdefault("uploadId", source_upload_id)
+
+    if source_type == "text":
+        source_text = source.get("text")
+        if source_text is None:
+            source_text = text
+        if not isinstance(source_text, str) or not source_text.strip():
+            return jsonify({"error": "text source requires non-empty text"}), 400
+        source["text"] = source_text
+        metadata.setdefault("textSize", len(source_text))
+
+    if source_type == "fetcher_crawl":
+        raw_domain = (
+            source.get("domain")
+            or source.get("domainId")
+            or source.get("domain_id")
+            or _get_payload_value(payload, "domain", "domainId", "domain_id")
+            or metadata.get("domain")
+            or metadata.get("fetcherDomain")
+        )
+        domain = _normalize_domain_value(raw_domain)
+        if not domain:
+            return jsonify({"error": "fetcher_crawl source requires domain"}), 400
+        source["domain"] = domain
+        metadata.setdefault("domain", domain)
+        metadata.setdefault("fetcherDomain", domain)
+
+        fetcher_key_aliases = {
+            "pageLimit": ("pageLimit", "limit", "maxPages"),
+            "fetchedFrom": ("fetchedFrom", "startDate"),
+            "fetchedTo": ("fetchedTo", "endDate"),
+            "storagePreference": ("storagePreference", "preferStorage", "storage"),
+        }
+        for canonical_key, aliases in fetcher_key_aliases.items():
+            value = _get_payload_value(source, *aliases)
+            if value is None:
+                value = _get_payload_value(payload, *aliases)
+            if value is None:
+                continue
+            if canonical_key == "pageLimit":
+                value = _parse_int(value, 50, minimum=1)
+            source[canonical_key] = value
+
+        raw_page_urls = (
+            _get_payload_value(source, "pageUrls", "page_urls", "urls", "pages", "crawlPages")
+            or _get_payload_value(payload, "pageUrls", "page_urls", "urls", "pages", "crawlPages")
+        )
+        page_urls = _extract_page_urls(raw_page_urls)
+        if page_urls:
+            source["pageUrls"] = page_urls
+            metadata.setdefault("requestedPageCount", len(page_urls))
+
+    doc_type = options.get("scope")
+    if not doc_type and isinstance(existing_doc, dict):
+        doc_type = existing_doc.get("docType") or existing_doc.get("type")
+    if doc_type:
+        source.setdefault("docType", doc_type)
+        metadata.setdefault("scope", doc_type)
+
+    title = payload.get("title") or metadata.get("title")
+    if not title and isinstance(existing_doc, dict):
+        title = existing_doc.get("title") or existing_doc.get("name")
+
+    app.logger.info(
+        "Content index request received (companyId=%s documentId=%s jobId=%s source=%s)",
+        company_id,
+        document_id,
+        job_id,
+        source_type,
+    )
+
+    try:
+        doc = content_store.upsert_document_with_source(
+            company_id=company_id,
+            document_id=document_id,
+            source=source,
+            metadata=metadata,
+            options=options,
+            job_id=job_id,
+            user_id=user_id,
+            trigger=trigger,
+            title=title,
+            doc_type=doc_type,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"failed to prepare document: {exc}"}), 500
+
+    try:
+        content_store.append_log_entry(
+            company_id=company_id,
+            document_id=document_id,
+            job_id=job_id,
+            level="info",
+            message="Index job queued via API.",
+            state="queued",
+            user_id=user_id,
+            trigger=trigger,
+            details={"source": source.get("type"), "options": options},
+        )
+    except Exception:
+        pass
+
+    publish_error = _publish_content_index_message(
+        company_id=company_id,
+        document_id=document_id,
+        options=options,
+        trigger=trigger,
+        job_id=job_id,
+        user_id=user_id,
+    )
+    if publish_error is not None:
         content_store.update_index_fields(
             company_id=company_id,
             document_id=document_id,
             state="failed",
-            error=error_msg,
+            error=publish_error,
             job_id=job_id,
             trigger=trigger,
             options=options,
@@ -2014,12 +2183,12 @@ def queue_content_index():
             document_id=document_id,
             job_id=job_id,
             level="error",
-            message=error_msg,
+            message=publish_error,
             state="failed",
             user_id=user_id,
             trigger=trigger,
         )
-        return jsonify({"error": error_msg}), 503
+        return jsonify({"error": publish_error}), 503
 
     index_state = doc.get("index", {}) if isinstance(doc, dict) else {}
     response = {
@@ -2027,9 +2196,143 @@ def queue_content_index():
         "documentId": document_id,
         "jobId": job_id,
         "state": index_state.get("state", "queued"),
+        "source": source_type,
         "options": options,
     }
     return jsonify(response), 202
+
+
+@app.route("/api/v10/content/index", methods=["POST"])
+def queue_content_index():
+    """
+    Queue a content document for indexing.
+
+    JSON body:
+        companyId (str, required)
+        documentId (str, optional - generates UUID if omitted)
+        uploadId (str, optional)
+        text (str, optional)
+        url (str, optional)
+        source (dict, optional): supports fetcher_crawl with domain/pageLimit/fetchedFrom/fetchedTo/storagePreference
+        indexOptions / options (dict, optional)
+        metadata (dict, optional)
+        trigger (str, optional)
+        userId (str, optional)
+    """
+    try:
+        payload = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"error": "invalid JSON payload"}), 400
+    return _queue_content_index_payload(payload, default_trigger="api")
+
+
+@app.route("/api/v10/content/index/fetcher", methods=["POST"])
+def queue_content_index_fetcher():
+    """
+    Queue a fetcher domain crawl for indexing using existing ingest worker pipeline.
+
+    JSON body:
+        companyId (str, required)
+        domain (str, required): domain or URL. Normalized to hostname.
+        documentId (str, optional)
+        pageUrls / urls / pages (array, optional): if set, only these crawled URLs are indexed.
+        pageLimit / limit / maxPages (int, optional)
+        fetchedFrom / fetchedTo (ISO datetime, optional)
+        storagePreference / preferStorage / storage (list|csv, optional)
+        indexOptions / options (dict, optional)
+        metadata (dict, optional)
+        trigger (str, optional)
+        userId (str, optional)
+    """
+    try:
+        payload = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"error": "invalid JSON payload"}), 400
+
+    if not isinstance(payload, dict):
+        return jsonify({"error": "payload must be an object"}), 400
+
+    domain_value = _get_payload_value(payload, "domain", "domainId", "domain_id")
+    normalized_domain = _normalize_domain_value(domain_value)
+    if not normalized_domain:
+        return jsonify({"error": "domain is required"}), 400
+
+    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    source = dict(source)
+    source["type"] = "fetcher_crawl"
+    source["domain"] = normalized_domain
+
+    for key in ("pageLimit", "limit", "maxPages", "fetchedFrom", "fetchedTo", "startDate", "endDate"):
+        value = _get_payload_value(payload, key)
+        if value is not None:
+            source[key] = value
+
+    page_urls = _extract_page_urls(
+        _get_payload_value(payload, "pageUrls", "page_urls", "urls", "pages", "crawlPages")
+    )
+    if page_urls:
+        source["pageUrls"] = page_urls
+
+    storage_value = _get_payload_value(payload, "storagePreference", "preferStorage", "storage")
+    if storage_value is not None:
+        source["storagePreference"] = storage_value
+
+    payload_with_source = dict(payload)
+    payload_with_source["source"] = source
+    payload_with_source.setdefault("trigger", "fetcher_api")
+    return _queue_content_index_payload(payload_with_source, default_trigger="fetcher_api")
+
+
+@app.route("/api/v10/content/index/fetcher/pages", methods=["POST"])
+def queue_content_index_fetcher_pages():
+    """
+    Queue indexing only for selected crawled page URLs of a fetcher domain.
+
+    JSON body:
+        companyId (str, required)
+        domain (str, required): domain or URL. Normalized to hostname.
+        pageUrls / urls / pages (array, required): crawled page URLs to index.
+        documentId (str, optional)
+        indexOptions / options (dict, optional)
+        metadata (dict, optional)
+        trigger (str, optional)
+        userId (str, optional)
+    """
+    try:
+        payload = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"error": "invalid JSON payload"}), 400
+
+    if not isinstance(payload, dict):
+        return jsonify({"error": "payload must be an object"}), 400
+
+    domain_value = _get_payload_value(payload, "domain", "domainId", "domain_id")
+    normalized_domain = _normalize_domain_value(domain_value)
+    if not normalized_domain:
+        return jsonify({"error": "domain is required"}), 400
+
+    page_urls = _extract_page_urls(
+        _get_payload_value(payload, "pageUrls", "page_urls", "urls", "pages", "crawlPages")
+    )
+    if not page_urls:
+        return jsonify({"error": "pageUrls (or urls/pages) is required and must be a non-empty array"}), 400
+
+    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    source = dict(source)
+    source["type"] = "fetcher_crawl"
+    source["domain"] = normalized_domain
+    source["pageUrls"] = page_urls
+
+    storage_value = _get_payload_value(payload, "storagePreference", "preferStorage", "storage")
+    if storage_value is not None:
+        source["storagePreference"] = storage_value
+
+    payload_with_source = dict(payload)
+    payload_with_source["source"] = source
+    payload_with_source.setdefault("trigger", "fetcher_pages_api")
+    return _queue_content_index_payload(payload_with_source, default_trigger="fetcher_pages_api")
+
+
 @app.route("/api/v10/ingest/markdown", methods=["POST"])
 def ingest_markdown():
     """
