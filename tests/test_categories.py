@@ -49,3 +49,52 @@ def test_search_attribute(client, mocker):
     assert len(data["results"]) == 1
     assert data["results"][0]["attributeId"] == "attr_456"
     assert data["results"][0]["text"] == "Color: Red"
+
+
+def test_list_categories_slug_filter_supports_text_fallback(client, mocker):
+    mocked_items = [
+        {
+            "id": 1,
+            "external_id": "cat_1",
+            "text": "Home Appliances",
+            "companyId": "comp_1",
+            "metadata": {"slug": "home-appliances"},
+        },
+        {
+            "id": 2,
+            "external_id": "cat_2",
+            "text": "Gaming Laptop",
+            "companyId": "comp_1",
+            "metadata": {},
+        },
+    ]
+    mocker.patch("app.category_store.list_entries", return_value=(2, mocked_items))
+
+    response = client.get("/api/v10/categories?slug=gaming-laptop")
+    assert response.status_code == 200
+
+    data = response.get_json()
+    assert data["total"] == 1
+    assert len(data["items"]) == 1
+    assert data["items"][0]["categoryId"] == "cat_2"
+    assert data["items"][0]["slug"] == "gaming-laptop"
+
+
+def test_get_category_by_slug_identifier(client, mocker):
+    slug_entry = {
+        "id": 7,
+        "external_id": "cat_7",
+        "text": "Smart Phone",
+        "companyId": "comp_1",
+        "metadata": {"slug": "smart-phone"},
+    }
+    mocker.patch("app.category_store.find_ids_by_external_id", return_value=[])
+    mocker.patch("app.category_store.list_entries", return_value=(1, [slug_entry]))
+    mocker.patch("app.category_store.get_entry", return_value=slug_entry)
+    mocker.patch("app.attribute_store.list_entries", return_value=(0, []))
+
+    response = client.get("/api/v10/categories/smart-phone")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["categoryId"] == "cat_7"
+    assert data["slug"] == "smart-phone"

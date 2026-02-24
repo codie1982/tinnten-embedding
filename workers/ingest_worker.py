@@ -9,6 +9,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 import gzip
 import io
 from urllib.parse import unquote, urlparse
@@ -42,6 +43,7 @@ from services.upload_store import UploadStore, UploadNotFoundError
 from services.fetcher_store import FetcherStore
 from services.document_loader import DocumentDownloadError, DocumentParseError
 from services.email_queue_events import EmbeddingEmailEvents
+from services.error_logger import EmbeddingErrorLogger
 from init.aws import get_s3_client
 
 
@@ -135,6 +137,7 @@ class IngestWorker:
         self.channel: pika.adapters.blocking_connection.BlockingChannel | None = None
         self._stop_event = threading.Event()
         self.email_events = EmbeddingEmailEvents()
+        self.error_logger = EmbeddingErrorLogger(component="worker")
 
     def _get_store(self) -> MongoStore:
         if self.store is not None:
@@ -276,6 +279,11 @@ class IngestWorker:
             channel.basic_ack(delivery_tag=delivery_tag)
         except Exception as exc:  # noqa: BLE001
             log(f"Error processing message: {exc}")
+            self._log_worker_error(
+                "message_processing_failed",
+                exc=exc,
+                context={"payload": self._summarize_payload_for_log(payload)},
+            )
             # attempt to mark document(s) as failed if possible
             try:
                 if isinstance(payload, dict):
@@ -451,6 +459,16 @@ class IngestWorker:
                 self._process_single_document(document, context)
             except Exception as exc:  # noqa: BLE001
                 log(f"Failed to process document {doc_id}: {exc}")
+                self._log_worker_error(
+                    "content_document_processing_failed",
+                    exc=exc,
+                    context={
+                        "companyId": company_id,
+                        "documentId": doc_id,
+                        "jobId": context.job_id,
+                        "trigger": trigger,
+                    },
+                )
 
     def _process_embedded_chunks(self, payload: Dict[str, Any]) -> None:
         doc_id = payload.get("doc_id")
@@ -600,6 +618,16 @@ class IngestWorker:
                 stage="content_load",
                 exc=exc,
             )
+            self._log_worker_error(
+                "content_load_failed",
+                exc=exc,
+                context={
+                    "companyId": context.company_id,
+                    "documentId": context.document_id,
+                    "jobId": context.job_id,
+                    "source": source_name,
+                },
+            )
             raise
 
         self._log_document_event(
@@ -646,6 +674,16 @@ class IngestWorker:
                 source=source_name,
                 stage="embedding",
                 exc=exc,
+            )
+            self._log_worker_error(
+                "embedding_stage_failed",
+                exc=exc,
+                context={
+                    "companyId": context.company_id,
+                    "documentId": context.document_id,
+                    "jobId": context.job_id,
+                    "source": source_name,
+                },
             )
             raise
 
@@ -1752,6 +1790,57 @@ class IngestWorker:
             stage=stage,
             reason=reason,
         )
+
+    def _summarize_payload_for_log(self, payload: Any) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {"payloadType": type(payload).__name__}
+        summary: Dict[str, Any] = {}
+        for key in (
+            "ingest_type",
+            "payload_type",
+            "companyId",
+            "company_id",
+            "companyid",
+            "documentIds",
+            "document_ids",
+            "documentid",
+            "doc_id",
+            "jobId",
+            "job_id",
+            "upload_id",
+            "uploadId",
+            "source",
+            "trigger",
+            "domain",
+        ):
+            if key not in payload:
+                continue
+            value = payload.get(key)
+            if isinstance(value, (dict, list)):
+                summary[key] = type(value).__name__
+            else:
+                summary[key] = str(value)
+        return summary
+
+    def _log_worker_error(
+        self,
+        event: str,
+        *,
+        exc: Exception,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "event": str(event or "worker_error"),
+            "error": str(exc),
+            "exceptionType": type(exc).__name__,
+            "traceback": traceback.format_exc(),
+        }
+        if context:
+            payload["context"] = context
+        try:
+            self.error_logger.append(payload)
+        except Exception as log_exc:  # noqa: BLE001
+            log("Failed to persist worker error log (%s): %s", payload["event"], log_exc)
 
     # ------------------------------------------------------------------
     def _coalesce(self, data: Dict[str, Any], *candidates: str) -> Optional[Any]:

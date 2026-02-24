@@ -39,3 +39,15 @@ def test_search_vector_general(client, mocker):
     data = response.get_json()
     assert len(data["results"]) == 1
     assert data["results"][0]["text"] == "result 1"
+
+
+def test_upsert_vector_logs_error(client, mocker):
+    mocker.patch("app.store.upsert_vector", side_effect=RuntimeError("upsert boom"))
+    append_mock = mocker.patch("app.embedding_error_logger.append")
+
+    response = client.post("/api/v10/vector/upsert", json={"text": "test text", "metadata": {}})
+    assert response.status_code == 400
+    append_mock.assert_called_once()
+    entry = append_mock.call_args[0][0]
+    assert entry["event"] == "vector_upsert_failed"
+    assert entry["error"] == "upsert boom"

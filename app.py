@@ -1,7 +1,9 @@
 import json
 import logging
 import os
+import re
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -24,6 +26,7 @@ from services import (
     normalize_index_options,
 )
 from services.embedding_engine import EmbeddingEngine
+from services.error_logger import EmbeddingErrorLogger
 from services.mongo_store import MongoStore
 from services.rabbit_publisher import RabbitPublisher
 from services.keycloak_service import get_keycloak_service, KeycloakError, KeycloakTokenError
@@ -35,6 +38,7 @@ BASE_DIR = os.path.dirname(__file__) or "."
 logger = logging.getLogger("tinnten.embedding")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
+embedding_error_logger = EmbeddingErrorLogger(component="api")
 
 
 def _path_from_env(*keys, default: str) -> str:
@@ -199,6 +203,90 @@ def _get_payload_value(data: dict, *keys: str):
     return None
 
 
+def _summarize_payload(payload: dict | None) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    summary = {}
+    for key in (
+        "type",
+        "target",
+        "id",
+        "external_id",
+        "companyId",
+        "company_id",
+        "companyid",
+        "categoryId",
+        "category_id",
+        "attributeId",
+        "attribute_id",
+        "documentId",
+        "document_id",
+        "doc_id",
+        "jobId",
+        "job_id",
+        "uploadId",
+        "upload_id",
+        "trigger",
+        "domain",
+    ):
+        value = payload.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            summary[key] = type(value).__name__
+        else:
+            summary[key] = str(value)
+    return summary
+
+
+def _request_log_context() -> dict:
+    request_id = request.headers.get("X-Request-Id") or request.headers.get("x-request-id")
+    remote_addr = request.headers.get("X-Forwarded-For") or request.remote_addr
+    context = {
+        "path": request.path,
+        "method": request.method,
+    }
+    if request_id:
+        context["requestId"] = request_id
+    if remote_addr:
+        context["remoteAddr"] = str(remote_addr)
+    return context
+
+
+def _log_api_error(
+    event: str,
+    *,
+    exc: Exception | None = None,
+    status: int | None = None,
+    context: dict | None = None,
+) -> None:
+    payload = {
+        "event": str(event or "api_error"),
+    }
+    if status is not None:
+        payload["status"] = int(status)
+    merged_context = dict(context or {})
+    try:
+        merged_context["request"] = _request_log_context()
+    except Exception:
+        pass
+    if merged_context:
+        payload["context"] = merged_context
+
+    if exc is not None:
+        payload["error"] = str(exc)
+        payload["exceptionType"] = type(exc).__name__
+        payload["traceback"] = traceback.format_exc()
+        logger.exception("Embedding API error (%s): %s", payload["event"], exc)
+    else:
+        logger.error("Embedding API error (%s)", payload["event"])
+
+    try:
+        embedding_error_logger.append(payload)
+    except Exception as log_exc:  # noqa: BLE001
+        logger.warning("Failed to persist embedding error log (%s): %s", payload["event"], log_exc)
+
+
 def _normalize_domain_value(raw_value) -> str:
     raw = str(raw_value or "").strip()
     if not raw:
@@ -298,6 +386,33 @@ def _coerce_bool(value, default: bool = False) -> bool:
     return bool(value)
 
 
+def _normalize_slug(value) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    slug = re.sub(r"[^a-z0-9\s-]", "", raw)
+    slug = re.sub(r"\s+", "-", slug)
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    return slug
+
+
+def _resolve_slug_from_category_entry(entry: dict | None) -> str:
+    if not entry:
+        return ""
+    metadata = entry.get("metadata") or {}
+    direct = _normalize_slug(entry.get("slug") or metadata.get("slug"))
+    if direct:
+        return direct
+    return _normalize_slug(entry.get("text"))
+
+
+def _category_entry_matches_slug(entry: dict | None, slug: str) -> bool:
+    normalized_slug = _normalize_slug(slug)
+    if not normalized_slug:
+        return False
+    return _resolve_slug_from_category_entry(entry) == normalized_slug
+
+
 def _parse_filter_arg(raw_value):
     if raw_value is None:
         return None
@@ -328,6 +443,37 @@ def _resolve_ids_for_identifier(target_store, identifier: str, use_external: boo
         ids = target_store.find_ids_by_external_id(str(identifier))
         return ids, "external_id"
     return [int(identifier)], "id"
+
+
+def _find_category_ids_by_slug(slug: str) -> list[int]:
+    normalized_slug = _normalize_slug(slug)
+    if not normalized_slug:
+        return []
+
+    _, items = category_store.list_entries(offset=0, limit=None, simple_filter=None)
+    ids: list[int] = []
+    for item in items:
+        if _category_entry_matches_slug(item, normalized_slug):
+            item_id = item.get("id")
+            if item_id is None:
+                continue
+            try:
+                ids.append(int(item_id))
+            except (TypeError, ValueError):
+                continue
+    return ids
+
+
+def _resolve_category_ids_for_identifier(identifier: str, use_external: bool):
+    ids, id_kind = _resolve_ids_for_identifier(category_store, identifier, use_external)
+    if ids:
+        return ids, id_kind
+
+    slug_ids = _find_category_ids_by_slug(identifier)
+    if slug_ids:
+        return slug_ids, "slug"
+
+    return [], id_kind
 
 
 def _safe_object_id(value):
@@ -396,6 +542,15 @@ def _normalize_category_payload(payload: dict) -> dict:
     if description is not None:
         meta_payload["description"] = str(description)
 
+    slug = payload.get("slug") or meta_payload.get("slug")
+    normalized_slug = _normalize_slug(slug)
+    if normalized_slug:
+        payload["slug"] = normalized_slug
+        meta_payload["slug"] = normalized_slug
+    else:
+        payload.pop("slug", None)
+        meta_payload.pop("slug", None)
+
     if "isSystem" in payload:
         meta_payload["isSystem"] = _coerce_bool(payload.get("isSystem"), False)
     elif "is_system" in payload:
@@ -412,14 +567,22 @@ def _normalize_category_payload(payload: dict) -> dict:
 def _map_category_entry_basic(entry: dict | None) -> dict | None:
     if not entry:
         return None
-    metadata = entry.get("metadata") or {}
+    metadata = dict(entry.get("metadata") or {})
+    external_id = entry.get("external_id")
+    slug = _resolve_slug_from_category_entry(entry)
+    if slug:
+        metadata["slug"] = slug
     out = {
-        "categoryId": entry.get("external_id"),
+        "categoryId": external_id,
+        "id": external_id,
+        "externalId": external_id,
         "text": entry.get("text"),
         "companyId": entry.get("companyId"),
         "description": metadata.get("description"),
         "metadata": metadata,
     }
+    if slug:
+        out["slug"] = slug
     if entry.get("score") is not None:
         out["score"] = entry.get("score")
     return out
@@ -604,8 +767,10 @@ def _vector_upsert_response(
     payload: dict | None = None,
     transform=None,
 ):
+    request_payload = payload if isinstance(payload, dict) else None
     try:
-        payload = payload if payload is not None else (request.get_json() or {})
+        payload = request_payload if request_payload is not None else (request.get_json() or {})
+        request_payload = payload if isinstance(payload, dict) else request_payload
         text = payload.get("text")
         vector = payload.get("vector")
         external_id = payload.get("external_id")
@@ -620,12 +785,20 @@ def _vector_upsert_response(
             out = transform(out)
         return jsonify(out)
     except Exception as exc:  # noqa: BLE001
+        _log_api_error(
+            "vector_upsert_failed",
+            exc=exc,
+            status=400,
+            context={"label": label, "payload": _summarize_payload(request_payload)},
+        )
         return jsonify({"error": f"{label} failed: {exc}"}), 400
 
 
 def _vector_search_response(target_store, label: str = "search", payload: dict | None = None, transform=None):
+    request_payload = payload if isinstance(payload, dict) else None
     try:
-        payload = payload if payload is not None else (request.get_json() or {})
+        payload = request_payload if request_payload is not None else (request.get_json() or {})
+        request_payload = payload if isinstance(payload, dict) else request_payload
         text = payload.get("text")
         vector = payload.get("vector")
         k = int(payload.get("k") or 5)
@@ -642,6 +815,12 @@ def _vector_search_response(target_store, label: str = "search", payload: dict |
         # that expect either `results`, `items`, raw list-like wrappers, or `data`.
         return jsonify({"results": results, "items": results, "data": results})
     except Exception as exc:  # noqa: BLE001
+        _log_api_error(
+            "vector_search_failed",
+            exc=exc,
+            status=400,
+            context={"label": label, "payload": _summarize_payload(request_payload)},
+        )
         return jsonify({"error": f"{label} failed: {exc}"}), 400
 
 
@@ -865,12 +1044,19 @@ def generate_vector():
     JSON body:
         text (str, required): Content to vectorize.
     """
+    data = {}
     try:
         data = request.get_json() or {}
         text = data.get("text")
         vec = store.vectorize_text(text)
         return jsonify({"vector": vec})
     except Exception as e:
+        _log_api_error(
+            "vectorization_failed",
+            exc=e,
+            status=400,
+            context={"payload": _summarize_payload(data if isinstance(data, dict) else None)},
+        )
         return jsonify({"error": f"vectorization failed: {str(e)}"}), 400
 
 @app.route("/api/v10/vector/upsert", methods=["POST"])
@@ -952,6 +1138,12 @@ def search_web_index():
         scores, ids = _websearch_faiss_search(text, k, model_name, index_path)
         app.logger.info("Websearch: text='%s' k=%d model='%s' index='%s' -> found %d IDs", text, k, model_name, index_path, len(ids))
     except Exception as exc:  # noqa: BLE001
+        _log_api_error(
+            "websearch_failed",
+            exc=exc,
+            status=400,
+            context={"k": k, "model": model_name, "indexPath": index_path},
+        )
         app.logger.error("Websearch failed: %s", exc)
         return jsonify({"error": f"websearch failed: {exc}"}), 400
 
@@ -1113,17 +1305,23 @@ def list_categories():
     if filter_arg and "metadata.parentId" in filter_arg:
         filter_arg["parentId"] = str(filter_arg.pop("metadata.parentId"))
 
-    # slug filter desteği
     slug = request.args.get("slug")
-    if slug is not None:
-        filter_arg = dict(filter_arg or {})
-        filter_arg["metadata.slug"] = str(slug)
+    slug_filter = _normalize_slug(slug) if slug is not None else ""
 
+    query_offset = 0 if slug_filter else offset
+    query_limit = None if slug_filter else limit
     total, items = category_store.list_entries(
-        offset=offset,
-        limit=limit,
+        offset=query_offset,
+        limit=query_limit,
         simple_filter=filter_arg,
     )
+    if slug_filter:
+        items = [item for item in items if _category_entry_matches_slug(item, slug_filter)]
+        total = len(items)
+        if offset > 0:
+            items = items[offset:]
+        if limit is not None:
+            items = items[:limit]
     mapped = [_map_category_entry(item) for item in items]
     mapped = [m for m in mapped if m]
     return jsonify({"total": total, "offset": offset, "limit": limit, "items": mapped})
@@ -1151,9 +1349,7 @@ def category_stats():
         filter_arg["parentId"] = str(parent_id)
 
     slug = request.args.get("slug")
-    if slug is not None:
-        filter_arg = dict(filter_arg or {})
-        filter_arg["metadata.slug"] = str(slug)
+    slug_filter = _normalize_slug(slug) if slug is not None else ""
 
     text = request.args.get("text")
     if text is not None:
@@ -1161,6 +1357,9 @@ def category_stats():
         filter_arg["text"] = str(text)
 
     total, items = category_store.list_entries(offset=0, limit=None, simple_filter=filter_arg)
+    if slug_filter:
+        items = [item for item in items if _category_entry_matches_slug(item, slug_filter)]
+        total = len(items)
 
     by_company: dict[str, int] = {}
     by_type: dict[str, int] = {"product": 0, "service": 0, "general": 0}
@@ -1280,11 +1479,11 @@ def get_category(category_id: str):
         return jsonify({"error": "category_id is required"}), 400
 
     use_external = _should_use_external_id()
-    ids, id_kind = _resolve_ids_for_identifier(category_store, category_id, use_external)
+    ids, id_kind = _resolve_category_ids_for_identifier(category_id, use_external)
     if not ids:
         return jsonify({"error": "not_found"}), 404
 
-    if id_kind == "external_id":
+    if id_kind in {"external_id", "slug"}:
         entries = [category_store.get_entry(fid) for fid in ids]
         entries = [entry for entry in entries if entry]
         if len(entries) == 1:
@@ -1311,10 +1510,10 @@ def update_category(category_id: str):
         return jsonify({"error": "category_id is required"}), 400
 
     use_external = _should_use_external_id()
-    ids, id_kind = _resolve_ids_for_identifier(category_store, category_id, use_external)
+    ids, id_kind = _resolve_category_ids_for_identifier(category_id, use_external)
     if not ids:
         return jsonify({"error": "not_found"}), 404
-    if id_kind == "external_id" and len(ids) > 1:
+    if id_kind in {"external_id", "slug"} and len(ids) > 1:
         return jsonify({"error": "multiple_matches", "count": len(ids)}), 409
 
     resolved_id = ids[0]
@@ -1362,9 +1561,11 @@ def delete_category(category_id: str):
     company_id = request.args.get("companyId") or request.args.get("company_id") or request.args.get("companyid")
 
     use_external = _should_use_external_id()
-    ids, id_kind = _resolve_ids_for_identifier(category_store, category_id, use_external)
+    ids, id_kind = _resolve_category_ids_for_identifier(category_id, use_external)
     if not ids:
         return jsonify({"error": "not_found"}), 404
+    if id_kind == "slug" and len(ids) > 1:
+        return jsonify({"error": "multiple_matches", "count": len(ids)}), 409
     
     external_ids: list[str | None] = []
     # Her ID için companyId kontrolü
@@ -1692,6 +1893,12 @@ def ingest_web_legacy():
     try:
         job_publisher.publish(message)
     except Exception as exc:  # noqa: BLE001
+        _log_api_error(
+            "ingest_web_enqueue_failed",
+            exc=exc,
+            status=500,
+            context={"docId": doc_id, "url": url},
+        )
         chunk_store.update_document_status(doc_id, status="failed", error=str(exc))
         return jsonify({"error": "failed_to_enqueue", "message": str(exc)}), 500
 
@@ -1761,6 +1968,12 @@ def ingest_upload_legacy():
     try:
         job_publisher.publish(message)
     except Exception as exc:  # noqa: BLE001
+        _log_api_error(
+            "ingest_upload_enqueue_failed",
+            exc=exc,
+            status=500,
+            context={"docId": doc_id, "uploadId": upload_id},
+        )
         chunk_store.update_document_status(doc_id, status="failed", error=str(exc))
         upload_store.update_upload_status(
             upload_id,
@@ -1809,6 +2022,12 @@ def deactivate_document():
     try:
         chunk_store.update_document_status(str(document_id), status="disabled")
     except Exception as exc:  # noqa: BLE001
+        _log_api_error(
+            "deactivate_document_failed",
+            exc=exc,
+            status=500,
+            context={"documentId": str(document_id)},
+        )
         return jsonify({"error": f"failed to update document status: {exc}"}), 500
 
     _deactivate_index_state(company_id, str(document_id), state="disabled")
@@ -1882,6 +2101,12 @@ def remove_document():
             chunk_engine.remove_ids(faiss_ids)
             faiss_removed = len(faiss_ids)
         except Exception as exc:  # noqa: BLE001
+            _log_api_error(
+                "hard_remove_failed",
+                exc=exc,
+                status=500,
+                context={"documentId": doc_id_str, "faissIdCount": len(faiss_ids)},
+            )
             return jsonify({"error": f"failed to remove from FAISS: {exc}"}), 500
     else:
         app.logger.warning(
@@ -1965,6 +2190,12 @@ def _publish_content_index_message(
 
     if last_exc is None:
         return None
+    _log_api_error(
+        "content_index_publish_failed",
+        exc=last_exc,
+        status=503,
+        context={"companyId": company_id, "documentId": document_id, "jobId": job_id},
+    )
     return f"failed to enqueue indexing job: {last_exc}"
 
 
@@ -2172,6 +2403,17 @@ def _queue_content_index_payload(payload: dict, *, default_trigger: str) -> tupl
             doc_type=doc_type,
         )
     except Exception as exc:  # noqa: BLE001
+        _log_api_error(
+            "content_index_prepare_failed",
+            exc=exc,
+            status=500,
+            context={
+                "companyId": company_id,
+                "documentId": document_id,
+                "jobId": job_id,
+                "source": source.get("type"),
+            },
+        )
         return jsonify({"error": f"failed to prepare document: {exc}"}), 500
 
     try:
@@ -2376,6 +2618,7 @@ def ingest_markdown():
             target_chars (int): Desired chunk size (default 1100).
             overlap_chars (int): Character overlap between chunks (default 180).
     """
+    data = {}
     try:
         data = request.get_json() or {}
         url = (data.get("url") or "").strip()
@@ -2394,6 +2637,12 @@ def ingest_markdown():
         )
         return jsonify(result)
     except Exception as e:
+        _log_api_error(
+            "ingest_markdown_failed",
+            exc=e,
+            status=400,
+            context={"url": (data.get("url") if isinstance(data, dict) else None)},
+        )
         return jsonify({"success": False, "error": f"ingest failed: {str(e)}"}), 400
 
 
@@ -2419,10 +2668,28 @@ def get_upload_text(upload_id):
     try:
         document = document_loader.fetch_text(key, bucket=bucket)
     except DocumentDownloadError as exc:
+        _log_api_error(
+            "upload_text_download_failed",
+            exc=exc,
+            status=502,
+            context={"uploadId": upload_id, "bucket": bucket, "key": key},
+        )
         return jsonify({"error": f"download failed: {exc}"}), 502
     except DocumentParseError as exc:
+        _log_api_error(
+            "upload_text_parse_failed",
+            exc=exc,
+            status=422,
+            context={"uploadId": upload_id, "bucket": bucket, "key": key},
+        )
         return jsonify({"error": f"parse failed: {exc}"}), 422
     except Exception as exc:
+        _log_api_error(
+            "upload_text_unexpected_failed",
+            exc=exc,
+            status=500,
+            context={"uploadId": upload_id, "bucket": bucket, "key": key},
+        )
         return jsonify({"error": f"unexpected error: {exc}"}), 500
 
     payload = {
