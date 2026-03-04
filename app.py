@@ -569,6 +569,14 @@ def _map_category_entry_basic(entry: dict | None) -> dict | None:
         return None
     metadata = dict(entry.get("metadata") or {})
     external_id = entry.get("external_id")
+    text_value = entry.get("text")
+    name_value = (
+        entry.get("name")
+        or entry.get("title")
+        or metadata.get("name")
+        or metadata.get("label")
+        or text_value
+    )
     slug = _resolve_slug_from_category_entry(entry)
     if slug:
         metadata["slug"] = slug
@@ -576,7 +584,10 @@ def _map_category_entry_basic(entry: dict | None) -> dict | None:
         "categoryId": external_id,
         "id": external_id,
         "externalId": external_id,
-        "text": entry.get("text"),
+        "text": text_value,
+        "name": name_value,
+        "title": name_value,
+        "label": metadata.get("label") or name_value,
         "companyId": entry.get("companyId"),
         "description": metadata.get("description"),
         "metadata": metadata,
@@ -597,6 +608,16 @@ def _get_category_by_external_id(external_id: str | None):
         if entry:
             return entry
     return None
+
+
+@lru_cache(maxsize=4096)
+def _get_category_brief_by_external_id(external_id: str) -> dict | None:
+    entry = _get_category_by_external_id(external_id)
+    return _map_category_entry_basic(entry) if entry else None
+
+
+def _clear_category_lookup_cache():
+    _get_category_brief_by_external_id.cache_clear()
 
 
 def _build_category_parent_chain(entry: dict | None) -> list[dict]:
@@ -722,15 +743,102 @@ def _normalize_attribute_payload(payload: dict) -> dict:
 def _map_attribute_entry(entry: dict | None) -> dict | None:
     if not entry:
         return None
+    metadata = dict(entry.get("metadata") or {})
+    external_id = entry.get("external_id")
+    text_value = entry.get("text")
+    name_value = (
+        entry.get("name")
+        or entry.get("title")
+        or metadata.get("name")
+        or metadata.get("label")
+        or text_value
+    )
+    category_id = (
+        metadata.get("categoryId")
+        or metadata.get("category_id")
+        or metadata.get("category")
+    )
+    category_id = str(category_id) if category_id is not None else None
+    category_name = metadata.get("categoryName") or metadata.get("category_name")
+    category_slug = metadata.get("categorySlug") or metadata.get("category_slug")
+
+    category_ref = None
+    if category_id:
+        mapped_category = _get_category_brief_by_external_id(category_id)
+        if mapped_category:
+            category_name = category_name or mapped_category.get("name") or mapped_category.get("text")
+            category_slug = category_slug or mapped_category.get("slug")
+            category_ref = {
+                "categoryId": mapped_category.get("categoryId"),
+                "id": mapped_category.get("id"),
+                "name": mapped_category.get("name") or mapped_category.get("text"),
+                "text": mapped_category.get("text"),
+                "slug": mapped_category.get("slug"),
+            }
+
     out = {
-        "attributeId": entry.get("external_id"),
-        "text": entry.get("text"),
+        "attributeId": external_id,
+        "id": external_id,
+        "externalId": external_id,
+        "text": text_value,
+        "name": name_value,
+        "title": name_value,
+        "label": metadata.get("label") or name_value,
         "companyId": entry.get("companyId"),
-        "metadata": entry.get("metadata") or {},
+        "categoryId": category_id,
+        "categoryName": category_name,
+        "categorySlug": category_slug,
+        "category": category_ref,
+        "metadata": metadata,
     }
     if entry.get("score") is not None:
         out["score"] = entry.get("score")
     return out
+
+
+def _map_category_upsert_result(out: dict | None) -> dict:
+    out = out or {}
+    _clear_category_lookup_cache()
+    faiss_id = out.get("id")
+    if faiss_id is not None:
+        try:
+            entry = category_store.get_entry(int(faiss_id))
+            mapped = _map_category_entry(entry, include_parents=False, include_attributes=False)
+            if mapped:
+                return mapped
+        except Exception:
+            pass
+
+    external_id = out.get("external_id")
+    return {
+        "categoryId": external_id,
+        "id": external_id,
+        "externalId": external_id,
+        "name": None,
+        "text": None,
+    }
+
+
+def _map_attribute_upsert_result(out: dict | None) -> dict:
+    out = out or {}
+    faiss_id = out.get("id")
+    if faiss_id is not None:
+        try:
+            entry = attribute_store.get_entry(int(faiss_id))
+            mapped = _map_attribute_entry(entry)
+            if mapped:
+                return mapped
+        except Exception:
+            pass
+
+    external_id = out.get("external_id")
+    return {
+        "attributeId": external_id,
+        "id": external_id,
+        "externalId": external_id,
+        "name": None,
+        "text": None,
+    }
 
 
 def _resolve_upload_s3_location(upload_doc, file_doc):
@@ -1254,7 +1362,7 @@ def upsert_category_vector():
         category_store,
         label="category upsert",
         payload=payload,
-        transform=lambda out: {"categoryId": out.get("external_id")},
+        transform=_map_category_upsert_result,
     )
 
 
@@ -1468,7 +1576,7 @@ def create_category():
         category_store,
         label="category create",
         payload=payload,
-        transform=lambda out: {"categoryId": out.get("external_id")},
+        transform=_map_category_upsert_result,
     )
 
 @app.route("/api/v10/categories/<category_id>", methods=["GET"])
@@ -1547,7 +1655,7 @@ def update_category(category_id: str):
         category_store,
         label="category update",
         payload=payload,
-        transform=lambda out: {"categoryId": out.get("external_id")},
+        transform=_map_category_upsert_result,
     )
 
 @app.route("/api/v10/categories/<category_id>", methods=["DELETE"])
@@ -1590,6 +1698,7 @@ def delete_category(category_id: str):
         return jsonify({"error": str(exc)}), 500
 
     clean_external = [eid for eid in external_ids if eid is not None]
+    _clear_category_lookup_cache()
     return jsonify({"removed": removed, "categoryIds": clean_external, "identifierType": id_kind})
 
 
@@ -1619,7 +1728,7 @@ def upsert_attribute_vector():
         attribute_store,
         label="attribute upsert",
         payload=payload,
-        transform=lambda out: {"attributeId": out.get("external_id")},
+        transform=_map_attribute_upsert_result,
     )
 
 
@@ -1711,7 +1820,7 @@ def create_attribute():
         attribute_store,
         label="attribute create",
         payload=payload,
-        transform=lambda out: {"attributeId": out.get("external_id")},
+        transform=_map_attribute_upsert_result,
     )
 
 @app.route("/api/v10/attributes/<attribute_id>", methods=["GET"])
@@ -1781,7 +1890,7 @@ def update_attribute(attribute_id: str):
         attribute_store,
         label="attribute update",
         payload=payload,
-        transform=lambda out: {"attributeId": out.get("external_id")},
+        transform=_map_attribute_upsert_result,
     )
 
 @app.route("/api/v10/attributes/<attribute_id>", methods=["DELETE"])
