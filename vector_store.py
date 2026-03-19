@@ -624,6 +624,13 @@ class EmbeddingIndex:
             self.model = SentenceTransformer(self.model_name)
         return self.model
 
+    def warmup_model(self) -> SentenceTransformer:
+        """
+        Eagerly load the backing SentenceTransformer during process startup so the
+        first user request does not pay the model download/init cost.
+        """
+        return self._ensure_model()
+
     def _save_state(self) -> None:
         self._ensure_parent_dir(self.meta_path)
         with open(self.meta_path, "w", encoding="utf-8") as f:

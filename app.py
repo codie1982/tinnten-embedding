@@ -7,7 +7,7 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 from functools import lru_cache
-from threading import RLock
+from threading import Lock, RLock
 from urllib.parse import urlparse
 
 import numpy as np
@@ -40,6 +40,8 @@ logger = logging.getLogger("tinnten.embedding")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 embedding_error_logger = EmbeddingErrorLogger(component="api")
+_startup_warmup_lock = Lock()
+_startup_warmup_done = False
 
 
 def _path_from_env(*keys, default: str) -> str:
@@ -166,6 +168,36 @@ def _get_cached_chunk_engine() -> EmbeddingEngine | None:
     if cache_info.currsize <= 0:
         return None
     return get_chunk_engine()
+
+
+def warmup_embedding_models() -> None:
+    """
+    Eagerly initialise API-facing embedding models during worker boot so the first
+    request does not block on model download/loading.
+    """
+    global _startup_warmup_done
+    if _startup_warmup_done:
+        return
+    with _startup_warmup_lock:
+        if _startup_warmup_done:
+            return
+
+        started_at = time.time()
+        logger.info("Startup model warmup started.")
+        warmup_steps = (
+            ("general_store", store.warmup_model),
+            ("category_store", category_store.warmup_model),
+            ("attribute_store", attribute_store.warmup_model),
+            ("chunk_engine", get_chunk_engine),
+        )
+        for name, loader in warmup_steps:
+            step_started_at = time.time()
+            logger.info("Warmup loading %s...", name)
+            loader()
+            logger.info("Warmup finished %s in %.2fs", name, time.time() - step_started_at)
+
+        _startup_warmup_done = True
+        logger.info("Startup model warmup completed in %.2fs", time.time() - started_at)
 
 
 @lru_cache(maxsize=4)
