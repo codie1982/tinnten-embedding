@@ -7,6 +7,7 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 from functools import lru_cache
+from threading import RLock
 from urllib.parse import urlparse
 
 import numpy as np
@@ -137,6 +138,9 @@ category_store = EmbeddingIndex(
     meta_path=CATEGORY_META_PATH,
     meta_repo=category_meta_repo,
 )
+category_lookup_lock = RLock()
+category_external_id_index: dict[str, set[int]] = {}
+category_slug_index: dict[str, set[int]] = {}
 attribute_meta_repo = MetaRepository(db_name=ATTRIBUTE_META_DB_NAME, collection=ATTRIBUTE_META_COLLECTION)
 attribute_store = EmbeddingIndex(
     model_name=ATTRIBUTE_MODEL_NAME,
@@ -148,9 +152,20 @@ upload_store = UploadStore()
 document_loader = DocumentLoader()
 content_store = ContentDocumentStore()
 job_publisher = RabbitPublisher()
-# Worker’la aynı FAISS + Mongo chunk akışı üzerinden arama için
-chunk_engine = EmbeddingEngine(model_name=CHUNK_MODEL_NAME, index_path=CHUNK_INDEX_PATH)
 chunk_store = MongoStore()
+
+
+@lru_cache(maxsize=1)
+def get_chunk_engine() -> EmbeddingEngine:
+    # Chunk modeli sadece ilgili endpoint'ler ilk kez kullanıldığında yüklenir.
+    return EmbeddingEngine(model_name=CHUNK_MODEL_NAME, index_path=CHUNK_INDEX_PATH)
+
+
+def _get_cached_chunk_engine() -> EmbeddingEngine | None:
+    cache_info = get_chunk_engine.cache_info()
+    if cache_info.currsize <= 0:
+        return None
+    return get_chunk_engine()
 
 
 @lru_cache(maxsize=4)
@@ -163,6 +178,19 @@ def _should_require_auth() -> bool:
         return False
     if request.method == "OPTIONS":
         return False
+    if request.method == "GET":
+        if request.path in {"/", "/healthz"}:
+            return False
+        category_paths = (
+            "/api/v10/categories",
+            "/categories",
+            "/embedding/categories",
+        )
+        if any(
+            request.path == base or request.path.startswith(f"{base}/")
+            for base in category_paths
+        ):
+            return False
     if ALLOW_UNAUTH_CONTENT_INDEX and request.path in {
         "/api/v10/content/index",
         "/api/v10/content/index/fetcher",
@@ -413,6 +441,128 @@ def _category_entry_matches_slug(entry: dict | None, slug: str) -> bool:
     return _resolve_slug_from_category_entry(entry) == normalized_slug
 
 
+def _category_lookup_entry_id(entry: dict | None) -> int | None:
+    if not isinstance(entry, dict):
+        return None
+    raw_id = entry.get("id") or entry.get("_id") or entry.get("faiss_id")
+    try:
+        return int(raw_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _category_lookup_register(index: dict[str, set[int]], key: str | None, faiss_id: int) -> None:
+    normalized = str(key or "").strip()
+    if not normalized:
+        return
+    index.setdefault(normalized, set()).add(int(faiss_id))
+
+
+def _category_lookup_remove(faiss_id: int) -> None:
+    with category_lookup_lock:
+        for index in (category_external_id_index, category_slug_index):
+            empty_keys = []
+            for key, ids in index.items():
+                ids.discard(int(faiss_id))
+                if not ids:
+                    empty_keys.append(key)
+            for key in empty_keys:
+                index.pop(key, None)
+
+
+def _register_category_lookup_entry(entry: dict | None) -> None:
+    faiss_id = _category_lookup_entry_id(entry)
+    if faiss_id is None or not isinstance(entry, dict):
+        return
+    _category_lookup_remove(faiss_id)
+    with category_lookup_lock:
+        _category_lookup_register(
+            category_external_id_index,
+            entry.get("external_id") or entry.get("categoryId") or entry.get("externalId"),
+            faiss_id,
+        )
+        _category_lookup_register(
+            category_slug_index,
+            _resolve_slug_from_category_entry(entry),
+            faiss_id,
+        )
+
+
+def _rebuild_category_lookup_indexes() -> None:
+    external_index: dict[str, set[int]] = {}
+    slug_index: dict[str, set[int]] = {}
+    _, items = category_store.list_entries(offset=0, limit=None, simple_filter=None)
+    for item in items:
+        faiss_id = _category_lookup_entry_id(item)
+        if faiss_id is None:
+            continue
+        _category_lookup_register(
+            external_index,
+            item.get("external_id") or item.get("categoryId") or item.get("externalId"),
+            faiss_id,
+        )
+        _category_lookup_register(slug_index, _resolve_slug_from_category_entry(item), faiss_id)
+
+    with category_lookup_lock:
+        global category_external_id_index, category_slug_index
+        category_external_id_index = external_index
+        category_slug_index = slug_index
+
+
+def _category_ids_from_index(index: dict[str, set[int]], key: str) -> list[int]:
+    normalized = str(key or "").strip()
+    if not normalized:
+        return []
+    with category_lookup_lock:
+        ids = index.get(normalized, set())
+        return sorted(int(fid) for fid in ids)
+
+
+def _category_entries_match_filter(entry: dict, filter_arg: dict | None) -> bool:
+    if not filter_arg:
+        return True
+
+    metadata = entry.get("metadata") or {}
+    for key, value in filter_arg.items():
+        if key in {"external_id", "externalId"}:
+            if str(entry.get("external_id") or "").strip() != str(value).strip():
+                return False
+            continue
+        if key in {"companyId", "company_id", "companyid"}:
+            if str(entry.get("companyId") or "").strip() != str(value).strip():
+                return False
+            continue
+        if key in {"parentId", "parent_id", "parentid"}:
+            if str(metadata.get("parentId") or "").strip() != str(value).strip():
+                return False
+            continue
+        if key == "slug":
+            if _resolve_slug_from_category_entry(entry) != _normalize_slug(value):
+                return False
+            continue
+        if key.startswith("metadata."):
+            sub_key = key.split(".", 1)[1]
+            current = metadata.get(sub_key)
+            if sub_key in {"companyId", "company_id", "companyid"}:
+                current = entry.get("companyId") or current
+            elif sub_key in {"parentId", "parent_id", "parentid"}:
+                current = metadata.get("parentId")
+            if str(current) != str(value):
+                return False
+            continue
+        current = entry.get(key)
+        if current is None:
+            current = metadata.get(key)
+        if current is None and str(value).strip():
+            return False
+        if current is not None and str(current) != str(value):
+            return False
+    return True
+
+
+_rebuild_category_lookup_indexes()
+
+
 def _parse_filter_arg(raw_value):
     if raw_value is None:
         return None
@@ -438,6 +588,23 @@ def _should_use_external_id():
     return False
 
 
+def _should_include_category_attributes() -> bool:
+    raw_value = request.args.get("includeAttributes")
+    if raw_value is None:
+        raw_value = request.args.get("include_attributes")
+    if raw_value is None:
+        raw_value = request.args.get("brief")
+        if raw_value is not None:
+            return str(raw_value).strip().lower() in {"0", "false", "no", "off"}
+        return True
+    normalized = str(raw_value).strip().lower()
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    return True
+
+
 def _resolve_ids_for_identifier(target_store, identifier: str, use_external: bool):
     if use_external or not str(identifier).isdigit():
         ids = target_store.find_ids_by_external_id(str(identifier))
@@ -449,31 +616,21 @@ def _find_category_ids_by_slug(slug: str) -> list[int]:
     normalized_slug = _normalize_slug(slug)
     if not normalized_slug:
         return []
-
-    _, items = category_store.list_entries(offset=0, limit=None, simple_filter=None)
-    ids: list[int] = []
-    for item in items:
-        if _category_entry_matches_slug(item, normalized_slug):
-            item_id = item.get("id")
-            if item_id is None:
-                continue
-            try:
-                ids.append(int(item_id))
-            except (TypeError, ValueError):
-                continue
-    return ids
+    return _category_ids_from_index(category_slug_index, normalized_slug)
 
 
 def _resolve_category_ids_for_identifier(identifier: str, use_external: bool):
-    ids, id_kind = _resolve_ids_for_identifier(category_store, identifier, use_external)
-    if ids:
-        return ids, id_kind
+    normalized_identifier = str(identifier or "").strip()
+    if not normalized_identifier:
+        return [], "external_id"
 
-    slug_ids = _find_category_ids_by_slug(identifier)
-    if slug_ids:
-        return slug_ids, "slug"
+    if use_external or not normalized_identifier.isdigit():
+        ids = _category_ids_from_index(category_external_id_index, normalized_identifier)
+        if ids:
+            return ids, "external_id"
+        return _find_category_ids_by_slug(normalized_identifier), "slug"
 
-    return [], id_kind
+    return [int(normalized_identifier)], "id"
 
 
 def _safe_object_id(value):
@@ -602,7 +759,7 @@ def _map_category_entry_basic(entry: dict | None) -> dict | None:
 def _get_category_by_external_id(external_id: str | None):
     if not external_id:
         return None
-    ids = category_store.find_ids_by_external_id(str(external_id))
+    ids = _category_ids_from_index(category_external_id_index, str(external_id))
     for cid in ids:
         entry = category_store.get_entry(cid)
         if entry:
@@ -805,6 +962,7 @@ def _map_category_upsert_result(out: dict | None) -> dict:
             entry = category_store.get_entry(int(faiss_id))
             mapped = _map_category_entry(entry, include_parents=False, include_attributes=False)
             if mapped:
+                _register_category_lookup_entry(entry)
                 return mapped
         except Exception:
             pass
@@ -1000,7 +1158,7 @@ def _chunk_search_response(payload: dict):
         text = payload.get("text")
         if not text or not isinstance(text, str) or not text.strip():
             return jsonify({"error": "Provide either 'text' or 'vector'."}), 400
-        query_vec = chunk_engine.encode([text], batch_size=1)
+        query_vec = get_chunk_engine().encode([text], batch_size=1)
     else:
         arr = np.array(vector, dtype=np.float32)
         if arr.ndim == 1:
@@ -1011,11 +1169,11 @@ def _chunk_search_response(payload: dict):
 
     filters = payload.get("filter") or {}
     try:
-        scores, ids = chunk_engine.search(query_vec, k)
+        scores, ids = get_chunk_engine().search(query_vec, k)
     except RuntimeError:
         return jsonify({"results": []})
     except ValueError as exc:
-        index_obj = getattr(chunk_engine, "_index", None)
+        index_obj = getattr(get_chunk_engine(), "_index", None)
         index_dim = getattr(index_obj, "d", None)
         return (
             jsonify(
@@ -1023,7 +1181,7 @@ def _chunk_search_response(payload: dict):
                     "error": str(exc),
                     "hint": "Embedding dimension mismatch: ensure CHUNK_MODEL_NAME matches the model used to build the index.",
                     "index_path": CHUNK_INDEX_PATH,
-                    "model_name": getattr(chunk_engine, "model_name", None),
+                    "model_name": getattr(get_chunk_engine(), "model_name", None),
                     "index_dim": index_dim,
                     "query_dim": int(query_vec.shape[1]),
                 }
@@ -1119,19 +1277,26 @@ def _deactivate_index_state(company_id: str | None, document_id: str, state: str
 
 
 @app.route("/", methods=["GET"])
+@app.route("/healthz", methods=["GET"])
 def root():
     """Health check: returns basic status text and current FAISS index size."""
     general_size = int(store.index.ntotal) if store.index is not None else 0
-    try:
-        chunk_size = chunk_engine.count()
-    except Exception:
-        chunk_size = None
-    try:
-        chunk_index_dim = chunk_engine.index_dimension()
-        chunk_model_dim = chunk_engine.model_dimension()
-    except Exception:
-        chunk_index_dim = None
-        chunk_model_dim = None
+    chunk_engine = _get_cached_chunk_engine()
+    chunk_engine_loaded = chunk_engine is not None
+    chunk_size = None
+    chunk_index_dim = None
+    chunk_model_dim = None
+    if chunk_engine is not None:
+        try:
+            chunk_size = chunk_engine.count()
+        except Exception:
+            chunk_size = None
+        try:
+            chunk_index_dim = chunk_engine.index_dimension()
+            chunk_model_dim = chunk_engine.model_dimension()
+        except Exception:
+            chunk_index_dim = None
+            chunk_model_dim = None
     return jsonify(
         {
             "message": "tinnten-embedding up",
@@ -1141,6 +1306,7 @@ def root():
             "chunk_model_name": CHUNK_MODEL_NAME,
             "chunk_index_dim": chunk_index_dim,
             "chunk_model_dim": chunk_model_dim,
+            "chunk_engine_loaded": chunk_engine_loaded,
         }
     )
 
@@ -1416,20 +1582,31 @@ def list_categories():
     slug = request.args.get("slug")
     slug_filter = _normalize_slug(slug) if slug is not None else ""
 
-    query_offset = 0 if slug_filter else offset
-    query_limit = None if slug_filter else limit
+    if slug_filter:
+        candidate_ids = _category_ids_from_index(category_slug_index, slug_filter)
+        if candidate_ids:
+            items = []
+            for fid in candidate_ids:
+                entry = category_store.get_entry(fid)
+                if not entry:
+                    continue
+                if not _category_entries_match_filter(entry, filter_arg):
+                    continue
+                items.append(entry)
+            total = len(items)
+            if offset > 0:
+                items = items[offset:]
+            if limit is not None:
+                items = items[:limit]
+            mapped = [_map_category_entry(item) for item in items]
+            mapped = [m for m in mapped if m]
+            return jsonify({"total": total, "offset": offset, "limit": limit, "items": mapped})
+
     total, items = category_store.list_entries(
-        offset=query_offset,
-        limit=query_limit,
+        offset=offset,
+        limit=limit,
         simple_filter=filter_arg,
     )
-    if slug_filter:
-        items = [item for item in items if _category_entry_matches_slug(item, slug_filter)]
-        total = len(items)
-        if offset > 0:
-            items = items[offset:]
-        if limit is not None:
-            items = items[:limit]
     mapped = [_map_category_entry(item) for item in items]
     mapped = [m for m in mapped if m]
     return jsonify({"total": total, "offset": offset, "limit": limit, "items": mapped})
@@ -1594,12 +1771,13 @@ def get_category(category_id: str):
     if id_kind in {"external_id", "slug"}:
         entries = [category_store.get_entry(fid) for fid in ids]
         entries = [entry for entry in entries if entry]
+        include_attributes = _should_include_category_attributes()
         if len(entries) == 1:
-            mapped = _map_category_entry(entries[0], include_attributes=True)
+            mapped = _map_category_entry(entries[0], include_attributes=include_attributes)
             return jsonify(mapped)
         mapped = []
         for e in entries:
-            obj = _map_category_entry(e, include_attributes=True)
+            obj = _map_category_entry(e, include_attributes=include_attributes)
             if obj:
                 mapped.append(obj)
         return jsonify({"items": mapped, "count": len(mapped)})
@@ -1607,7 +1785,7 @@ def get_category(category_id: str):
     entry = category_store.get_entry(ids[0])
     if not entry:
         return jsonify({"error": "not_found"}), 404
-    mapped_entry = _map_category_entry(entry, include_attributes=True)
+    mapped_entry = _map_category_entry(entry, include_attributes=_should_include_category_attributes())
     return jsonify(mapped_entry)
 
 @app.route("/api/v10/categories/<category_id>", methods=["PUT", "PATCH"])
@@ -1697,6 +1875,8 @@ def delete_category(category_id: str):
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 500
 
+    for fid in ids:
+        _category_lookup_remove(int(fid))
     clean_external = [eid for eid in external_ids if eid is not None]
     _clear_category_lookup_cache()
     return jsonify({"removed": removed, "categoryIds": clean_external, "identifierType": id_kind})
@@ -2207,7 +2387,7 @@ def remove_document():
     if remove_mode == "hard":
         app.logger.info("Hard remove requested for documentId=%s faiss_ids=%s", doc_id_str, len(faiss_ids))
         try:
-            chunk_engine.remove_ids(faiss_ids)
+            get_chunk_engine().remove_ids(faiss_ids)
             faiss_removed = len(faiss_ids)
         except Exception as exc:  # noqa: BLE001
             _log_api_error(

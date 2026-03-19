@@ -3,7 +3,7 @@ flask-cors==4.0.0
 sentence-transformers==3.0.1  # Upgrade to a newer version
 transformers==4.41.2
 huggingface_hub==0.23.0
-torch==2.7.1
+torch==2.7.1+cpu
 scipy==1.14.1
 numpy==2.1.2
 pyarrow==17.0.0
