@@ -98,3 +98,59 @@ def test_get_category_by_slug_identifier(client, mocker):
     data = response.get_json()
     assert data["categoryId"] == "cat_7"
     assert data["slug"] == "smart-phone"
+
+
+def test_create_category_normalizes_localized_object_payload(client, mocker):
+    created_entry = {
+        "id": 11,
+        "external_id": "cat_11",
+        "text": "Ev ve Yasam",
+        "companyId": None,
+        "metadata": {"slug": "ev-ve-yasam"},
+    }
+    upsert_mock = mocker.patch(
+        "app.category_store.upsert_vector",
+        return_value={"id": 11, "external_id": "cat_11"},
+    )
+    mocker.patch("app.category_store.get_entry", return_value=created_entry)
+    mocker.patch("app.category_store.list_entries", return_value=(0, []))
+
+    response = client.post(
+        "/api/v10/categories",
+        json={
+            "text": {"tr": "Ev ve Yasam"},
+            "name": {"tr": "Ev ve Yasam"},
+            "label": {"tr": "Ev ve Yasam"},
+            "slug": {"tr": "Ev ve Yasam"},
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["text"] == "Ev ve Yasam"
+    assert data["slug"] == "ev-ve-yasam"
+    upsert_mock.assert_called_once()
+    assert upsert_mock.call_args.args[0] == "Ev ve Yasam"
+    assert upsert_mock.call_args.args[3]["label"] == "Ev ve Yasam"
+    assert upsert_mock.call_args.args[3]["slug"] == "ev-ve-yasam"
+
+
+def test_get_category_normalizes_placeholder_fields_to_safe_fallback(client, mocker):
+    broken_entry = {
+        "id": 6,
+        "external_id": "5f9454e7-f655-4388-a011-1a9ff984360e",
+        "text": "[object Object]",
+        "companyId": None,
+        "metadata": {"slug": "object-object", "parentId": None},
+    }
+    mocker.patch("app.category_store.find_ids_by_external_id", return_value=[6])
+    mocker.patch("app.category_store.get_entry", return_value=broken_entry)
+    mocker.patch("app.attribute_store.list_entries", return_value=(0, []))
+
+    response = client.get("/api/v10/categories/5f9454e7-f655-4388-a011-1a9ff984360e")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["categoryId"] == "5f9454e7-f655-4388-a011-1a9ff984360e"
+    assert data["text"] == "5f9454e7-f655-4388-a011-1a9ff984360e"
+    assert data["slug"] == "5f9454e7-f655-4388-a011-1a9ff984360e"

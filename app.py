@@ -446,8 +446,78 @@ def _coerce_bool(value, default: bool = False) -> bool:
     return bool(value)
 
 
+def _is_invalid_object_placeholder(value) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return True
+    normalized = raw.lower()
+    return raw == "[object Object]" or normalized == "object-object"
+
+
+def _extract_display_text(value, visited: set[int] | None = None) -> str:
+    if value is None:
+        return ""
+
+    if isinstance(value, (str, int, float, bool)):
+        normalized = str(value).strip()
+        return "" if _is_invalid_object_placeholder(normalized) else normalized
+
+    if visited is None:
+        visited = set()
+
+    value_id = id(value)
+    if value_id in visited:
+        return ""
+    visited.add(value_id)
+
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            normalized = _extract_display_text(item, visited)
+            if normalized:
+                return normalized
+        return ""
+
+    if isinstance(value, dict):
+        preferred_keys = (
+            "tr",
+            "TR",
+            "name",
+            "text",
+            "title",
+            "label",
+            "value",
+            "displayName",
+            "display",
+            "slug",
+            "en",
+            "EN",
+        )
+        for key in preferred_keys:
+            if key not in value:
+                continue
+            normalized = _extract_display_text(value.get(key), visited)
+            if normalized:
+                return normalized
+
+        nested_keys = ("metadata", "translation", "translations", "item")
+        for key in nested_keys:
+            nested = value.get(key)
+            normalized = _extract_display_text(nested, visited)
+            if normalized:
+                return normalized
+
+        for nested in value.values():
+            normalized = _extract_display_text(nested, visited)
+            if normalized:
+                return normalized
+        return ""
+
+    normalized = str(value).strip()
+    return "" if _is_invalid_object_placeholder(normalized) else normalized
+
+
 def _normalize_slug(value) -> str:
-    raw = str(value or "").strip().lower()
+    raw = _extract_display_text(value).lower()
     if not raw:
         return ""
     slug = re.sub(r"[^a-z0-9\s-]", "", raw)
@@ -727,11 +797,34 @@ def _normalize_category_payload(payload: dict) -> dict:
     if parent_id is not None:
         meta_payload["parentId"] = str(parent_id)
 
-    description = payload.get("description") or payload.get("desc")
-    if description is not None:
-        meta_payload["description"] = str(description)
+    resolved_text = _extract_display_text(
+        payload.get("text")
+        or payload.get("name")
+        or payload.get("title")
+        or payload.get("label")
+        or meta_payload.get("label")
+        or meta_payload.get("name")
+        or meta_payload.get("text")
+    )
+    if not resolved_text:
+        raise ValueError("category text must be a non-empty string")
 
-    slug = payload.get("slug") or meta_payload.get("slug")
+    payload["text"] = resolved_text
+    payload["name"] = _extract_display_text(payload.get("name")) or resolved_text
+    payload["title"] = _extract_display_text(payload.get("title")) or payload["name"]
+    meta_payload["label"] = _extract_display_text(payload.get("label") or meta_payload.get("label")) or payload["name"]
+
+    description = _extract_display_text(
+        payload.get("description")
+        or payload.get("desc")
+        or meta_payload.get("description")
+    )
+    if description:
+        meta_payload["description"] = description
+    else:
+        meta_payload.pop("description", None)
+
+    slug = payload.get("slug") or meta_payload.get("slug") or resolved_text
     normalized_slug = _normalize_slug(slug)
     if normalized_slug:
         payload["slug"] = normalized_slug
@@ -758,17 +851,28 @@ def _map_category_entry_basic(entry: dict | None) -> dict | None:
         return None
     metadata = dict(entry.get("metadata") or {})
     external_id = entry.get("external_id")
-    text_value = entry.get("text")
-    name_value = (
+    fallback_id = str(external_id or "").strip() or None
+    text_value = _extract_display_text(
+        entry.get("text")
+        or entry.get("name")
+        or entry.get("title")
+        or metadata.get("text")
+        or metadata.get("name")
+        or metadata.get("label")
+    ) or fallback_id
+    name_value = _extract_display_text(
         entry.get("name")
         or entry.get("title")
         or metadata.get("name")
         or metadata.get("label")
         or text_value
-    )
+    ) or text_value
+    label_value = _extract_display_text(entry.get("label") or metadata.get("label")) or name_value
     slug = _resolve_slug_from_category_entry(entry)
     if slug:
         metadata["slug"] = slug
+    elif fallback_id:
+        slug = _normalize_slug(fallback_id)
     out = {
         "categoryId": external_id,
         "id": external_id,
@@ -776,7 +880,7 @@ def _map_category_entry_basic(entry: dict | None) -> dict | None:
         "text": text_value,
         "name": name_value,
         "title": name_value,
-        "label": metadata.get("label") or name_value,
+        "label": label_value,
         "companyId": entry.get("companyId"),
         "description": metadata.get("description"),
         "metadata": metadata,
@@ -840,10 +944,12 @@ def _map_category_entry(entry: dict | None, include_parents: bool = True, includ
         if parents:
             base["parents"] = parents
         path_parts = [p.get("text") for p in (parents or []) if p.get("text")]
-        if entry and entry.get("text"):
-            path_parts.append(entry.get("text"))
+        if base.get("text"):
+            path_parts.append(base.get("text"))
         if path_parts:
-            base["parentPath"] = ".".join(path_parts)
+            base["path"] = path_parts
+        if len(path_parts) > 1:
+            base["parentPath"] = ".".join(path_parts[:-1])
 
     if include_attributes:
         base["attributes"] = _fetch_attributes_for_category(base.get("categoryId"), base.get("companyId"), entry)
@@ -1857,6 +1963,16 @@ def update_category(category_id: str):
             return jsonify({"error": reason}), status
     
     payload["id"] = payload.get("id") or resolved_id
+    if not _extract_display_text(
+        payload.get("text")
+        or payload.get("name")
+        or payload.get("title")
+        or payload.get("label")
+    ):
+        payload["text"] = existing_entry.get("text")
+        existing_metadata = existing_entry.get("metadata") or {}
+        if not payload.get("slug") and not (payload.get("metadata") or {}).get("slug"):
+            payload["slug"] = existing_metadata.get("slug") or existing_entry.get("slug")
     try:
         payload = _normalize_category_payload(payload)
     except ValueError as exc:
