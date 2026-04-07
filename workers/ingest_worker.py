@@ -759,6 +759,28 @@ class IngestWorker:
         if source_type in {"fetcher_crawl", "crawler", "fetcher"}:
             return self._load_fetcher_crawl_text(resolved_source, metadata, context)
 
+        if source_type == "library_import":
+            s3_key = (
+                metadata.get("s3Key")
+                or resolved_source.get("s3Key")
+                or (resolved_source.get("metadata") or {}).get("s3Key")
+            )
+            if not s3_key:
+                raise ValueError("library_import source missing s3Key")
+            bucket = os.getenv("S3_BUCKET", os.getenv("AWS_S3_BUCKET", "tinnten-cdn"))
+            try:
+                from init.aws import get_s3_client
+                obj = get_s3_client().get_object(Bucket=bucket, Key=s3_key)
+                text = obj["Body"].read().decode("utf-8")
+            except Exception as exc:
+                raise RuntimeError(f"S3 read failed for library_import: {s3_key}: {exc}") from exc
+            url = resolved_source.get("url") or metadata.get("url")
+            if url:
+                metadata.setdefault("url", url)
+            metadata.setdefault("contentType", "text/markdown")
+            logger.info("[IngestWorker] library_import S3'ten okundu: %s (%d chars)", s3_key, len(text))
+            return text, metadata
+
         if source_type in {"import_url", "url", "web"}:
             url = resolved_source.get("url")
             if not url:
@@ -1677,7 +1699,18 @@ class IngestWorker:
         except requests.RequestException as exc:  # noqa: BLE001
             raise RuntimeError(f"Failed to fetch URL {url}: {exc}") from exc
         content_type = response.headers.get("Content-Type") or response.headers.get("content-type")
-        return response.text, content_type
+        text = response.text
+
+        # HTML icerik gelirse markdown_clean'e donustur
+        if content_type and "html" in content_type.lower():
+            try:
+                from services.html_to_markdown import html_to_clean_markdown
+                text = html_to_clean_markdown(text, url=url)
+                logger.info("[IngestWorker] HTML -> markdown_clean donusumu yapildi: %s", url)
+            except Exception as md_err:
+                logger.warning("[IngestWorker] HTML->markdown donusumu basarisiz, ham metin kullaniliyor: %s", md_err)
+
+        return text, content_type
 
     def _initial_stats(self, options: Dict[str, Any]) -> Dict[str, Any]:
         return {
