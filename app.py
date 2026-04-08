@@ -133,23 +133,15 @@ store = EmbeddingIndex(
     index_path=GENERAL_INDEX_PATH,
     meta_path=GENERAL_META_PATH,
 )
-category_meta_repo = MetaRepository(db_name=CATEGORY_META_DB_NAME, collection=CATEGORY_META_COLLECTION)
-category_store = EmbeddingIndex(
-    model_name=CATEGORY_MODEL_NAME,
-    index_path=CATEGORY_INDEX_PATH,
-    meta_path=CATEGORY_META_PATH,
-    meta_repo=category_meta_repo,
-)
+# [DEVRE DIŞI] Kategori ve attribute FAISS store'ları kaldırıldı.
+# Kategoriler ve attribute'lar artık ana DB + ES üzerinden yönetilecek.
+category_meta_repo = None
+category_store = None
 category_lookup_lock = RLock()
 category_external_id_index: dict[str, set[int]] = {}
 category_slug_index: dict[str, set[int]] = {}
-attribute_meta_repo = MetaRepository(db_name=ATTRIBUTE_META_DB_NAME, collection=ATTRIBUTE_META_COLLECTION)
-attribute_store = EmbeddingIndex(
-    model_name=ATTRIBUTE_MODEL_NAME,
-    index_path=ATTRIBUTE_INDEX_PATH,
-    meta_path=ATTRIBUTE_META_PATH,
-    meta_repo=attribute_meta_repo,
-)
+attribute_meta_repo = None
+attribute_store = None
 upload_store = UploadStore()
 document_loader = DocumentLoader()
 content_store = ContentDocumentStore()
@@ -186,8 +178,7 @@ def warmup_embedding_models() -> None:
         logger.info("Startup model warmup started.")
         warmup_steps = (
             ("general_store", store.warmup_model),
-            ("category_store", category_store.warmup_model),
-            ("attribute_store", attribute_store.warmup_model),
+            # [DEVRE DIŞI] category_store ve attribute_store kaldırıldı
             ("chunk_engine", get_chunk_engine),
         )
         for name, loader in warmup_steps:
@@ -591,6 +582,9 @@ def _register_category_lookup_entry(entry: dict | None) -> None:
 
 
 def _rebuild_category_lookup_indexes() -> None:
+    # [DEVRE DIŞI] category_store kaldırıldı
+    if category_store is None:
+        return
     external_index: dict[str, set[int]] = {}
     slug_index: dict[str, set[int]] = {}
     _, items = category_store.list_entries(offset=0, limit=None, simple_filter=None)
