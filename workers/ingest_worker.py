@@ -778,7 +778,7 @@ class IngestWorker:
             if url:
                 metadata.setdefault("url", url)
             metadata.setdefault("contentType", "text/markdown")
-            logger.info("[IngestWorker] library_import S3'ten okundu: %s (%d chars)", s3_key, len(text))
+            print(f"[ingest-worker] library_import S3'ten okundu: {s3_key} ({len(text)} chars)")
             return text, metadata
 
         if source_type in {"import_url", "url", "web"}:
@@ -1706,9 +1706,9 @@ class IngestWorker:
             try:
                 from services.html_to_markdown import html_to_clean_markdown
                 text = html_to_clean_markdown(text, url=url)
-                logger.info("[IngestWorker] HTML -> markdown_clean donusumu yapildi: %s", url)
+                print(f"[ingest-worker] HTML -> markdown_clean donusumu yapildi: {url}")
             except Exception as md_err:
-                logger.warning("[IngestWorker] HTML->markdown donusumu basarisiz, ham metin kullaniliyor: %s", md_err)
+                print(f"[ingest-worker] HTML->markdown donusumu basarisiz, ham metin kullaniliyor: {md_err}")
 
         return text, content_type
 

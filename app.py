@@ -2638,9 +2638,7 @@ def _publish_content_index_message(
 
 def _queue_content_index_payload(payload: dict, *, default_trigger: str) -> tuple:
     company_id = _get_payload_value(payload, "companyId", "company_id", "companyid")
-    if not company_id:
-        return jsonify({"error": "companyId is required"}), 400
-    company_id = str(company_id)
+    company_id = str(company_id) if company_id else None
 
     document_id = _get_payload_value(payload, "documentId", "document_id", "documentid")
     if document_id:
