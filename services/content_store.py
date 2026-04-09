@@ -186,21 +186,27 @@ class ContentDocumentStore:
                     documents[key] = doc
         return documents
 
-    def get_document(self, company_id: str, document_id: str) -> Optional[Dict[str, Any]]:
+    def get_document(self, company_id: Optional[str], document_id: str) -> Optional[Dict[str, Any]]:
         doc_id_str = str(document_id)
-        company_obj = _safe_object_id(company_id)
         doc_obj = _safe_object_id(doc_id_str)
 
-        company_filters: List[Dict[str, Any]] = [{"companyId": company_id}, {"companyid": company_id}]
-        if company_obj is not None:
-            company_filters.extend([{"companyId": company_obj}, {"companyid": company_obj}])
+        if company_id:
+            company_obj = _safe_object_id(company_id)
+            company_filters: List[Dict[str, Any]] = [{"companyId": company_id}, {"companyid": company_id}]
+            if company_obj is not None:
+                company_filters.extend([{"companyId": company_obj}, {"companyid": company_obj}])
 
-        selectors: List[Dict[str, Any]] = [
-            {"$and": [{"$or": company_filters}, {"documentId": doc_id_str}]},
-        ]
-        if doc_obj is not None:
-            selectors.append({"$and": [{"$or": company_filters}, {"documentId": doc_obj}]})
-            selectors.append({"$and": [{"$or": company_filters}, {"_id": doc_obj}]})
+            selectors: List[Dict[str, Any]] = [
+                {"$and": [{"$or": company_filters}, {"documentId": doc_id_str}]},
+            ]
+            if doc_obj is not None:
+                selectors.append({"$and": [{"$or": company_filters}, {"documentId": doc_obj}]})
+                selectors.append({"$and": [{"$or": company_filters}, {"_id": doc_obj}]})
+        else:
+            selectors = [{"documentId": doc_id_str}]
+            if doc_obj is not None:
+                selectors.append({"documentId": doc_obj})
+                selectors.append({"_id": doc_obj})
 
         return self.documents.find_one({"$or": selectors})
 
@@ -246,18 +252,33 @@ class ContentDocumentStore:
             for key, value in extra_updates.items():
                 updates[key] = value
 
+        # companyId opsiyonel — personal documents için company_id=None olabilir
+        if company_id:
+            query = {"companyId": company_id, "documentId": document_id}
+        else:
+            query = {"documentId": document_id}
+
         result = self.documents.find_one_and_update(
-            {"companyId": company_id, "documentId": document_id},
+            query,
             {"$set": updates},
             return_document=ReturnDocument.AFTER,
             session=session,
         )
-        if result is None:
+        if result is None and company_id:
             company_obj = _safe_object_id(company_id) or company_id
             doc_obj = _safe_object_id(document_id)
             if doc_obj:
                 result = self.documents.find_one_and_update(
                     {"companyid": company_obj, "_id": doc_obj},
+                    {"$set": updates},
+                    return_document=ReturnDocument.AFTER,
+                    session=session,
+                )
+        if result is None:
+            doc_obj = _safe_object_id(document_id)
+            if doc_obj:
+                result = self.documents.find_one_and_update(
+                    {"_id": doc_obj},
                     {"$set": updates},
                     return_document=ReturnDocument.AFTER,
                     session=session,

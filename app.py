@@ -738,7 +738,8 @@ def _safe_object_id(value):
 
 def _validate_company_user(company_id: str | None, user_id: str | None):
     if not company_id:
-        return False, "companyId is required"
+        # companyId opsiyonel — personal kullanıcılar için
+        return True, None
     if not user_id:
         return False, "userId is required"
 
@@ -1394,8 +1395,6 @@ def _short_text_for_log(text: str | None, max_len: int = 160) -> str:
 
 
 def _deactivate_index_state(company_id: str | None, document_id: str, state: str) -> None:
-    if not company_id:
-        return
     try:
         content_store.update_index_fields(
             company_id=company_id,
