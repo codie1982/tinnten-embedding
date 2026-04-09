@@ -1636,6 +1636,7 @@ def search_web_index():
 @app.route("/api/v10/categories/upsert", methods=["POST"])
 def upsert_category_vector():
     """
+    [DEPRECATED] category_store devre disi. Bu endpoint artik kullanilmiyor.
     Insert or update a category vector in its dedicated FAISS index.
 
     JSON body:
@@ -1666,6 +1667,7 @@ def upsert_category_vector():
 @app.route("/api/v10/categories/search", methods=["POST"])
 def search_category_vector():
     """
+    [DEPRECATED] category_store devre disi. Bu endpoint artik kullanilmiyor.
     Run a similarity search on the category FAISS index.
     """
     return _vector_search_response(category_store, label="category search", transform=_map_category_entry)
@@ -1674,6 +1676,7 @@ def search_category_vector():
 @app.route("/categories", methods=["GET"])
 @app.route("/embedding/categories", methods=["GET"])
 def list_categories():
+    """[DEPRECATED] category_store devre disi. Bu endpoint artik kullanilmiyor."""
     limit = _parse_int(request.args.get("limit"), 100, minimum=0)
     offset = _parse_int(request.args.get("offset"), 0, minimum=0)
     filter_arg = _parse_filter_arg(request.args.get("filter"))
@@ -1745,6 +1748,7 @@ def list_categories():
 @app.route("/api/v10/categories/stats", methods=["GET"])
 def category_stats():
     """
+    [DEPRECATED] category_store devre disi. Bu endpoint artik kullanilmiyor.
     Category stats endpoint.
     Compatible with legacy shape and extended with additional breakdowns.
     """
@@ -1851,6 +1855,7 @@ def category_stats():
 @app.route("/categories", methods=["POST"])
 @app.route("/embedding/categories", methods=["POST"])
 def create_category():
+    """[DEPRECATED] category_store devre disi. Bu endpoint artik kullanilmiyor."""
     payload = request.get_json() or {}
     
     # companyId zorunluluğu
@@ -1891,6 +1896,7 @@ def create_category():
 @app.route("/categories/<category_id>", methods=["GET"])
 @app.route("/embedding/categories/<category_id>", methods=["GET"])
 def get_category(category_id: str):
+    """[DEPRECATED] category_store devre disi. Bu endpoint artik kullanilmiyor."""
     if not category_id:
         return jsonify({"error": "category_id is required"}), 400
 
@@ -1923,6 +1929,7 @@ def get_category(category_id: str):
 @app.route("/categories/<category_id>", methods=["PUT", "PATCH"])
 @app.route("/embedding/categories/<category_id>", methods=["PUT", "PATCH"])
 def update_category(category_id: str):
+    """[DEPRECATED] category_store devre disi. Bu endpoint artik kullanilmiyor."""
     if not category_id:
         return jsonify({"error": "category_id is required"}), 400
 
@@ -1981,6 +1988,7 @@ def update_category(category_id: str):
 @app.route("/categories/<category_id>", methods=["DELETE"])
 @app.route("/embedding/categories/<category_id>", methods=["DELETE"])
 def delete_category(category_id: str):
+    """[DEPRECATED] category_store devre disi. Bu endpoint artik kullanilmiyor."""
     if not category_id:
         return jsonify({"error": "category_id is required"}), 400
 
@@ -2026,6 +2034,7 @@ def delete_category(category_id: str):
 @app.route("/api/v10/attributes/upsert", methods=["POST"])
 def upsert_attribute_vector():
     """
+    [DEPRECATED] attribute_store devre disi. Bu endpoint artik kullanilmiyor.
     Insert or update an attribute vector in its dedicated FAISS index.
 
     JSON body:
@@ -2056,12 +2065,14 @@ def upsert_attribute_vector():
 @app.route("/api/v10/attributes/search", methods=["POST"])
 def search_attribute_vector():
     """
+    [DEPRECATED] attribute_store devre disi. Bu endpoint artik kullanilmiyor.
     Run a similarity search on the attribute FAISS index.
     """
     return _vector_search_response(attribute_store, label="attribute search", transform=_map_attribute_entry)
 
 @app.route("/api/v10/attributes", methods=["GET"])
 def list_attributes():
+    """[DEPRECATED] attribute_store devre disi. Bu endpoint artik kullanilmiyor."""
     limit = _parse_int(request.args.get("limit"), 100, minimum=0)
     offset = _parse_int(request.args.get("offset"), 0, minimum=0)
     filter_arg = _parse_filter_arg(request.args.get("filter"))
@@ -2107,6 +2118,7 @@ def list_attributes():
 
 @app.route("/api/v10/attributes", methods=["POST"])
 def create_attribute():
+    """[DEPRECATED] attribute_store devre disi. Bu endpoint artik kullanilmiyor."""
     payload = request.get_json() or {}
     
     # companyId zorunluluğu
@@ -2146,6 +2158,7 @@ def create_attribute():
 
 @app.route("/api/v10/attributes/<attribute_id>", methods=["GET"])
 def get_attribute(attribute_id: str):
+    """[DEPRECATED] attribute_store devre disi. Bu endpoint artik kullanilmiyor."""
     if not attribute_id:
         return jsonify({"error": "attribute_id is required"}), 400
 
@@ -2170,6 +2183,7 @@ def get_attribute(attribute_id: str):
 
 @app.route("/api/v10/attributes/<attribute_id>", methods=["PUT", "PATCH"])
 def update_attribute(attribute_id: str):
+    """[DEPRECATED] attribute_store devre disi. Bu endpoint artik kullanilmiyor."""
     if not attribute_id:
         return jsonify({"error": "attribute_id is required"}), 400
 
@@ -2216,6 +2230,7 @@ def update_attribute(attribute_id: str):
 
 @app.route("/api/v10/attributes/<attribute_id>", methods=["DELETE"])
 def delete_attribute(attribute_id: str):
+    """[DEPRECATED] attribute_store devre disi. Bu endpoint artik kullanilmiyor."""
     if not attribute_id:
         return jsonify({"error": "attribute_id is required"}), 400
 
