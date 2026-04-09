@@ -369,8 +369,7 @@ class IngestWorker:
 
     def _process_content_index_message(self, payload: Dict[str, Any]) -> None:
         company_id = self._coalesce(payload, "companyId", "company_id", "companyid")
-        if not company_id:
-            raise ValueError("payload missing companyId")
+        company_id = str(company_id) if company_id else None
 
         document_ids_raw = self._coalesce(payload, "documentIds", "document_ids", "documentids")
         if document_ids_raw is None:

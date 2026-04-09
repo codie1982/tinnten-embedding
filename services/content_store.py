@@ -146,28 +146,29 @@ class ContentDocumentStore:
     # ------------------------------------------------------------------
     def get_documents(
         self,
-        company_id: str,
+        company_id: Optional[str],
         document_ids: Sequence[str],
         *,
         projection: Optional[MutableMapping[str, int]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """
         Fetch documents by company/document id pair and return a mapping keyed by documentId.
+        If company_id is None, skip company filter (personal library).
         """
         if not document_ids:
             return {}
         doc_ids = [str(doc_id) for doc_id in document_ids]
         documents: Dict[str, Dict[str, Any]] = {}
 
-        company_obj = _safe_object_id(company_id)
-        company_filters: List[Dict[str, Any]] = [{"companyId": company_id}, {"companyid": company_id}]
-        if company_obj is not None:
-            company_filters.extend([{"companyId": company_obj}, {"companyid": company_obj}])
+        base_filter: Dict[str, Any] = {"documentId": {"$in": doc_ids}}
+        if company_id:
+            company_obj = _safe_object_id(company_id)
+            company_filters: List[Dict[str, Any]] = [{"companyId": company_id}, {"companyid": company_id}]
+            if company_obj is not None:
+                company_filters.extend([{"companyId": company_obj}, {"companyid": company_obj}])
+            base_filter = {"$and": [{"$or": company_filters}, base_filter]}
 
-        cursor = self.documents.find(
-            {"$and": [{"$or": company_filters}, {"documentId": {"$in": doc_ids}}]},
-            projection,
-        )
+        cursor = self.documents.find(base_filter, projection)
         for doc in cursor:
             key = str(doc.get("documentId") or doc.get("_id"))
             documents[key] = doc
