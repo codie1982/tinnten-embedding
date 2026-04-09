@@ -781,6 +781,23 @@ class IngestWorker:
             print(f"[ingest-worker] library_import S3'ten okundu: {s3_key} ({len(text)} chars)")
             return text, metadata
 
+        if source_type == "local_file":
+            local_path = (
+                resolved_source.get("localPath")
+                or (resolved_source.get("metadata") or {}).get("localPath")
+                or metadata.get("localPath")
+            )
+            if not local_path:
+                raise ValueError("local_file source missing localPath")
+            loader = self._get_loader()
+            document = loader.fetch_text(local_path, bucket=None, local=True)
+            metadata.setdefault("localPath", local_path)
+            metadata.setdefault("filename", os.path.basename(local_path))
+            if document.content_type:
+                metadata.setdefault("contentType", document.content_type)
+            log("local_file okundu: %s (%d chars)", local_path, len(document.text))
+            return document.text, metadata
+
         if source_type in {"import_url", "url", "web"}:
             url = resolved_source.get("url")
             if not url:

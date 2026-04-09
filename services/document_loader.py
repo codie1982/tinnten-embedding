@@ -86,10 +86,13 @@ class DocumentLoader:
         self.bucket = bucket or cfg.bucket
         self.client = get_s3_client()
 
-    def fetch_text(self, key: str, *, bucket: Optional[str] = None) -> DocumentContent:
+    def fetch_text(self, key: str, *, bucket: Optional[str] = None, local: bool = False) -> DocumentContent:
         """
-        Download a document from S3 and return its textual contents.
+        Download a document from S3 (or read from local filesystem) and return its textual contents.
         """
+        if local:
+            return self._fetch_local(key)
+
         target_bucket = bucket or self.bucket
         try:
             response = self.client.get_object(Bucket=target_bucket, Key=key)
@@ -101,6 +104,27 @@ class DocumentLoader:
         filename = Path(key).name or key
         text = self._extract_text(data, filename, content_type)
         return DocumentContent(bucket=target_bucket, key=key, filename=filename, content_type=content_type, text=text)
+
+    def _fetch_local(self, file_path: str) -> DocumentContent:
+        """Read a document from local filesystem and extract text."""
+        try:
+            with open(file_path, "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            raise DocumentDownloadError(f"Failed to read local file {file_path!r}: {exc}") from exc
+
+        filename = Path(file_path).name
+        suffix = Path(filename).suffix.lower()
+        content_type = {
+            ".pdf": "application/pdf",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ".html": "text/html", ".htm": "text/html",
+            ".csv": "text/csv", ".txt": "text/plain", ".md": "text/markdown", ".json": "application/json",
+        }.get(suffix)
+        text = self._extract_text(data, filename, content_type)
+        return DocumentContent(bucket="local", key=file_path, filename=filename, content_type=content_type, text=text)
 
     # ------------------------------------------------------------------
     # Text extraction helpers
