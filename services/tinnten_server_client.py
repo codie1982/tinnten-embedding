@@ -54,6 +54,58 @@ class TinntenServerClient:
             return None
         return data
 
+    def update_document_index_state(
+        self,
+        document_id: str,
+        state: str,
+        *,
+        error_msg: str | None = None,
+        stats: dict | None = None,
+        company_id: str | None = None,
+    ) -> bool:
+        """Notify tinnten-server of a document index state change.
+
+        Maps embedding-service states to tinnten-server states:
+          completed → indexed
+          failed    → error
+          indexing  → indexing
+        Returns True on success, False on soft failure (caller should not crash).
+        """
+        if not self.base_url:
+            return False
+
+        # Map embedding service state names to tinnten-server enum values
+        state_map = {
+            "completed": "indexed",
+            "failed": "error",
+            "indexing": "indexing",
+            "queued": "queued",
+        }
+        mapped_state = state_map.get(state, state)
+
+        body = {"state": mapped_state}
+        if error_msg:
+            body["errorMsg"] = error_msg
+        if stats and isinstance(stats, dict):
+            body["stats"] = {
+                "chunks": int(stats.get("chunkCount") or stats.get("chunks") or 0),
+                "tokens": int(stats.get("tokenCount") or stats.get("tokens") or 0),
+            }
+        if company_id:
+            body["companyid"] = company_id
+
+        try:
+            url = f"{self.base_url}/api/v10/internal/content/documents/{document_id}/index-state"
+            response = requests.patch(
+                url,
+                json=body,
+                headers=self._build_headers(),
+                timeout=self.timeout,
+            )
+            return response.status_code < 400
+        except Exception:
+            return False
+
 
 _tinnten_server_client = None
 

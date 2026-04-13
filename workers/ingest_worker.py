@@ -44,6 +44,7 @@ from services.fetcher_store import FetcherStore
 from services.document_loader import DocumentDownloadError, DocumentParseError
 from services.email_queue_events import EmbeddingEmailEvents
 from services.error_logger import EmbeddingErrorLogger
+from services.tinnten_server_client import get_tinnten_server_client
 from init.aws import get_s3_client
 
 
@@ -1662,6 +1663,21 @@ class IngestWorker:
         )
         if storage_pref is not None:
             resolved["storagePreference"] = storage_pref
+
+        # Propagate localPath for local_file sources
+        local_path_val = (
+            source_info.get("localPath")
+            or source_info.get("local_path")
+            or payload_section.get("localPath")
+            or payload_section.get("local_path")
+            or document.get("localPath")
+            or document.get("local_path")
+            or metadata.get("localPath")
+            or metadata.get("local_path")
+        )
+        if local_path_val:
+            resolved["localPath"] = str(local_path_val)
+
         return resolved
 
     @staticmethod
@@ -1790,6 +1806,22 @@ class IngestWorker:
             self._get_content_store().update_index_fields(**update_kwargs)
         except Exception as exc:  # noqa: BLE001
             log(f"Failed to update index state for {context.document_id}: {exc}")
+
+        # Notify tinnten-server so it can sync its own contentdocuments record
+        if state in ("completed", "failed", "indexing"):
+            try:
+                server_client = get_tinnten_server_client()
+                stats_payload = None if stats is UPDATE_UNSET else stats
+                error_msg = None if error is UPDATE_UNSET else (str(error) if error else None)
+                server_client.update_document_index_state(
+                    document_id=context.document_id,
+                    state=state,
+                    error_msg=error_msg,
+                    stats=stats_payload if isinstance(stats_payload, dict) else None,
+                    company_id=context.company_id,
+                )
+            except Exception as cb_exc:  # noqa: BLE001
+                log(f"[callback] Failed to notify tinnten-server for {context.document_id}: {cb_exc}")
 
     def _notify_index_failure(
         self,
