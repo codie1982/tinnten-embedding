@@ -1227,10 +1227,15 @@ def _passes_chunk_filters(chunk: dict, filters: dict) -> bool:
     for key, val in (filters or {}).items():
         if key.startswith("metadata."):
             sub = key.split(".", 1)[1]
-            if (chunk.get("metadata") or {}).get(sub) != val:
+            chunk_val = (chunk.get("metadata") or {}).get(sub)
+        else:
+            chunk_val = chunk.get(key)
+
+        if isinstance(val, dict) and "$in" in val:
+            if chunk_val not in val["$in"]:
                 return False
         else:
-            if chunk.get(key) != val:
+            if chunk_val != val:
                 return False
     return True
 
