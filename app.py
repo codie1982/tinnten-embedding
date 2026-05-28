@@ -2513,17 +2513,21 @@ def remove_document():
     """
     Remove a document from content search.
 
-    Default mode is `soft`:
-    - does NOT mutate FAISS
-    - removes chunk metadata from Mongo
-    - marks document/index state as removed
-
-    Optional hard mode (`mode=hard` in query/body) also removes FAISS IDs.
+    Modes:
+        soft       — keep FAISS vectors, delete chunk metadata, mark removed.
+                     (FAISS IDs accumulate as `pending_faiss_ids`; a janitor
+                     job is expected to sweep them later.)
+        deactivate — remove FAISS vectors so the doc no longer appears in
+                     semantic search, but keep chunk metadata in Mongo for
+                     audit/history. This is the right choice when a user
+                     "deletes" a tracked website from their dashboard.
+        hard       — remove FAISS vectors AND chunk metadata. Use for full
+                     cleanup (e.g. GDPR erasure).
 
     JSON body:
         documentId (str, required)
         companyId (str, optional): Used to update contentdocuments.index.state
-        mode (str, optional): soft|hard
+        mode (str, optional): soft|deactivate|hard
     """
     payload = request.get_json() or {}
     document_id = _get_payload_value(payload, "documentId", "document_id", "documentid")
@@ -2537,22 +2541,30 @@ def remove_document():
         or CONTENT_REMOVE_MODE
     )
     remove_mode = str(raw_mode or "").strip().lower()
-    if remove_mode not in {"soft", "hard"}:
-        return jsonify({"error": "mode must be one of: soft, hard"}), 400
+    if remove_mode not in {"soft", "deactivate", "hard"}:
+        return jsonify({"error": "mode must be one of: soft, deactivate, hard"}), 400
 
     doc_id_str = str(document_id)
     chunks = chunk_store.get_chunks_by_doc(doc_id_str)
     faiss_ids = sorted({int(c["faiss_id"]) for c in chunks if "faiss_id" in c})
 
+    should_remove_faiss = remove_mode in {"hard", "deactivate"}
+    should_delete_chunks = remove_mode in {"soft", "hard"}
+
     faiss_removed = 0
-    if remove_mode == "hard":
-        app.logger.info("Hard remove requested for documentId=%s faiss_ids=%s", doc_id_str, len(faiss_ids))
+    if should_remove_faiss:
+        app.logger.info(
+            "%s remove requested for documentId=%s faiss_ids=%s",
+            remove_mode.capitalize(),
+            doc_id_str,
+            len(faiss_ids),
+        )
         try:
             get_chunk_engine().remove_ids(faiss_ids)
             faiss_removed = len(faiss_ids)
         except Exception as exc:  # noqa: BLE001
             _log_api_error(
-                "hard_remove_failed",
+                f"{remove_mode}_remove_failed",
                 exc=exc,
                 status=500,
                 context={"documentId": doc_id_str, "faissIdCount": len(faiss_ids)},
@@ -2565,9 +2577,21 @@ def remove_document():
             len(faiss_ids),
         )
 
-    # Clean Mongo chunk metadata so removed docs do not appear in search results.
-    deleted_chunks = chunk_store.delete_chunks_by_doc(doc_id_str)
-    chunk_store.update_document_status(doc_id_str, status="removed", chunk_count=0, error=None)
+    deleted_chunks = 0
+    if should_delete_chunks:
+        # soft/hard: chunk metadata is wiped so the doc disappears from
+        # downstream consumers that scan the chunks collection directly.
+        deleted_chunks = chunk_store.delete_chunks_by_doc(doc_id_str)
+        chunk_store.update_document_status(
+            doc_id_str, status="removed", chunk_count=0, error=None
+        )
+    else:
+        # deactivate: keep chunk rows for audit. We still flip the document
+        # status so admin tooling/dashboards can show "removed" without
+        # losing the underlying text.
+        chunk_store.update_document_status(
+            doc_id_str, status="removed", error=None
+        )
 
     _deactivate_index_state(company_id, doc_id_str, state="removed")
 
@@ -2578,6 +2602,7 @@ def remove_document():
             "faissRemoved": faiss_removed,
             "faissPendingCleanup": max(0, len(faiss_ids) - faiss_removed),
             "chunksDeleted": deleted_chunks,
+            "chunksRetained": len(chunks) - deleted_chunks,
             "state": "removed",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
