@@ -213,10 +213,39 @@ class EmbeddingEngine:
                         return disk_index.search(query_vectors, k)
                 raise RuntimeError("FAISS index is empty.")
             if self._index.d <= 0 or self._index.d > self.max_index_dimension:
+                # In-memory index dimension is garbage (e.g. -230590221). This is
+                # almost always heap corruption of the live C++ index object under
+                # concurrent access — NOT a corrupt file. The on-disk index is
+                # normally fine, so re-read it, REPAIR the in-memory state, and
+                # serve from it instead of returning 502 (the recurring search
+                # failure) and possibly quarantining a perfectly good index file.
                 disk_index = self._read_index_from_disk()
-                if disk_index is not None and disk_index.d == query_vectors.shape[1] and disk_index.ntotal > 0:
+                disk_dim = (
+                    int(getattr(disk_index, "d", 0) or 0)
+                    if disk_index is not None
+                    else 0
+                )
+                if disk_index is not None and 0 < disk_dim <= self.max_index_dimension:
+                    # Disk index is structurally valid → adopt it as the live index
+                    # so subsequent queries don't keep hitting the corrupt object.
+                    self._index = disk_index
+                    self._dimension = disk_dim
+                    try:
+                        self._index_mtime = os.path.getmtime(self.index_path)
+                    except OSError:
+                        self._index_mtime = None
+                    if disk_dim != query_vectors.shape[1]:
+                        # The index is fine; the *query* dimension is wrong. Never
+                        # quarantine a healthy index because of a bad query.
+                        raise ValueError(
+                            f"Query dim {query_vectors.shape[1]} != index dim {disk_dim}"
+                        )
+                    if disk_index.ntotal == 0:
+                        raise RuntimeError("FAISS index is empty.")
                     faiss.normalize_L2(query_vectors)
-                    return disk_index.search(query_vectors, k)
+                    return self._index.search(query_vectors, k)
+                # Disk file is missing or itself structurally invalid → only now is
+                # a reset/quarantine justified.
                 reason = f"invalid FAISS index dimension: {self._index.d}"
                 print(f"[embedding-engine] {reason}", flush=True)
                 if self.auto_reset_on_error:
