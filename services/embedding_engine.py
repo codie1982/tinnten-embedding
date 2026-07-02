@@ -410,6 +410,24 @@ class EmbeddingEngine:
         except OSError:
             self._index_mtime = None
 
+    def ensure_index_persisted(self) -> dict:
+        """
+        Firma-scope FAISS'i ÖN-OLUŞTURUR (provision): index dosyası diskte yoksa
+        boş bir IndexIDMap2 (IndexFlatIP tabanlı, model boyutunda) yazar. Zaten
+        varsa DOKUNMAZ (idempotent) — sadece güncel durumu döner. company-create
+        anında çağrılır ki firma oluşur oluşmaz kendi (boş) FAISS index'i diskte
+        var olsun (spec: "firma oluşturulduğunda FAISS oluşmalı").
+        """
+        with self._lock:
+            if os.path.exists(self.index_path):
+                self.reload_if_updated_locked()
+                ntotal = int(self._index.ntotal) if self._index is not None else 0
+                return {"created": False, "path": self.index_path, "ntotal": ntotal}
+            dim = self.model_dimension()
+            self._ensure_index(dim)
+            self._save_index()
+            return {"created": True, "path": self.index_path, "dimension": int(dim), "ntotal": 0}
+
     def _read_index_from_disk(self) -> faiss.IndexIDMap2 | None:
         if not os.path.exists(self.index_path):
             return None

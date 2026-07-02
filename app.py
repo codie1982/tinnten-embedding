@@ -3257,6 +3257,30 @@ def queue_content_index():
     return _queue_content_index_payload(payload, default_trigger="api")
 
 
+@app.route("/api/v10/company/<company_id>/provision-faiss", methods=["POST"])
+def provision_company_faiss(company_id):
+    """
+    Firma oluşturulduğunda o firmanın per-company FAISS index'ini ÖN-OLUŞTURUR
+    (spec: firma-create → FAISS). İdempotent + best-effort: server bunu
+    fire-and-forget çağırır, başarısızlık firma oluşturmayı BLOKLAMAZ.
+    PER_COMPANY_FAISS_ENABLED KAPALIYKEN no-op 200 döner (ingest zaten lazy-create
+    yapar; bayrak açılınca boş index önceden var olur → firma-create doğrulanabilir
+    bir sinyal + ilk ingest'te "index yok" gecikmesi olmaz).
+    """
+    cid = str(company_id or "").strip()
+    if not cid:
+        return jsonify({"error": "company_id required"}), 400
+    if not PER_COMPANY_FAISS_ENABLED:
+        return jsonify({"ok": True, "companyId": cid, "skipped": "feature_disabled"}), 200
+    try:
+        engine = get_company_chunk_engine(cid)
+        info = engine.ensure_index_persisted()
+        return jsonify({"ok": True, "companyId": cid, **info}), 200
+    except Exception as exc:  # noqa: BLE001
+        _log_api_error("provision_company_faiss", exc=exc)
+        return jsonify({"ok": False, "companyId": cid, "error": str(exc)}), 500
+
+
 @app.route("/api/v10/content/index/fetcher", methods=["POST"])
 def queue_content_index_fetcher():
     """
