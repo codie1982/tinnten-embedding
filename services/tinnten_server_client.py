@@ -62,6 +62,9 @@ class TinntenServerClient:
         error_msg: str | None = None,
         stats: dict | None = None,
         company_id: str | None = None,
+        domain: str | None = None,
+        source: str | None = None,
+        domain_chunks: int | None = None,
     ) -> bool:
         """Notify tinnten-server of a document index state change.
 
@@ -93,6 +96,13 @@ class TinntenServerClient:
             }
         if company_id:
             body["companyid"] = company_id
+        # Per-sayfa (fetcher_page/initial) doc'ları için: server, website entry'sini
+        # tek faissIndexId yerine DOMAIN ile bulur; domainChunks agrega chunk sayısı.
+        if domain and source in ("fetcher_page", "fetcher_initial"):
+            body["metadata"] = {"domain": str(domain), "source": str(source)}
+            if isinstance(domain_chunks, int):
+                body.setdefault("stats", {})
+                body["stats"]["domainChunks"] = int(domain_chunks)
 
         try:
             url = f"{self.base_url}/api/v10/internal/content/documents/{document_id}/index-state"

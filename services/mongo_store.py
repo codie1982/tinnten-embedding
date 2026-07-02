@@ -60,6 +60,25 @@ class MongoStore:
         self.documents.create_index([("status", ASCENDING)], name="status_idx")
         self.chunks.create_index([("faiss_id", ASCENDING)], unique=True, name="faiss_id_unique")
         self.chunks.create_index([("doc_id", ASCENDING)], name="chunk_doc_idx")
+        # FAZ 5 — hybrid retrieval altyapısı.
+        # 1) Lexical ($text) index: dense FAISS'e paralel BM25-benzeri sözcük araması.
+        #    default_language="none": içerik TR/EN karışık; Mongo'nun TR stemmer'ı yok
+        #    ve EN stemmer'ı TR kelimeleri bozar → stemming KAPALI (birebir token eşleşmesi).
+        # 2) (companyId, domain) compound: Faz 2 domainChunks agregasıyla paylaşımlı;
+        #    lexical sorgunun firma/domain daraltmasını da hızlandırır.
+        # Not: mevcut index'ler değişmediğinden idempotent — yeniden çalıştırılabilir.
+        try:
+            self.chunks.create_index(
+                [("text", "text")],
+                default_language="none",
+                name="chunk_text_search",
+            )
+        except Exception:  # noqa: BLE001 — text index opsiyonel (ör. mongomock desteklemez)
+            pass
+        self.chunks.create_index(
+            [("metadata.companyId", ASCENDING), ("metadata.domain", ASCENDING)],
+            name="chunk_company_domain_idx",
+        )
 
     # ------------------------------------------------------------------
     # Document helpers
@@ -143,6 +162,89 @@ class MongoStore:
     def delete_chunks_by_doc(self, doc_id: str, *, session=None) -> int:
         result = self.chunks.delete_many({"doc_id": doc_id}, session=session)
         return int(result.deleted_count)
+
+    @staticmethod
+    def _company_domain_query(company_id: str, domain: str) -> Dict[str, Any]:
+        """
+        (company_id, metadata.domain) eşleşmesi. Firma kimliği hem top-level
+        `company_id` hem `metadata.companyId` altında olabildiği için ikisini de
+        kabul eder — per-sayfa doc'larda o domain'e ait TÜM chunk'ları yakalar.
+        """
+        cid = str(company_id)
+        return {
+            "metadata.domain": str(domain),
+            "$or": [{"company_id": cid}, {"metadata.companyId": cid}],
+        }
+
+    def get_chunk_index_by_company_domain(
+        self, company_id: str, domain: str
+    ) -> Dict[str, Any]:
+        """Bir firmanın bir domain'e ait chunk'larının faiss_id'leri + doc_id'leri."""
+        cursor = self.chunks.find(
+            self._company_domain_query(company_id, domain),
+            {"faiss_id": 1, "doc_id": 1},
+        )
+        faiss_ids: set = set()
+        doc_ids: set = set()
+        for c in cursor:
+            if isinstance(c.get("faiss_id"), (int, float)):
+                faiss_ids.add(int(c["faiss_id"]))
+            if c.get("doc_id"):
+                doc_ids.add(str(c["doc_id"]))
+        return {"faiss_ids": sorted(faiss_ids), "doc_ids": sorted(doc_ids)}
+
+    def delete_chunks_by_company_domain(
+        self, company_id: str, domain: str, *, session=None
+    ) -> int:
+        result = self.chunks.delete_many(
+            self._company_domain_query(company_id, domain), session=session
+        )
+        return int(result.deleted_count)
+
+    # ------------------------------------------------------------------
+    # FAZ 5 — lexical (BM25-benzeri) arama; hybrid retrieval için dense'e eşlik eder
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _translate_chunk_filters(filters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Uygulama-seviyesi filtre sözlüğünü Mongo sorgusuna çevirir; `app.py`
+        `_passes_chunk_filters` semantiğiyle BİREBİR aynıdır: "metadata.X" anahtarı
+        iç içe alana, aksi halde top-level alana gider; `{"$in": [...]}` korunur,
+        skaler değer eşitliğe çevrilir. Bu birebirlik önemli — lexical aday kümesi,
+        dense yolunun `_passes_chunk_filters`'ından geçen kümeyle tutarlı kalmalı ki
+        RRF füzyonu ÖNCESİ yeniden filtreleme hiçbir geçerli adayı düşürmesin.
+        """
+        query: Dict[str, Any] = {}
+        for key, val in (filters or {}).items():
+            if isinstance(val, dict) and "$in" in val:
+                query[key] = {"$in": list(val["$in"])}
+            else:
+                query[key] = val
+        return query
+
+    def text_search_chunks(
+        self,
+        query_text: str,
+        filters: Optional[Dict[str, Any]] = None,
+        *,
+        limit: int = 40,
+    ) -> List[Dict[str, Any]]:
+        """
+        `$text` sözcük araması + `_translate_chunk_filters` daraltması. textScore'a
+        göre azalan sıralı chunk döner (en alakalı ilk). Boş sorguda [] döner.
+        Not: mongomock `$text`'i desteklemez → birim testlerde bu yol atlanır,
+        füzyon saf fonksiyon (`_rrf_fuse`) olarak test edilir (plan kararı #9).
+        """
+        if not query_text or not str(query_text).strip():
+            return []
+        mongo_query: Dict[str, Any] = {"$text": {"$search": str(query_text)}}
+        mongo_query.update(self._translate_chunk_filters(filters))
+        cursor = (
+            self.chunks.find(mongo_query, {"score": {"$meta": "textScore"}})
+            .sort([("score", {"$meta": "textScore"})])
+            .limit(int(limit))
+        )
+        return list(cursor)
 
     # ------------------------------------------------------------------
     # Counter helpers

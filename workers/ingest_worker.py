@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -36,7 +37,7 @@ if load_dotenv is not None:
     load_dotenv()
 
 from init.rabbit_connection import connect_rabbit_with_retry
-from services.chunker import chunk_text
+from services.chunker import chunk_text, chunk_markdown_structure
 from services.mongo_store import MongoStore
 from services.content_store import ContentDocumentStore, normalize_index_options
 from services.upload_store import UploadStore, UploadNotFoundError
@@ -118,6 +119,15 @@ class IngestWorker:
         default_chunk_model = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
         self.model_name = os.getenv("CHUNK_MODEL_NAME") or os.getenv("MODEL_NAME") or default_chunk_model
         self.index_path = os.getenv("CHUNK_INDEX_PATH") or os.getenv("FAISS_INDEX_PATH") or "faiss.index"
+        # Per-company FAISS rollout bayrağı (app.py ile AYNI env). Kapalıyken tüm
+        # içerik tek global index'e yazılır (davranış değişmez). Açıkken firma
+        # içeriği firma-scope index'e (`company/<id>.index`) gider.
+        self.per_company_faiss = (os.getenv("PER_COMPANY_FAISS_ENABLED") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
         # Lazily initialised dependencies to keep startup fast and avoid blocking
         # on network connections/model downloads before consuming messages.
@@ -225,6 +235,28 @@ class IngestWorker:
             )
             self._engine_cache[index_path] = engine
             return engine
+
+    def _company_index_path(self, company_id) -> str:
+        """Firma-scope chunk index yolu (app.py `_company_chunk_index_path` ile aynı)."""
+        cid = re.sub(r"[^A-Za-z0-9_-]", "", str(company_id or "").strip())
+        if not cid:
+            return self.index_path
+        base_dir = os.path.dirname(self.index_path) or "."
+        return os.path.join(base_dir, "company", f"{cid}.index")
+
+    def _engine_for_company(self, company_id) -> EmbeddingEngine:
+        """
+        İçeriği hangi engine'e yazacağımızı çözer. Bayrak kapalıysa veya
+        company_id yoksa GLOBAL engine (davranış değişmez). Açıksa firma-scope
+        index engine'i (cache'li). faiss_id sayacı GLOBAL kalır — ID'ler global
+        benzersiz, sadece vektör firmanın index dosyasına yazılır.
+        """
+        if not self.per_company_faiss:
+            return self._get_engine()
+        cid = str(company_id or "").strip()
+        if not cid:
+            return self._get_engine()
+        return self._get_engine_for_index(self._company_index_path(cid))
 
     # ------------------------------------------------------------------
     def start(self) -> None:
@@ -527,8 +559,15 @@ class IngestWorker:
             deleted_count = store.delete_chunks_by_doc(doc_id)
             log(f"Removed {deleted_count} old chunks for doc_id={doc_id}")
 
-        engine = self._get_engine_for_index(index_path)
-        
+        # Explicit index_path verilmişse ona saygı göster; yoksa firma-scope'a
+        # yönlendir (bayrak kapalıysa global — davranış değişmez).
+        if payload.get("index_path"):
+            engine = self._get_engine_for_index(index_path)
+        else:
+            engine = self._engine_for_company(
+                metadata.get("companyId") or metadata.get("company_id")
+            )
+
         if old_faiss_ids:
             # Optimize: use replace_embeddings to save to disk only once
             engine.replace_embeddings(old_faiss_ids, embeddings_arr, faiss_ids)
@@ -927,13 +966,28 @@ class IngestWorker:
             or domain_config.get("companyId")
             or domain_config.get("companyid")
         )
-        if domain_company and str(domain_company) != str(context.company_id):
+        # Multi-owner ownership: a canonical domain may be crawled by the system
+        # (no primary companyId) and shared by several companies via the fetcher
+        # `informationOwners` array. The set of companies allowed to index this
+        # crawl is {primary companyId} ∪ {information owner companyIds}. Accept
+        # the request when the caller is among them; only reject when the domain
+        # is owned exclusively by *other* companies.
+        allowed_companies = {
+            str(o.get("companyId")).strip()
+            for o in (domain_doc.get("informationOwners") or [])
+            if isinstance(o, dict) and o.get("companyId")
+        }
+        if domain_company:
+            allowed_companies.add(str(domain_company).strip())
+        ctx_company = str(context.company_id).strip() if context.company_id else ""
+        if allowed_companies and ctx_company not in allowed_companies:
             raise RuntimeError(
-                f"fetcher domain company mismatch: domain={domain} expected={context.company_id} got={domain_company}"
+                f"fetcher domain company mismatch: domain={domain} "
+                f"expected={context.company_id} owners={sorted(allowed_companies)}"
             )
-        if not domain_company:
+        if not allowed_companies:
             log(
-                "Fetcher domain %s has no companyId metadata; skipping domain company match.",
+                "Fetcher domain %s has no company owner metadata; skipping domain company match.",
                 domain,
             )
 
@@ -1081,16 +1135,22 @@ class IngestWorker:
         storage_preferences: List[str],
         s3_bucket: str,
     ) -> str:
+        clean_markdown = str(row.get("clean_markdown") or "").strip()
         markdown = str(row.get("markdown") or "").strip()
         html = str(row.get("html") or "").strip()
         media_text = self._serialize_fetcher_media(media_entries)
 
         for target in storage_preferences:
             if target == "db":
+                if clean_markdown:
+                    return self._join_fetcher_text_with_media(clean_markdown, media_text)
                 if markdown:
                     return self._join_fetcher_text_with_media(markdown, media_text)
                 if html:
-                    return self._join_fetcher_text_with_media(html, media_text)
+                    return self._join_fetcher_text_with_media(
+                        self._clean_fetcher_html_text(html, url=str(row.get("url") or "")),
+                        media_text,
+                    )
             elif target == "s3":
                 text_value = self._load_fetcher_content_from_s3(log_entry, s3_bucket)
                 if text_value:
@@ -1101,13 +1161,23 @@ class IngestWorker:
                     return self._join_fetcher_text_with_media(text_value, media_text)
 
         # Final fallback when preferences are missing/invalid.
-        base_text = markdown or html
+        base_text = clean_markdown or markdown
+        if not base_text and html:
+            base_text = self._clean_fetcher_html_text(html, url=str(row.get("url") or ""))
         return self._join_fetcher_text_with_media(base_text, media_text)
 
     def _load_fetcher_content_from_s3(self, log_entry: Optional[Dict[str, Any]], s3_bucket: str) -> str:
         if not log_entry or not s3_bucket:
             return ""
         s3_client = get_s3_client()
+
+        clean_key = str(
+            log_entry.get("s3_key_clean_markdown") or log_entry.get("s3_key_markdown") or ""
+        ).strip()
+        if clean_key:
+            text_value = self._read_s3_text(s3_client, s3_bucket, clean_key)
+            if text_value:
+                return text_value
 
         json_key = str(log_entry.get("s3_key_json") or "").strip()
         if json_key:
@@ -1116,19 +1186,35 @@ class IngestWorker:
                 try:
                     data = json.loads(payload)
                     if isinstance(data, dict):
+                        clean_markdown = str(data.get("clean_markdown") or "").strip()
                         markdown = str(data.get("markdown") or "").strip()
                         html = str(data.get("html") or "").strip()
+                        if clean_markdown:
+                            return clean_markdown
                         if markdown:
                             return markdown
                         if html:
-                            return html
+                            return self._clean_fetcher_html_text(html, url=str(data.get("url") or ""))
                 except Exception:
                     pass
 
         html_key = str(log_entry.get("s3_key") or "").strip()
         if html_key:
-            return self._read_s3_text(s3_client, s3_bucket, html_key)
+            html = self._read_s3_text(s3_client, s3_bucket, html_key)
+            return self._clean_fetcher_html_text(html, url=str(log_entry.get("url") or ""))
         return ""
+
+    @staticmethod
+    def _clean_fetcher_html_text(html: str, *, url: str = "") -> str:
+        html_value = str(html or "").strip()
+        if not html_value:
+            return ""
+        try:
+            from services.html_to_markdown import html_to_clean_markdown
+
+            return html_to_clean_markdown(html_value, url=url or None).strip()
+        except Exception:
+            return ""
 
     def _read_s3_text(self, s3_client, bucket: str, key: str) -> str:
         try:
@@ -1309,13 +1395,29 @@ class IngestWorker:
         chunk_size = int(options.get("chunkSize") or self.chunk_size)
         chunk_overlap = int(options.get("chunkOverlap") or self.chunk_overlap)
         min_chars = int(options.get("minChars") or 80)
+        # Chunking stratejisi: "structure" (heading-aware + context header) veya
+        # "char" (klasik karakter penceresi). options > env > default("char").
+        strategy = str(
+            options.get("chunkStrategy") or os.getenv("CHUNK_STRATEGY") or "char"
+        ).strip().lower()
 
-        chunks = chunk_text(
-            text,
-            chunk_size=chunk_size,
-            overlap=chunk_overlap,
-            min_chars=min_chars,
-        )
+        md = metadata if isinstance(metadata, dict) else {}
+        if strategy == "structure":
+            chunks = chunk_markdown_structure(
+                text,
+                chunk_size=chunk_size,
+                overlap=chunk_overlap,
+                min_chars=min_chars,
+                title=md.get("title"),
+                url=md.get("url"),
+            )
+        else:
+            chunks = chunk_text(
+                text,
+                chunk_size=chunk_size,
+                overlap=chunk_overlap,
+                min_chars=min_chars,
+            )
         if not chunks:
             return {
                 "chunkCount": 0,
@@ -1327,7 +1429,7 @@ class IngestWorker:
             }
 
         faiss_ids = self._get_store().reserve_faiss_ids(len(chunks))
-        engine = self._get_engine()
+        engine = self._engine_for_company(company_id)
         embeddings = engine.encode([chunk.text for chunk in chunks], batch_size=self.batch_size)
         engine.add_embeddings(embeddings, faiss_ids)
 
@@ -1433,7 +1535,9 @@ class IngestWorker:
             return
 
         faiss_ids = self._get_store().reserve_faiss_ids(len(chunks))
-        engine = self._get_engine()
+        engine = self._engine_for_company(
+            metadata.get("companyId") or metadata.get("company_id")
+        )
         embeddings = engine.encode([chunk.text for chunk in chunks], batch_size=self.batch_size)
         engine.add_embeddings(embeddings, faiss_ids)
 
@@ -1813,12 +1917,46 @@ class IngestWorker:
                 server_client = get_tinnten_server_client()
                 stats_payload = None if stats is UPDATE_UNSET else stats
                 error_msg = None if error is UPDATE_UNSET else (str(error) if error else None)
+
+                # Per-sayfa (fetcher_page/initial) doc'ları website ENTRY'sine
+                # bağlamak için domain + domainChunks gönder. Entry'nin tek
+                # faissIndexId'i per-sayfa docId'lerle eşleşmez → server domain ile
+                # bulur, chunkCount'u SET eder (badge "İndeksleniyor"→"Tamamlandı").
+                page_domain = None
+                page_source = None
+                domain_chunks = None
+                if str(context.trigger or "") in ("fetcher_page", "fetcher_initial"):
+                    try:
+                        for c in self._get_store().get_chunks_by_doc(context.document_id):
+                            md = c.get("metadata") or {}
+                            if md.get("domain"):
+                                page_domain = md.get("domain")
+                                page_source = str(md.get("source") or context.trigger)
+                                break
+                        if not page_source:
+                            page_source = str(context.trigger)
+                        if page_domain:
+                            domain_chunks = self._get_store().chunks.count_documents(
+                                {
+                                    "metadata.domain": page_domain,
+                                    "$or": [
+                                        {"company_id": context.company_id},
+                                        {"metadata.companyId": context.company_id},
+                                    ],
+                                }
+                            )
+                    except Exception:  # noqa: BLE001
+                        pass
+
                 server_client.update_document_index_state(
                     document_id=context.document_id,
                     state=state,
                     error_msg=error_msg,
                     stats=stats_payload if isinstance(stats_payload, dict) else None,
                     company_id=context.company_id,
+                    domain=page_domain,
+                    source=page_source,
+                    domain_chunks=domain_chunks,
                 )
             except Exception as cb_exc:  # noqa: BLE001
                 log(f"[callback] Failed to notify tinnten-server for {context.document_id}: {cb_exc}")

@@ -29,6 +29,25 @@ class EmbeddingEngine:
     _process_locks: dict[str, threading.RLock] = {}
     _process_locks_guard = threading.Lock()
 
+    # Model paylaşımı: aynı model_name'i kullanan TÜM engine'ler (per-company
+    # index'ler dâhil) TEK SentenceTransformer instance paylaşır → N engine
+    # ≠ N model yüklemesi (per-company FAISS'te OOM'u önler). Model yalnız
+    # inference için kullanıldığından paylaşım thread-safe'tir.
+    _model_cache: dict[str, "SentenceTransformer"] = {}
+    _model_cache_guard = threading.Lock()
+
+    @classmethod
+    def _get_shared_model(cls, model_name: str) -> "SentenceTransformer":
+        model = cls._model_cache.get(model_name)
+        if model is not None:
+            return model
+        with cls._model_cache_guard:
+            model = cls._model_cache.get(model_name)
+            if model is None:
+                model = SentenceTransformer(model_name)
+                cls._model_cache[model_name] = model
+            return model
+
     @classmethod
     def _resolve_process_lock(cls, index_path: str) -> threading.RLock:
         normalized = os.path.abspath(os.path.expanduser(index_path or "faiss.index"))
@@ -78,7 +97,7 @@ class EmbeddingEngine:
         self.tmp_ttl_seconds = int(os.getenv("FAISS_TMP_TTL_SECONDS") or 3600)
         self.max_index_dimension = int(os.getenv("FAISS_MAX_INDEX_DIMENSION") or 16384)
         self._lock = self._resolve_process_lock(self.index_path)
-        self._model = SentenceTransformer(self.model_name)
+        self._model = self._get_shared_model(self.model_name)
         self._index: faiss.IndexIDMap2 | None = None
         self._backing_index: Any = None
         self._dimension: int | None = None
@@ -371,6 +390,11 @@ class EmbeddingEngine:
     def _save_index(self) -> None:
         if self._index is None:
             return
+        # Per-company index'ler alt dizinde (`company/<id>.index`) yaşar — ilk
+        # kayıtta dizin henüz yoksa write_index patlamasın diye garanti altına al.
+        index_dir = os.path.dirname(self.index_path)
+        if index_dir:
+            os.makedirs(index_dir, exist_ok=True)
         tmp = f"{self.index_path}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
         try:
             faiss.write_index(self._index, tmp)

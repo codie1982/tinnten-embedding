@@ -73,6 +73,7 @@ class FetcherStore:
             "domain": 1,
             "title": 1,
             "description": 1,
+            "clean_markdown": 1,
             "markdown": 1,
             "html": 1,
             "fetched_at": 1,

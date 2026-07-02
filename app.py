@@ -162,6 +162,69 @@ def _get_cached_chunk_engine() -> EmbeddingEngine | None:
     return get_chunk_engine()
 
 
+def _company_chunk_index_path(company_id: str | None) -> str:
+    """
+    Firma-scope chunk FAISS index yolu. company_id yoksa/boşsa GLOBAL chunk
+    index'e düşer (personal/company'siz içerik orada kalır). Per-company index'ler
+    global index'in yanında `company/<companyId>.index` olarak tutulur.
+    company_id dosya-adı-güvenli hâle getirilir (path traversal savunması).
+    """
+    cid = re.sub(r"[^A-Za-z0-9_-]", "", str(company_id or "").strip())
+    if not cid:
+        return CHUNK_INDEX_PATH
+    base_dir = os.path.dirname(CHUNK_INDEX_PATH) or "."
+    return os.path.join(base_dir, "company", f"{cid}.index")
+
+
+# Per-company FAISS rollout bayrağı. KAPALI (default) iken tüm firma içeriği
+# eskisi gibi tek global chunk index'te kalır (davranış DEĞİŞMEZ, sıfır risk).
+# Migration tamamlanınca AÇILIR; o zaman search + ingest + remove per-company
+# index'e yönlenir. Search ve ingest AYNI bayrağı okumalı ki tutarlı olsun.
+PER_COMPANY_FAISS_ENABLED = (os.getenv("PER_COMPANY_FAISS_ENABLED") or "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+# FAZ 5 — hybrid retrieval + opsiyonel reranker (varsayılan KAPALI; açılmadıkça
+# davranış birebir korunur). HYBRID_SEARCH_ENABLED açıkken metin sorgularında
+# dense (FAISS) + lexical ($text) sonuçları RRF ile birleştirilir. RERANKER_MODEL
+# set edilirse (ör. BAAI/bge-reranker-v2-m3) füzyon sonrası cross-encoder rerank.
+HYBRID_SEARCH_ENABLED = (os.getenv("HYBRID_SEARCH_ENABLED") or "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+HYBRID_OVERFETCH = max(1, int(os.getenv("HYBRID_OVERFETCH") or 4))
+RRF_K_CONSTANT = max(1, int(os.getenv("RRF_K_CONSTANT") or 60))
+RERANKER_MODEL = (os.getenv("RERANKER_MODEL") or "").strip()
+RERANK_TOP_N = max(1, int(os.getenv("RERANK_TOP_N") or 30))
+
+
+@lru_cache(maxsize=128)
+def _get_company_chunk_engine_cached(company_id: str) -> EmbeddingEngine:
+    return EmbeddingEngine(
+        model_name=CHUNK_MODEL_NAME, index_path=_company_chunk_index_path(company_id)
+    )
+
+
+def get_company_chunk_engine(company_id: str | None) -> EmbeddingEngine:
+    """
+    Firma-scope chunk engine (per-company FAISS). İzolasyon YAPISAL: her firma
+    yalnız kendi index'inde arar → global paylaşımlı index'in over-fetch /
+    kalabalıklaşma sorunu ortadan kalkar. Model paylaşımlı
+    (EmbeddingEngine._get_shared_model) olduğundan çok firma OOM yapmaz.
+    Bayrak KAPALI veya company_id yoksa GLOBAL chunk engine'e delege eder
+    (cache'lenmez — global engine kendi lru_cache'inde; test izolasyonu da korunur).
+    """
+    cid = str(company_id or "").strip()
+    if not cid or not PER_COMPANY_FAISS_ENABLED:
+        return get_chunk_engine()
+    return _get_company_chunk_engine_cached(cid)
+
+
 def warmup_embedding_models() -> None:
     """
     Eagerly initialise API-facing embedding models during worker boot so the first
@@ -1286,17 +1349,165 @@ def _serialize_chunk_entry(chunk: dict) -> dict:
     return out
 
 
+def _assemble_chunk_result(
+    chunk: dict | None,
+    faiss_id: int,
+    score: float,
+    filters: dict,
+    radius: int,
+    doc_status_map: dict,
+    doc_chunk_cache: dict,
+) -> dict | None:
+    """
+    Tek bir chunk'ı arama sonucuna dönüştürür: doküman durumu (disabled/removed)
+    ve `_passes_chunk_filters` elemesini uygular, radius>0 ise komşu chunk'larla
+    metni yeniden birleştirir. Elenen chunk için None döner. Dense ve lexical
+    yollar AYNI pipeline'dan geçsin diye çıkarıldı (füzyon tutarlılığı).
+    """
+    if not chunk:
+        return None
+    doc_info = doc_status_map.get(chunk.get("doc_id"))
+    if doc_info and str(doc_info.get("status")).lower() in {"disabled", "removed"}:
+        return None
+    if not _passes_chunk_filters(chunk, filters):
+        return None
+    combined_text = chunk.get("text")
+    if radius > 0:
+        doc_id = str(chunk.get("doc_id") or "")
+        chunk_index = chunk.get("chunk_index") if "chunk_index" in chunk else chunk.get("index")
+        if doc_id and chunk_index is not None:
+            if doc_id not in doc_chunk_cache:
+                doc_chunk_cache[doc_id] = chunk_store.get_chunks_by_doc(doc_id)
+            all_chunks = doc_chunk_cache.get(doc_id) or []
+            try:
+                target_idx = next(
+                    i for i, c in enumerate(all_chunks) if int(c.get("chunk_index", -1)) == int(chunk_index)
+                )
+                start = max(0, target_idx - radius)
+                end = min(len(all_chunks), target_idx + radius + 1)
+                combined_text = _reconstruct_from_chunks(all_chunks[start:end])
+            except StopIteration:
+                combined_text = chunk.get("text")
+    return {
+        "type": "chunk",
+        "id": int(faiss_id),
+        "score": float(score),
+        "chunk_id": chunk.get("chunk_id"),
+        "doc_id": chunk.get("doc_id"),
+        "text": combined_text,
+        "metadata": chunk.get("metadata") or {},
+        "char_start": chunk.get("char_start"),
+        "char_end": chunk.get("char_end"),
+        "doc_type": chunk.get("doc_type"),
+        "source": chunk.get("source"),
+        "radius": radius,
+    }
+
+
+def _rrf_fuse(dense: list[dict], lexical: list[dict], *, k_const: int = 60) -> list[dict]:
+    """
+    Reciprocal Rank Fusion — iki alaka-sıralı listeyi (0=en iyi) tek listede
+    birleştirir. Her aday için `score = Σ 1/(k_const + rank)`; aynı chunk iki
+    listede de varsa skorları toplanır. Anahtar `chunk_id` (yoksa `id:doc_id`).
+    Saf fonksiyon — I/O yok, deterministik → birim test edilebilir (plan #9).
+    Aynı chunk'ın hem dense hem lexical kaydı varsa DENSE kaydı korunur (FAISS
+    skoru/id'si taşınır); dense önce işlendiği için ilk-görülen odur.
+    """
+    fused: dict[str, dict] = {}
+    first_pos: dict[str, int] = {}
+    seq = 0
+    for source in (dense, lexical):
+        for rank, res in enumerate(source):
+            key = res.get("chunk_id") or f"{res.get('id')}:{res.get('doc_id')}"
+            entry = fused.get(key)
+            if entry is None:
+                fused[key] = {"result": res, "score": 0.0}
+                first_pos[key] = seq
+                seq += 1
+                entry = fused[key]
+            entry["score"] += 1.0 / (k_const + rank)
+    ranked = sorted(fused.keys(), key=lambda kk: (-fused[kk]["score"], first_pos[kk]))
+    out: list[dict] = []
+    for kk in ranked:
+        res = dict(fused[kk]["result"])
+        res["rrf_score"] = round(fused[kk]["score"], 6)
+        out.append(res)
+    return out
+
+
+_RERANKER = None
+_RERANKER_LOADED = False
+
+
+def _get_reranker():
+    """
+    Lazy CrossEncoder singleton. `RERANKER_MODEL` boşsa None (reranker kapalı).
+    Yükleme başarısızsa None'a düşer (arama füzyonla devam eder) — tek denemede
+    işaretlenir, her istekte yeniden denenmez.
+    """
+    global _RERANKER, _RERANKER_LOADED
+    if _RERANKER_LOADED:
+        return _RERANKER
+    _RERANKER_LOADED = True
+    if not RERANKER_MODEL:
+        _RERANKER = None
+        return None
+    try:
+        from sentence_transformers import CrossEncoder
+
+        _RERANKER = CrossEncoder(RERANKER_MODEL)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[reranker] load failed model={RERANKER_MODEL}: {exc}")
+        _RERANKER = None
+    return _RERANKER
+
+
+def _maybe_rerank(query_text: str | None, results: list[dict], *, enabled: bool = True) -> list[dict]:
+    """
+    Opsiyonel cross-encoder rerank: ilk `RERANK_TOP_N` adayı (query, text) çiftiyle
+    yeniden skorlar, kalan kuyruğu olduğu gibi bırakır. Reranker yoksa/kapalıysa ya
+    da skorlama patlarsa girdi sırası korunur (güvenli düşüş).
+    """
+    if not enabled or not query_text or not results:
+        return results
+    reranker = _get_reranker()
+    if reranker is None:
+        return results
+    head = results[:RERANK_TOP_N]
+    tail = results[RERANK_TOP_N:]
+    pairs = [(query_text, r.get("text") or "") for r in head]
+    try:
+        scores = reranker.predict(pairs)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[reranker] predict failed: {exc}")
+        return results
+    for r, s in zip(head, scores):
+        r["rerank_score"] = float(s)
+    head_sorted = sorted(head, key=lambda r: -float(r.get("rerank_score") or 0.0))
+    return head_sorted + tail
+
+
 def _chunk_search_response(payload: dict):
     k = int(payload.get("k") or 5)
     if k <= 0:
         return jsonify({"error": "k must be positive"}), 400
 
+    # Per-company FAISS: arama, filtredeki companyId'nin KENDİ index'inde yapılır.
+    # İzolasyon yapısal olduğundan over-fetch gerekmez; company_id yoksa global
+    # chunk index'e düşer (personal / company'siz içerik).
+    filters = payload.get("filter") or {}
+    company_id = (
+        filters.get("company_id") or filters.get("companyId") or filters.get("companyid")
+    )
+    engine = get_company_chunk_engine(company_id)
+
     vector = payload.get("vector")
+    raw_text = payload.get("text")
+    text_query = raw_text.strip() if isinstance(raw_text, str) and raw_text.strip() else None
     if vector is None:
-        text = payload.get("text")
-        if not text or not isinstance(text, str) or not text.strip():
+        if not text_query:
             return jsonify({"error": "Provide either 'text' or 'vector'."}), 400
-        query_vec = get_chunk_engine().encode([text], batch_size=1)
+        query_vec = engine.encode([text_query], batch_size=1)
     else:
         arr = np.array(vector, dtype=np.float32)
         if arr.ndim == 1:
@@ -1305,13 +1516,25 @@ def _chunk_search_response(payload: dict):
             return jsonify({"error": "vector must be 1D or 2D array"}), 400
         query_vec = arr.astype(np.float32, copy=False)
 
-    filters = payload.get("filter") or {}
+    radius = int(payload.get("radius") or 0)
+    if radius < 0:
+        return jsonify({"error": "radius must be >= 0"}), 400
+
+    # Hybrid retrieval: yalnız metin sorgusunda ($text lexical arama metin ister) ve
+    # bayrak/istek açıkken. Vektör-only sorguda daima saf dense (davranış korunur).
+    hybrid_requested = payload.get("hybrid")
+    do_hybrid = bool(
+        text_query
+        and (hybrid_requested if hybrid_requested is not None else HYBRID_SEARCH_ENABLED)
+    )
+    n_dense = k * HYBRID_OVERFETCH if do_hybrid else k
+
     try:
-        scores, ids = get_chunk_engine().search(query_vec, k)
+        scores, ids = engine.search(query_vec, n_dense)
     except RuntimeError:
         return jsonify({"results": []})
     except ValueError as exc:
-        index_obj = getattr(get_chunk_engine(), "_index", None)
+        index_obj = getattr(engine, "_index", None)
         index_dim = getattr(index_obj, "d", None)
         return (
             jsonify(
@@ -1330,57 +1553,49 @@ def _chunk_search_response(payload: dict):
     faiss_ids = [int(i) for i in ids[0] if i != -1]
     chunk_docs = chunk_store.get_chunks_by_faiss_ids(faiss_ids)
     doc_status_map = chunk_store.get_documents_by_ids({c.get("doc_id") for c in chunk_docs.values() if c})
-    radius = int(payload.get("radius") or 0)
-    if radius < 0:
-        return jsonify({"error": "radius must be >= 0"}), 400
     doc_chunk_cache: dict[str, list[dict]] = {}
 
-    results = []
+    dense_results: list[dict] = []
     for idx, score in zip(ids[0], scores[0]):
         if idx == -1:
             continue
-        chunk = chunk_docs.get(int(idx))
-        if not chunk:
-            continue
-        doc_info = doc_status_map.get(chunk.get("doc_id"))
-        if doc_info and str(doc_info.get("status")).lower() in {"disabled", "removed"}:
-            continue
-        if not _passes_chunk_filters(chunk, filters):
-            continue
-        combined_text = chunk.get("text")
-        if radius > 0:
-            doc_id = str(chunk.get("doc_id") or "")
-            chunk_index = chunk.get("chunk_index") if "chunk_index" in chunk else chunk.get("index")
-            if doc_id and chunk_index is not None:
-                if doc_id not in doc_chunk_cache:
-                    doc_chunk_cache[doc_id] = chunk_store.get_chunks_by_doc(doc_id)
-                all_chunks = doc_chunk_cache.get(doc_id) or []
-                try:
-                    target_idx = next(
-                        i for i, c in enumerate(all_chunks) if int(c.get("chunk_index", -1)) == int(chunk_index)
-                    )
-                    start = max(0, target_idx - radius)
-                    end = min(len(all_chunks), target_idx + radius + 1)
-                    combined_text = _reconstruct_from_chunks(all_chunks[start:end])
-                except StopIteration:
-                    combined_text = chunk.get("text")
-        results.append(
-            {
-                "type": "chunk",
-                "id": int(idx),
-                "score": float(score),
-                "chunk_id": chunk.get("chunk_id"),
-                "doc_id": chunk.get("doc_id"),
-                "text": combined_text,
-                "metadata": chunk.get("metadata") or {},
-                "char_start": chunk.get("char_start"),
-                "char_end": chunk.get("char_end"),
-                "doc_type": chunk.get("doc_type"),
-                "source": chunk.get("source"),
-                "radius": radius,
-            }
+        row = _assemble_chunk_result(
+            chunk_docs.get(int(idx)), int(idx), float(score), filters, radius, doc_status_map, doc_chunk_cache
         )
-    return jsonify({"results": results})
+        if row is not None:
+            dense_results.append(row)
+
+    if not do_hybrid:
+        return jsonify({"results": dense_results[:k]})
+
+    # Lexical dal — $text sonuçlarını AYNI pipeline'dan geçir (durum + filtre + radius).
+    lexical_docs = chunk_store.text_search_chunks(text_query, filters, limit=n_dense)
+    missing_status = {
+        c.get("doc_id") for c in lexical_docs if c.get("doc_id") and c.get("doc_id") not in doc_status_map
+    }
+    if missing_status:
+        doc_status_map.update(chunk_store.get_documents_by_ids(missing_status))
+    lexical_results: list[dict] = []
+    for chunk in lexical_docs:
+        faiss_id = chunk.get("faiss_id")
+        row = _assemble_chunk_result(
+            chunk,
+            int(faiss_id) if isinstance(faiss_id, (int, float)) else -1,
+            float(chunk.get("score") or 0.0),
+            filters,
+            radius,
+            doc_status_map,
+            doc_chunk_cache,
+        )
+        if row is not None:
+            lexical_results.append(row)
+
+    fused = _rrf_fuse(dense_results, lexical_results, k_const=RRF_K_CONSTANT)
+    rerank_enabled = payload.get("rerank") is not False
+    fused = _maybe_rerank(text_query, fused, enabled=rerank_enabled)
+    for row in fused:
+        row["retrieval"] = "hybrid"
+    return jsonify({"results": fused[:k]})
 
 
 def _websearch_faiss_search(query: str, k: int, model_name: str, index_path: str):
@@ -2560,7 +2775,10 @@ def remove_document():
             len(faiss_ids),
         )
         try:
-            get_chunk_engine().remove_ids(faiss_ids)
+            # Per-company FAISS: vektörler firmanın KENDİ index'inden silinir
+            # (bayrak kapalıysa global — davranış değişmez). Böylece bir firmanın
+            # silmesi diğer firmaların index'ine dokunmaz.
+            get_company_chunk_engine(company_id).remove_ids(faiss_ids)
             faiss_removed = len(faiss_ids)
         except Exception as exc:  # noqa: BLE001
             _log_api_error(
@@ -2603,6 +2821,74 @@ def remove_document():
             "faissPendingCleanup": max(0, len(faiss_ids) - faiss_removed),
             "chunksDeleted": deleted_chunks,
             "chunksRetained": len(chunks) - deleted_chunks,
+            "state": "removed",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+
+@app.route("/api/v10/content/index/remove/domain", methods=["POST"])
+def remove_domain_index():
+    """
+    Bir firmanın bir DOMAIN'e ait TÜM per-sayfa doc'larını index'ten kaldırır.
+
+    Per-company FAISS'te vektörler firmanın KENDİ index'inden silinir; aynı
+    domaini paylaşan DİĞER firmaların index'ine dokunulmaz. Crawl verisine de
+    dokunmaz (o fetcher tarafında owner-scoped yönetilir). Böylece "kullanıcı
+    domaini silince heryerden siliniyor" sorunu çözülür — sadece silen firma.
+
+    Body: { companyId (req), domain (req), mode: soft|deactivate|hard (default hard) }
+      hard       — FAISS vektörleri + chunk metadata silinir (tam temizlik).
+      deactivate — FAISS vektörleri silinir, chunk'lar audit için kalır.
+      soft       — chunk'lar silinir, FAISS mutasyonu yok (janitor toplar).
+    """
+    payload = request.get_json(silent=True) or {}
+    company_id = _get_payload_value(payload, "companyId", "company_id", "companyid")
+    domain = _normalize_domain_value(_get_payload_value(payload, "domain"))
+    if not company_id or not domain:
+        return jsonify({"error": "companyId and domain are required"}), 400
+    remove_mode = str(payload.get("mode") or "hard").lower()
+    if remove_mode not in {"soft", "deactivate", "hard"}:
+        return jsonify({"error": "mode must be one of: soft, deactivate, hard"}), 400
+
+    info = chunk_store.get_chunk_index_by_company_domain(company_id, domain)
+    faiss_ids = info["faiss_ids"]
+    doc_ids = info["doc_ids"]
+
+    should_remove_faiss = remove_mode in {"hard", "deactivate"}
+    should_delete_chunks = remove_mode in {"soft", "hard"}
+
+    faiss_removed = 0
+    if should_remove_faiss and faiss_ids:
+        try:
+            # SADECE bu firmanın index'inden sil.
+            get_company_chunk_engine(company_id).remove_ids(faiss_ids)
+            faiss_removed = len(faiss_ids)
+        except Exception as exc:  # noqa: BLE001
+            _log_api_error(
+                "remove_domain_faiss_failed",
+                exc=exc,
+                status=500,
+                context={"companyId": company_id, "domain": domain, "faissIdCount": len(faiss_ids)},
+            )
+            return jsonify({"error": f"failed to remove from FAISS: {exc}"}), 500
+
+    deleted_chunks = 0
+    if should_delete_chunks:
+        deleted_chunks = chunk_store.delete_chunks_by_company_domain(company_id, domain)
+
+    for did in doc_ids:
+        chunk_store.update_document_status(did, status="removed", error=None)
+        _deactivate_index_state(company_id, did, state="removed")
+
+    return jsonify(
+        {
+            "companyId": company_id,
+            "domain": domain,
+            "mode": remove_mode,
+            "docs": len(doc_ids),
+            "faissRemoved": faiss_removed,
+            "chunksDeleted": deleted_chunks,
             "state": "removed",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
