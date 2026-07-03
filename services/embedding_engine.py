@@ -278,6 +278,23 @@ class EmbeddingEngine:
                 raise ValueError(f"Query dim {query_vectors.shape[1]} != index dim {self._index.d}")
             faiss.normalize_L2(query_vectors)
             scores, ids = self._index.search(query_vectors, k)
+            # Self-heal: canlı bellek index'i sessizce bozulmuş olabilir (concurrent
+            # C++ erişimi → .d/.ntotal doğru görünür ama search TÜM -1 döner) hâlbuki
+            # disk sağlam. Bu, "index dolu ama arama 0" (canlı doğrulanan) arızasının
+            # kaynağı. Sonuç tamamen boşsa diskten TEK KEZ yeniden oku + tekrar dene;
+            # disk de eşleşme vermiyorsa boş kalır (yalnız gerçekten-boş sorguda ekstra
+            # okuma — nadir). Böylece restart beklemeden kendini onarır.
+            if len(ids) and all(int(i) == -1 for i in ids[0]):
+                disk_index = self._read_index_from_disk()
+                disk_dim = int(getattr(disk_index, "d", 0) or 0) if disk_index is not None else 0
+                if disk_index is not None and disk_index.ntotal > 0 and disk_dim == query_vectors.shape[1]:
+                    self._index = disk_index
+                    self._dimension = disk_dim
+                    try:
+                        self._index_mtime = os.path.getmtime(self.index_path)
+                    except OSError:
+                        self._index_mtime = None
+                    scores, ids = self._index.search(query_vectors, k)
             return scores, ids
 
     def count(self) -> int:
