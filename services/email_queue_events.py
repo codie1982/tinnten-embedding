@@ -11,12 +11,22 @@ from services.tinnten_server_client import get_tinnten_server_client
 logger = logging.getLogger("tinnten.embedding.email_events")
 
 
+def _flag_enabled(value):
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 class EmbeddingEmailEvents:
+    # Kill-switch: indexleme sonrası (started/completed/failed/upload) e-postaları.
+    # Varsayılan KAPALI — yalnızca EMBEDDING_EMAIL_EVENTS_ENABLED açıkça açılırsa
+    # e-posta olayı yayınlanır. Kod deploy'u tek başına gönderimi durdurur.
     def __init__(self):
         queue_name = (os.getenv("EMAIL_QUEUE_NAME") or "email_queue").strip()
         self.publisher = RabbitPublisher(queue_name=queue_name)
         self.server_client = get_tinnten_server_client()
         self.cache_ttl_seconds = int(os.getenv("EMBED_COMPANY_CONTACT_CACHE_TTL_SECONDS") or 300)
+        self._enabled = _flag_enabled(os.getenv("EMBEDDING_EMAIL_EVENTS_ENABLED"))
+        if not self._enabled:
+            logger.info("EmbeddingEmailEvents disabled (EMBEDDING_EMAIL_EVENTS_ENABLED not set).")
         self._cache = {}
         self._cache_lock = threading.RLock()
 
@@ -63,6 +73,8 @@ class EmbeddingEmailEvents:
         return "-"
 
     def _publish_for_company(self, *, company_id, event_type, subject, content):
+        if not self._enabled:
+            return False
         context = self._resolve_company_context(company_id)
         to = self._owner_email(context)
         if not to:
