@@ -143,3 +143,5 @@ cython_debug/
 *.json
 *.index
 *.index.*
+# Runtime error logs — repo'ya girmez
+logs/
