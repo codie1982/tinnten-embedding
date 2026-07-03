@@ -16,19 +16,19 @@ def _flag_enabled(value):
 
 
 class EmbeddingEmailEvents:
-    # Kill-switch: indexleme sonrası (started/completed/failed/upload) e-postaları.
-    # Varsayılan KAPALI — yalnızca EMBEDDING_EMAIL_EVENTS_ENABLED açıkça açılırsa
-    # e-posta olayı yayınlanır. Kod deploy'u tek başına gönderimi durdurur.
+    # İndexleme e-postaları KALDIRILDI (started/completed/failed/upload).
+    # `_enabled` KALICI False — EMBEDDING_EMAIL_EVENTS_ENABLED bayrağından BAĞIMSIZ
+    # (bayrak açılsa bile mail gitmez). Tüm send_* metodları `_publish_for_company`
+    # üzerinden geçer, o da her ağ çağrısından ÖNCE `_enabled`'a bakıp bail eder →
+    # tam, yan-etkisiz no-op. Geri bildirim artık abonelik state'i + UI/SSE ile verilir.
     def __init__(self):
-        queue_name = (os.getenv("EMAIL_QUEUE_NAME") or "email_queue").strip()
-        self.publisher = RabbitPublisher(queue_name=queue_name)
-        self.server_client = get_tinnten_server_client()
-        self.cache_ttl_seconds = int(os.getenv("EMBED_COMPANY_CONTACT_CACHE_TTL_SECONDS") or 300)
-        self._enabled = _flag_enabled(os.getenv("EMBEDDING_EMAIL_EVENTS_ENABLED"))
-        if not self._enabled:
-            logger.info("EmbeddingEmailEvents disabled (EMBEDDING_EMAIL_EVENTS_ENABLED not set).")
+        self.publisher = None
+        self.server_client = None
+        self.cache_ttl_seconds = 300
+        self._enabled = False  # HARD-DISABLED — indexleme mailleri kaldırıldı
         self._cache = {}
         self._cache_lock = threading.RLock()
+        logger.info("EmbeddingEmailEvents hard-disabled (indexleme e-postaları kaldırıldı).")
 
     def _resolve_company_context(self, company_id):
         normalized = str(company_id or "").strip()
