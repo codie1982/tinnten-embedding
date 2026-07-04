@@ -754,6 +754,11 @@ class IngestWorker:
             stats=stats_with_flags,
             error=None,
             extra={"index.finishedAt": finished_at},
+            # 0-chunk tamamlanmada da callback domain'li gitsin: chunk yokken
+            # domain content-load metadata'sından çözülür (inline fetcher_page
+            # payload'ı metadata.domain taşır).
+            callback_domain=metadata.get("domain") or metadata.get("fetcherDomain"),
+            callback_source=str(metadata.get("source") or context.trigger or "") or None,
         )
         self._log_document_event(
             context,
@@ -1890,6 +1895,8 @@ class IngestWorker:
         stats: Any = UPDATE_UNSET,
         error: Any = UPDATE_UNSET,
         extra: Optional[Dict[str, Any]] = None,
+        callback_domain: Optional[str] = None,
+        callback_source: Optional[str] = None,
     ) -> None:
         try:
             update_kwargs: Dict[str, Any] = {
@@ -1926,13 +1933,22 @@ class IngestWorker:
                 page_source = None
                 domain_chunks = None
                 if str(context.trigger or "") in ("fetcher_page", "fetcher_initial"):
+                    # Domain önce çağıran taraftan gelen hint'ten (content-load
+                    # metadata'sı). chunks=0 tamamlanmada kayıtlı chunk YOK →
+                    # chunk-tabanlı çözüm domain'siz kalır, callback metadata'sız
+                    # gider ve server website entry'sini bulamaz (abonelik
+                    # embedding-state köprüsü hiç tetiklenmez).
+                    if callback_domain:
+                        page_domain = str(callback_domain)
+                        page_source = str(callback_source or context.trigger)
                     try:
-                        for c in self._get_store().get_chunks_by_doc(context.document_id):
-                            md = c.get("metadata") or {}
-                            if md.get("domain"):
-                                page_domain = md.get("domain")
-                                page_source = str(md.get("source") or context.trigger)
-                                break
+                        if not page_domain:
+                            for c in self._get_store().get_chunks_by_doc(context.document_id):
+                                md = c.get("metadata") or {}
+                                if md.get("domain"):
+                                    page_domain = md.get("domain")
+                                    page_source = str(md.get("source") or context.trigger)
+                                    break
                         if not page_source:
                             page_source = str(context.trigger)
                         if page_domain:
