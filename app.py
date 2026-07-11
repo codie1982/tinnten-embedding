@@ -198,6 +198,14 @@ HYBRID_SEARCH_ENABLED = (os.getenv("HYBRID_SEARCH_ENABLED") or "").strip().lower
     "on",
 }
 HYBRID_OVERFETCH = max(1, int(os.getenv("HYBRID_OVERFETCH") or 4))
+FILTERED_SEARCH_OVERFETCH = max(1, int(os.getenv("FILTERED_SEARCH_OVERFETCH") or 200))
+FILTERED_SEARCH_MIN_CANDIDATES = max(
+    1, int(os.getenv("FILTERED_SEARCH_MIN_CANDIDATES") or 1000)
+)
+FILTERED_SEARCH_MAX_CANDIDATES = max(
+    FILTERED_SEARCH_MIN_CANDIDATES,
+    int(os.getenv("FILTERED_SEARCH_MAX_CANDIDATES") or 5000),
+)
 RRF_K_CONSTANT = max(1, int(os.getenv("RRF_K_CONSTANT") or 60))
 RERANKER_MODEL = (os.getenv("RERANKER_MODEL") or "").strip()
 RERANK_TOP_N = max(1, int(os.getenv("RERANK_TOP_N") or 30))
@@ -1528,6 +1536,20 @@ def _chunk_search_response(payload: dict):
         and (hybrid_requested if hybrid_requested is not None else HYBRID_SEARCH_ENABLED)
     )
     n_dense = k * HYBRID_OVERFETCH if do_hybrid else k
+    # Filters are evaluated after FAISS returns candidates.  When per-company
+    # FAISS is disabled (the current global-index rollout state), asking FAISS
+    # for only `k` neighbours can yield zero rows after company/domain filters
+    # even though matching vectors exist.  Over-fetch a bounded candidate set;
+    # the common unfiltered path remains unchanged.
+    if filters:
+        filtered_candidates = max(
+            FILTERED_SEARCH_MIN_CANDIDATES,
+            k * FILTERED_SEARCH_OVERFETCH,
+        )
+        n_dense = max(
+            n_dense,
+            min(filtered_candidates, FILTERED_SEARCH_MAX_CANDIDATES),
+        )
 
     try:
         scores, ids = engine.search(query_vec, n_dense)

@@ -454,7 +454,12 @@ class EmbeddingEngine:
             return None
         if not isinstance(index, faiss.IndexIDMap):
             index = faiss.IndexIDMap(index)
-        return faiss.downcast_index(index)
+        # `downcast_index()` returns a SWIG view whose underlying C++ object is
+        # owned by `index`.  Keep the owning wrapper alive on the engine;
+        # otherwise the local `index` can be garbage-collected and the live
+        # view starts returning impossible dimensions / empty searches.
+        self._backing_index = index
+        return faiss.downcast_index(self._backing_index)
 
     def _cleanup_tmp_files(self) -> None:
         if not self.cleanup_tmp:
@@ -554,7 +559,11 @@ class EmbeddingEngine:
                 index = faiss.read_index(self.index_path)
                 if not isinstance(index, faiss.IndexIDMap):
                     index = faiss.IndexIDMap(index)
-                self._index = faiss.downcast_index(index)
+                # Keep the SWIG owner alive for as long as the downcast view is
+                # used. `_load_index()` already did this; the mtime reload path
+                # must provide the same ownership guarantee.
+                self._backing_index = index
+                self._index = faiss.downcast_index(self._backing_index)
                 self._dimension = int(self._index.d)
                 if self._dimension <= 0 or self._dimension > self.max_index_dimension:
                     raise ValueError(f"invalid FAISS index dimension: {self._dimension}")

@@ -3,12 +3,35 @@ EmbeddingEngine.search self-heal: canlı bellek index'i bozulup TÜM -1 dönerse
 (disk sağlamken) — "index dolu ama arama 0" arızası — diskten yeniden okuyup
 tekrar dener. Restart beklemeden kendini onarır.
 """
+import gc
 import threading
 from unittest.mock import MagicMock
 
 import numpy as np
 
 from services.embedding_engine import EmbeddingEngine
+
+
+def test_reload_keeps_faiss_owner_alive(tmp_path):
+    """The downcast SWIG view must not outlive its owning index wrapper."""
+    import faiss
+
+    path = tmp_path / "owned.index"
+    source = faiss.IndexIDMap2(faiss.IndexFlatIP(2))
+    vectors = np.asarray([[1.0, 0.0]], dtype="float32")
+    source.add_with_ids(vectors, np.asarray([42], dtype="int64"))
+    faiss.write_index(source, str(path))
+
+    eng = EmbeddingEngine.__new__(EmbeddingEngine)
+    eng.index_path = str(path)
+    eng._backing_index = None
+    loaded = eng._read_index_from_disk()
+    gc.collect()
+
+    assert eng._backing_index is not None
+    assert loaded.d == 2
+    scores, ids = loaded.search(vectors, 1)
+    assert int(ids[0][0]) == 42
 
 
 def _bare_engine():
