@@ -158,6 +158,43 @@ def test_maybe_rerank_predict_failure_falls_back(app_with_mocks, mocker):
     assert app._maybe_rerank("q", results) is results
 
 
+def test_title_heading_match_beats_repeated_inline_link(app_with_mocks):
+    import app
+
+    rows = [
+        {
+            "doc_id": "sidebar-page",
+            "score": 0.91,
+            "text": "Populer: [Plaj Donusu Ilk 24 Saat Cildinizi Rahatlatacak](/x)",
+            "metadata": {"url": "https://example.com/unrelated"},
+        },
+        {
+            "doc_id": "target-page",
+            "score": 0.64,
+            "text": "# Plaj Donusu Ilk 24 Saat Cildinizi Rahatlatacak En Iyi Kremler",
+            "metadata": {"url": "https://example.com/target"},
+        },
+    ]
+
+    out = app._promote_title_matches(
+        "Plaj Donusu Ilk 24 Saat Cildinizi Rahatlatacak", rows
+    )
+    assert out[0]["doc_id"] == "target-page"
+    assert out[0]["title_match"] == 2
+
+
+def test_title_promotion_deduplicates_document_chunks(app_with_mocks):
+    import app
+
+    rows = [
+        {"doc_id": "same", "score": 0.9, "text": "hello", "metadata": {}},
+        {"doc_id": "same", "score": 0.8, "text": "hello again", "metadata": {}},
+        {"doc_id": "other", "score": 0.7, "text": "other", "metadata": {}},
+    ]
+    out = app._promote_title_matches("semantic query", rows)
+    assert [row["doc_id"] for row in out] == ["same", "other"]
+
+
 # ---------------------------------------------------------------------------
 # Endpoint hybrid dalı — dense + lexical füzyonu, per-request gating
 # ---------------------------------------------------------------------------

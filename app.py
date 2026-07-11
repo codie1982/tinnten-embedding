@@ -200,7 +200,7 @@ HYBRID_SEARCH_ENABLED = (os.getenv("HYBRID_SEARCH_ENABLED") or "").strip().lower
 HYBRID_OVERFETCH = max(1, int(os.getenv("HYBRID_OVERFETCH") or 4))
 FILTERED_SEARCH_OVERFETCH = max(1, int(os.getenv("FILTERED_SEARCH_OVERFETCH") or 200))
 FILTERED_SEARCH_MIN_CANDIDATES = max(
-    1, int(os.getenv("FILTERED_SEARCH_MIN_CANDIDATES") or 1000)
+    1, int(os.getenv("FILTERED_SEARCH_MIN_CANDIDATES") or 5000)
 )
 FILTERED_SEARCH_MAX_CANDIDATES = max(
     FILTERED_SEARCH_MIN_CANDIDATES,
@@ -1495,6 +1495,60 @@ def _maybe_rerank(query_text: str | None, results: list[dict], *, enabled: bool 
     return head_sorted + tail
 
 
+def _promote_title_matches(query_text: str | None, results: list[dict]) -> list[dict]:
+    """Promote the source page whose own heading/title matches the query.
+
+    Large sites repeat recommendation/sidebar links on thousands of pages. A
+    title query can therefore retrieve many unrelated source URLs containing
+    the same link before the article's own chunk. Markdown headings and
+    metadata.title are stronger evidence than an inline occurrence.
+    """
+    if not query_text or not results:
+        return results
+
+    def normalize(value) -> str:
+        return re.sub(r"[^\w]+", " ", str(value or "").casefold()).strip()
+
+    query_norm = normalize(query_text)
+    if len(query_norm) < 3:
+        return results
+
+    ranked = []
+    for position, row in enumerate(results):
+        metadata = row.get("metadata") or {}
+        text = str(row.get("text") or "")
+        title_norm = normalize(metadata.get("title"))
+        headings = [
+            normalize(line.lstrip("#").strip())
+            for line in text.splitlines()
+            if line.lstrip().startswith("#")
+        ]
+        strong_match = bool(
+            (title_norm and (query_norm in title_norm or title_norm in query_norm))
+            or any(query_norm in heading or heading in query_norm for heading in headings if heading)
+        )
+        inline_match = query_norm in normalize(text)
+        rank = 2 if strong_match else (1 if inline_match else 0)
+        enriched = dict(row)
+        if rank:
+            enriched["title_match"] = rank
+        ranked.append((rank, float(row.get("score") or 0.0), -position, enriched))
+
+    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2]))
+
+    # One result per source document keeps repeated adjacent chunks from
+    # consuming the whole result page.
+    deduped = []
+    seen_docs = set()
+    for _, _, _, row in ranked:
+        doc_key = str(row.get("doc_id") or row.get("chunk_id") or row.get("id"))
+        if doc_key in seen_docs:
+            continue
+        seen_docs.add(doc_key)
+        deduped.append(row)
+    return deduped
+
+
 def _chunk_search_response(payload: dict):
     k = int(payload.get("k") or 5)
     if k <= 0:
@@ -1588,6 +1642,7 @@ def _chunk_search_response(payload: dict):
             dense_results.append(row)
 
     if not do_hybrid:
+        dense_results = _promote_title_matches(text_query, dense_results)
         return jsonify({"results": dense_results[:k]})
 
     # Lexical dal — $text sonuçlarını AYNI pipeline'dan geçir (durum + filtre + radius).
@@ -1615,6 +1670,7 @@ def _chunk_search_response(payload: dict):
     fused = _rrf_fuse(dense_results, lexical_results, k_const=RRF_K_CONSTANT)
     rerank_enabled = payload.get("rerank") is not False
     fused = _maybe_rerank(text_query, fused, enabled=rerank_enabled)
+    fused = _promote_title_matches(text_query, fused)
     for row in fused:
         row["retrieval"] = "hybrid"
     return jsonify({"results": fused[:k]})
