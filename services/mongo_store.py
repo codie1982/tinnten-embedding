@@ -60,6 +60,12 @@ class MongoStore:
         self.documents.create_index([("status", ASCENDING)], name="status_idx")
         self.chunks.create_index([("faiss_id", ASCENDING)], unique=True, name="faiss_id_unique")
         self.chunks.create_index([("doc_id", ASCENDING)], name="chunk_doc_idx")
+        # Sürüm-seçici swap sorguları (doc_id + ingest_version) için — eski sürümü
+        # temizlerken ve aramada aktif sürümü süzerken sık kullanılır.
+        self.chunks.create_index(
+            [("doc_id", ASCENDING), ("ingest_version", ASCENDING)],
+            name="chunk_doc_version_idx",
+        )
         # FAZ 5 — hybrid retrieval altyapısı.
         # 1) Lexical ($text) index: dense FAISS'e paralel BM25-benzeri sözcük araması.
         #    default_language="none": içerik TR/EN karışık; Mongo'nun TR stemmer'ı yok
@@ -160,8 +166,69 @@ class MongoStore:
         return list(cursor)
 
     def delete_chunks_by_doc(self, doc_id: str, *, session=None) -> int:
+        """Bir dokümanın TÜM chunk'larını siler — sürümden bağımsız.
+
+        DİKKAT: versiyonlu swap'ta KULLANMA. Swap sırasında eski ve yeni sürüm
+        chunk'ları aynı `doc_id` altında bir süre birlikte yaşar; bu metot ikisini
+        birden siler ve yeni veriyi de yok eder. Swap için
+        `delete_chunks_by_doc_version` kullan. Bu metot yalnız dokümanı tamamen
+        kaldırırken (remove endpoint'i) doğrudur.
+        """
         result = self.chunks.delete_many({"doc_id": doc_id}, session=session)
         return int(result.deleted_count)
+
+    # ------------------------------------------------------------------
+    # Sürüm-seçici işlemler — idempotent re-ingest'in "önce ekle, sonra eskiyi
+    # kaldır" swap'ı için. Eski/yeni sürüm geçiş penceresinde birlikte var olur.
+    # ------------------------------------------------------------------
+    def get_chunks_by_doc_version(self, doc_id: str, version: str) -> List[Dict[str, Any]]:
+        cursor = self.chunks.find({"doc_id": doc_id, "ingest_version": version}).sort(
+            "chunk_index", ASCENDING
+        )
+        return list(cursor)
+
+    def delete_chunks_by_doc_version(self, doc_id: str, version: str, *, session=None) -> int:
+        """Yalnız belirtilen sürümün chunk'larını siler."""
+        result = self.chunks.delete_many(
+            {"doc_id": doc_id, "ingest_version": version}, session=session
+        )
+        return int(result.deleted_count)
+
+    def delete_chunks_by_doc_except_version(
+        self, doc_id: str, active_version: str, *, session=None
+    ) -> int:
+        """Aktif sürüm DIŞINDAKİ her şeyi siler.
+
+        Sürümsüz (legacy) chunk'ları da temizler: `ingest_version` alanı olmayan
+        kayıtlar `$ne` ile eşleşir. Bu, ilk versiyonlu ingest'in eski sürümsüz
+        chunk'ları geride bırakmamasını sağlar.
+        """
+        result = self.chunks.delete_many(
+            {"doc_id": doc_id, "ingest_version": {"$ne": active_version}}, session=session
+        )
+        return int(result.deleted_count)
+
+    def get_faiss_ids_by_doc_except_version(self, doc_id: str, active_version: str) -> List[int]:
+        """Aktif sürüm dışındaki chunk'ların faiss_id'leri (FAISS temizliği için)."""
+        cursor = self.chunks.find(
+            {"doc_id": doc_id, "ingest_version": {"$ne": active_version}},
+            {"faiss_id": 1},
+        )
+        out: List[int] = []
+        for row in cursor:
+            fid = row.get("faiss_id")
+            if isinstance(fid, (int, float)):
+                out.append(int(fid))
+        return out
+
+    def set_active_ingest_version(self, doc_id: str, version: str, *, session=None) -> None:
+        """Dokümanın aktif sürümünü işaretler — arama yalnız bunu görür."""
+        self.documents.update_one(
+            {"doc_id": doc_id},
+            {"$set": {"active_ingest_version": version, "updated_at": datetime.now(timezone.utc)}},
+            upsert=False,
+            session=session,
+        )
 
     @staticmethod
     def _company_domain_query(company_id: str, domain: str) -> Dict[str, Any]:

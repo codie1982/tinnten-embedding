@@ -4,7 +4,7 @@ Repository helpers for `contentdocuments` and `contentdocumentlogs`.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence
 
 from bson import ObjectId
@@ -296,6 +296,122 @@ class ContentDocumentStore:
             document_id=document_id,
             error=None,
         )
+
+    # ------------------------------------------------------------------
+    # Ingest lock — lease'li compare-and-set
+    #
+    # `update_index_fields` atomiktir ama LOCK DEĞİLDİR: beklenen bir duruma
+    # koşul koymadan yazar, yani iki eşzamanlı re-ingest birbirinin chunk'larını
+    # silebilir. Aşağıdaki API gerçek lock semantiği verir:
+    #   * lease  → worker ölürse kilit kalıcı olmaz, süresi dolunca devralınır
+    #   * job_id → kilidi yalnız sahibi bırakabilir/ilerletebilir
+    #   * CAS    → eski bir job, yeni job'ın durumunu ezemez
+    # RabbitMQ redelivery'si aynı job_id ile gelir → aynı job kendi kilidini
+    # yeniden alabilir (idempotent).
+    # ------------------------------------------------------------------
+    def try_acquire_ingest_lock(
+        self,
+        *,
+        company_id: Optional[str],
+        document_id: str,
+        job_id: str,
+        lease_seconds: int = 900,
+        session=None,
+    ) -> Optional[Dict[str, Any]]:
+        """Kilidi almayı dener. Alırsa güncel dokümanı, alamazsa None döner.
+
+        Kilit şu durumlarda alınır:
+          * hiç kilit yoksa,
+          * lease süresi dolmuşsa (ölü worker),
+          * kilit zaten AYNI job_id'nin ise (redelivery → idempotent).
+        """
+        now = datetime.now(timezone.utc)
+        lease_until = now + timedelta(seconds=int(lease_seconds))
+        base = self._document_selector(company_id, document_id)
+        free_or_ours = {
+            "$or": [
+                {"index.lock": None},
+                {"index.lock.jobId": job_id},
+                {"index.lock.leaseUntil": {"$lt": now}},
+            ]
+        }
+        query = {"$and": [base, free_or_ours]}
+        updates = {
+            "index.lock": {"jobId": job_id, "acquiredAt": now, "leaseUntil": lease_until},
+            "index.state": "processing",
+            "indexState": "processing",
+            "index.startedAt": now,
+            "index.lastRunAt": now,
+        }
+        return self.documents.find_one_and_update(
+            query,
+            {"$set": updates},
+            return_document=ReturnDocument.AFTER,
+            session=session,
+        )
+
+    def renew_ingest_lock(
+        self,
+        *,
+        company_id: Optional[str],
+        document_id: str,
+        job_id: str,
+        lease_seconds: int = 900,
+        session=None,
+    ) -> bool:
+        """Uzun süren işlerde lease'i uzatır. Kilit bizde değilse False."""
+        now = datetime.now(timezone.utc)
+        query = {
+            "$and": [
+                self._document_selector(company_id, document_id),
+                {"index.lock.jobId": job_id},
+            ]
+        }
+        result = self.documents.update_one(
+            query,
+            {"$set": {"index.lock.leaseUntil": now + timedelta(seconds=int(lease_seconds))}},
+            session=session,
+        )
+        return int(result.matched_count or 0) > 0
+
+    def release_ingest_lock(
+        self,
+        *,
+        company_id: Optional[str],
+        document_id: str,
+        job_id: str,
+        state: Optional[str] = None,
+        error: Any = _UNSET,
+        session=None,
+    ) -> bool:
+        """Kilidi bırakır — YALNIZ sahibi olan job.
+
+        `jobId` koşulu kritik: lease'i dolduğu için işi devralınmış ESKİ bir job
+        geri dönüp durumu `ready`/`failed` yapamaz ve yeni job'ın kilidini
+        düşüremez. Kilit bizde değilse hiçbir şey yazılmaz ve False döner.
+        """
+        now = datetime.now(timezone.utc)
+        query = {
+            "$and": [
+                self._document_selector(company_id, document_id),
+                {"index.lock.jobId": job_id},
+            ]
+        }
+        updates: Dict[str, Any] = {"index.lock": None, "index.finishedAt": now, "index.lastRunAt": now}
+        if state is not None:
+            updates["index.state"] = state
+            updates["indexState"] = state
+        if error is not _UNSET:
+            updates["index.errorMsg"] = error
+        result = self.documents.update_one(query, {"$set": updates}, session=session)
+        return int(result.matched_count or 0) > 0
+
+    @staticmethod
+    def _document_selector(company_id: Optional[str], document_id: str) -> Dict[str, Any]:
+        """Kilit sorguları için doküman seçici (companyId opsiyonel — personal docs)."""
+        if company_id:
+            return {"companyId": company_id, "documentId": document_id}
+        return {"documentId": document_id}
 
     def upsert_document_with_source(
         self,

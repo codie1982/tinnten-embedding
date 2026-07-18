@@ -258,6 +258,24 @@ def warmup_embedding_models() -> None:
             loader()
             logger.info("Warmup finished %s in %.2fs", name, time.time() - step_started_at)
 
+        # Reranker'ı boot'ta yükle (RERANKER_MODEL set ise). İlk sorgu, ~2GB
+        # cross-encoder'ın indirme/yükleme cezasını ödemesin. `_get_reranker`
+        # başarısızlığı YUTAR (servis healthy kalır, arama güvenli düşer); sonuç
+        # `_reranker_status()` ile /config'te görünür → sessiz degrade değil.
+        # RERANKER_MODEL boşsa _get_reranker anında None döner (no-op).
+        if RERANKER_MODEL:
+            step_started_at = time.time()
+            logger.info("Warmup loading reranker (%s)...", RERANKER_MODEL)
+            reranker = _get_reranker()
+            if reranker is not None:
+                logger.info("Warmup finished reranker in %.2fs", time.time() - step_started_at)
+            else:
+                logger.warning(
+                    "Reranker warmup FAILED (%s); search will run without rerank. "
+                    "See GET /api/v10/config -> reranker_load_error",
+                    _RERANKER_LOAD_ERROR or "unknown",
+                )
+
         _startup_warmup_done = True
         logger.info("Startup model warmup completed in %.2fs", time.time() - started_at)
 
@@ -1377,6 +1395,15 @@ def _assemble_chunk_result(
     doc_info = doc_status_map.get(chunk.get("doc_id"))
     if doc_info and str(doc_info.get("status")).lower() in {"disabled", "removed"}:
         return None
+    # Yalnız AKTİF ingest sürümünü göster. Re-ingest "önce ekle, sonra eskiyi
+    # kaldır" sırasıyla çalıştığı için eski ve yeni sürüm chunk'ları kısa bir
+    # pencerede FAISS'te birlikte yaşar; bu süzgeç olmadan arama aynı içeriği
+    # iki kez döndürür. `active_ingest_version` yoksa (legacy doküman, sürüm
+    # etiketi hiç yazılmamış) süzme YAPILMAZ → geriye dönük uyumlu.
+    if doc_info:
+        active_version = doc_info.get("active_ingest_version")
+        if active_version and chunk.get("ingest_version") != active_version:
+            return None
     if not _passes_chunk_filters(chunk, filters):
         return None
     combined_text = chunk.get("text")
@@ -1445,6 +1472,11 @@ def _rrf_fuse(dense: list[dict], lexical: list[dict], *, k_const: int = 60) -> l
 
 _RERANKER = None
 _RERANKER_LOADED = False
+# Yükleme DENENDI mi + neden başarısız oldu. `/config` bunları YAN ETKİSİZ okur
+# (read-only endpoint model indirmeyi tetiklememeli), böylece "reranker açık
+# sanıyorduk ama sessizce kapalıymış" durumu deploy'da görünür olur.
+_RERANKER_LOAD_ATTEMPTED = False
+_RERANKER_LOAD_ERROR: str | None = None
 
 
 def _get_reranker():
@@ -1453,34 +1485,59 @@ def _get_reranker():
     Yükleme başarısızsa None'a düşer (arama füzyonla devam eder) — tek denemede
     işaretlenir, her istekte yeniden denenmez.
     """
-    global _RERANKER, _RERANKER_LOADED
+    global _RERANKER, _RERANKER_LOADED, _RERANKER_LOAD_ATTEMPTED, _RERANKER_LOAD_ERROR
     if _RERANKER_LOADED:
         return _RERANKER
     _RERANKER_LOADED = True
     if not RERANKER_MODEL:
         _RERANKER = None
         return None
+    _RERANKER_LOAD_ATTEMPTED = True
     try:
         from sentence_transformers import CrossEncoder
 
         _RERANKER = CrossEncoder(RERANKER_MODEL)
+        _RERANKER_LOAD_ERROR = None
     except Exception as exc:  # noqa: BLE001
         print(f"[reranker] load failed model={RERANKER_MODEL}: {exc}")
         _RERANKER = None
+        _RERANKER_LOAD_ERROR = str(exc)
     return _RERANKER
 
 
-def _maybe_rerank(query_text: str | None, results: list[dict], *, enabled: bool = True) -> list[dict]:
+def _reranker_status() -> dict:
+    """
+    Reranker durumunun YAN ETKİSİZ görüntüsü — `_get_reranker()` ÇAĞIRMAZ.
+    `/config` bunu kullanır; aksi halde read-only bir istek ~2GB model indirmeyi
+    tetikleyebilirdi.
+    """
+    return {
+        "reranker_model": RERANKER_MODEL or None,
+        "reranker_configured": bool(RERANKER_MODEL),
+        "reranker_load_attempted": _RERANKER_LOAD_ATTEMPTED,
+        "reranker_loaded": _RERANKER is not None,
+        "reranker_load_error": _RERANKER_LOAD_ERROR,
+    }
+
+
+def _maybe_rerank(
+    query_text: str | None, results: list[dict], *, enabled: bool = True
+) -> tuple[list[dict], bool]:
     """
     Opsiyonel cross-encoder rerank: ilk `RERANK_TOP_N` adayı (query, text) çiftiyle
     yeniden skorlar, kalan kuyruğu olduğu gibi bırakır. Reranker yoksa/kapalıysa ya
     da skorlama patlarsa girdi sırası korunur (güvenli düşüş).
+
+    `(results, applied)` döner. `applied` YALNIZ model çağrısı başarıyla tamamlanıp
+    skorlar sonuçlara uygulandığında True — sessiz fallback (model yok / predict
+    patladı) çağıranca ayırt edilebilsin diye. Bu ayrım olmadan "hybrid+rerank"
+    ölçümü gerçekte yalnız hybrid çalıştırıyor olabilir ve fark edilmez.
     """
     if not enabled or not query_text or not results:
-        return results
+        return results, False
     reranker = _get_reranker()
     if reranker is None:
-        return results
+        return results, False
     head = results[:RERANK_TOP_N]
     tail = results[RERANK_TOP_N:]
     pairs = [(query_text, r.get("text") or "") for r in head]
@@ -1488,11 +1545,11 @@ def _maybe_rerank(query_text: str | None, results: list[dict], *, enabled: bool 
         scores = reranker.predict(pairs)
     except Exception as exc:  # noqa: BLE001
         print(f"[reranker] predict failed: {exc}")
-        return results
+        return results, False
     for r, s in zip(head, scores):
         r["rerank_score"] = float(s)
     head_sorted = sorted(head, key=lambda r: -float(r.get("rerank_score") or 0.0))
-    return head_sorted + tail
+    return head_sorted + tail, True
 
 
 def _promote_title_matches(query_text: str | None, results: list[dict]) -> list[dict]:
@@ -1643,7 +1700,22 @@ def _chunk_search_response(payload: dict):
 
     if not do_hybrid:
         dense_results = _promote_title_matches(text_query, dense_results)
-        return jsonify({"results": dense_results[:k]})
+        for row in dense_results:
+            row["retrieval"] = "dense"
+        return jsonify(
+            {
+                "results": dense_results[:k],
+                "retrieval_meta": {
+                    "retrieval": "dense",
+                    "hybrid_applied": False,
+                    "rerank_requested": False,
+                    "rerank_applied": False,
+                    "dense_count": len(dense_results),
+                    "lexical_count": 0,
+                    **_reranker_status(),
+                },
+            }
+        )
 
     # Lexical dal — $text sonuçlarını AYNI pipeline'dan geçir (durum + filtre + radius).
     lexical_docs = chunk_store.text_search_chunks(text_query, filters, limit=n_dense)
@@ -1669,11 +1741,26 @@ def _chunk_search_response(payload: dict):
 
     fused = _rrf_fuse(dense_results, lexical_results, k_const=RRF_K_CONSTANT)
     rerank_enabled = payload.get("rerank") is not False
-    fused = _maybe_rerank(text_query, fused, enabled=rerank_enabled)
+    fused, rerank_applied = _maybe_rerank(text_query, fused, enabled=rerank_enabled)
     fused = _promote_title_matches(text_query, fused)
     for row in fused:
         row["retrieval"] = "hybrid"
-    return jsonify({"results": fused[:k]})
+    return jsonify(
+        {
+            "results": fused[:k],
+            "retrieval_meta": {
+                "retrieval": "hybrid",
+                "hybrid_applied": True,
+                "rerank_requested": bool(rerank_enabled),
+                "rerank_applied": rerank_applied,
+                "rerank_top_n": RERANK_TOP_N,
+                "rrf_k_constant": RRF_K_CONSTANT,
+                "dense_count": len(dense_results),
+                "lexical_count": len(lexical_results),
+                **_reranker_status(),
+            },
+        }
+    )
 
 
 def _websearch_faiss_search(query: str, k: int, model_name: str, index_path: str):
@@ -1738,6 +1825,33 @@ def root():
             "chunk_engine_loaded": chunk_engine_loaded,
         }
     )
+
+@app.route("/api/v10/config", methods=["GET"])
+def retrieval_config():
+    """
+    Etkin retrieval yapılandırmasını döner — eval harness'i KOŞMADAN ÖNCE
+    yeteneği doğrulasın diye (ör. "reranker açık mı, yüklendi mi?").
+
+    AUTH KORUMALI: model adı ve runtime config anonim açılmaz — `/healthz` gibi
+    allowlist'e EKLENMEZ (bkz. `_should_require_auth`, GET allowlist'i yalnız
+    "/" ve "/healthz").
+
+    YAN ETKİSİZ: reranker durumu `_reranker_status()` ile mevcut singleton'dan
+    okunur; `_get_reranker()` çağrılmaz (read-only bir istek ~2GB model
+    indirmeyi tetiklememeli).
+    """
+    return jsonify(
+        {
+            "hybrid_search_enabled": HYBRID_SEARCH_ENABLED,
+            "hybrid_overfetch": HYBRID_OVERFETCH,
+            "rrf_k_constant": RRF_K_CONSTANT,
+            "rerank_top_n": RERANK_TOP_N,
+            "chunk_model_name": CHUNK_MODEL_NAME,
+            "per_company_faiss_enabled": PER_COMPANY_FAISS_ENABLED,
+            **_reranker_status(),
+        }
+    )
+
 
 @app.route("/api/v10/llm/vector", methods=["POST"])
 def generate_vector():

@@ -5,8 +5,14 @@ def test_chunk_search_success(client, mocker):
     mock_vec = np.zeros((1, 768), dtype=np.float32)
     mock_engine = mocker.Mock()
     mock_engine.encode.return_value = mock_vec
+    # Skorlar AZALAN olmalı: index IndexFlatIP + normalize edilmiş vektör, yani
+    # kosinüs benzerliği döner ve FAISS en iyiyi (en yüksek skoru) ilk sırada
+    # verir. Mock eskiden artan ([0.1, 0.2]) veriyordu — gerçek FAISS'in asla
+    # üretmeyeceği bir sıra. Sonuç sırasını skora göre değerlendiren downstream
+    # mantık (`_promote_title_matches`) eklenince bu gerçekdışı mock testi
+    # kırdı; sıra beklentisi doğruydu, skorlar tersti.
     mock_engine.search.return_value = (
-        np.array([[0.1, 0.2]]), # scores
+        np.array([[0.9, 0.7]]), # scores (azalan — FAISS sırası)
         np.array([[10, 20]])   # ids
     )
     mocker.patch("app.get_chunk_engine", return_value=mock_engine)

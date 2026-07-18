@@ -18,6 +18,29 @@ RUN apt-get update && \
 COPY requirements.txt .
 RUN pip install --no-cache-dir --retries 10 --timeout 100 -r requirements.txt
 
+# HuggingFace model cache'i /opt/huggingface'te — bu dizin runtime'daki
+# `embedding_data:/app/data` volume mount'unun ALTINDA DEĞİL, o yüzden build'de
+# buraya bake edilen model runtime'da volume tarafından ÖRTÜLMEZ (RAG v2 KN2).
+# HF_HOME set etmezsek modeller ~/.cache/huggingface'e iner ve her container
+# yeniden yaratmada kaybolur (ilk sorgu ~2GB reranker'ı tekrar indirir).
+ENV HF_HOME=/opt/huggingface \
+    SENTENCE_TRANSFORMERS_HOME=/opt/huggingface
+
+# Opsiyonel build-time reranker bake (RAG v2 — Faz 4).
+# VARSAYILAN BOŞ = bake YOK (reranker kapali, image'a ~2GB eklenmez).
+# Reranker acilirken determinizm icin bake et + revision PINLE:
+#   docker build --build-arg RERANKER_MODEL=BAAI/bge-reranker-v2-m3 \
+#                --build-arg RERANKER_REVISION=<commit-sha> .
+# Yalniz model adi build'i tekrarlanabilir yapmaz — revision sart.
+ARG RERANKER_MODEL=
+ARG RERANKER_REVISION=
+RUN if [ -n "$RERANKER_MODEL" ]; then \
+      echo "Baking reranker $RERANKER_MODEL (revision=${RERANKER_REVISION:-none})" && \
+      RM="$RERANKER_MODEL" RR="$RERANKER_REVISION" python -c "import os; from sentence_transformers import CrossEncoder; CrossEncoder(os.environ['RM'], revision=(os.environ['RR'] or None))"; \
+    else \
+      echo "RERANKER_MODEL bos — bake atlandi (reranker kapali)"; \
+    fi
+
 # Uygulama dosyalarını kopyala
 COPY . .
 

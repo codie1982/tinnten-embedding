@@ -54,6 +54,12 @@ LEGACY_QUEUE_NAME = "embedding.ingest"
 DEFAULT_CHUNK_SIZE = 1200
 DEFAULT_CHUNK_OVERLAP = 200
 DEFAULT_BATCH_SIZE = 32
+DEFAULT_INGEST_LEASE_SECONDS = 900
+
+# 'auto' chunk stratejisi: metinde ATX markdown başlığı var mı? (Faz 7 / KN3)
+# Yalnız satır başı '#'ler heading sayılır — böylece schema-derived düz metinde
+# (başlıksız \n-join) veya prosa içindeki '#'te yanlış pozitif olmaz.
+_HAS_ATX_HEADING = re.compile(r"(?m)^#{1,6}\s+\S")
 DEFAULT_CONTENT_DOC_LOOKUP_RETRIES = 3
 DEFAULT_CONTENT_DOC_LOOKUP_DELAY_SECONDS = 2.0
 DEFAULT_UPLOAD_DOWNLOAD_RETRIES = 5
@@ -116,6 +122,20 @@ class IngestWorker:
         self.chunk_size = int(os.getenv("EMBED_CHUNK_SIZE") or DEFAULT_CHUNK_SIZE)
         self.chunk_overlap = int(os.getenv("EMBED_CHUNK_OVERLAP") or DEFAULT_CHUNK_OVERLAP)
         self.batch_size = int(os.getenv("EMBED_BATCH_SIZE") or DEFAULT_BATCH_SIZE)
+        # Ingest kilidinin lease süresi. Worker ölürse kilit bu kadar sonra
+        # devralınabilir → kalıcı kilit oluşmaz. Uzun dokümanların embed süresinden
+        # belirgin uzun olmalı (aksi halde iş bitmeden kilit çalınır).
+        self.ingest_lease_seconds = int(os.getenv("INGEST_LEASE_SECONDS") or DEFAULT_INGEST_LEASE_SECONDS)
+        # Faithful schema reindex (Faz 6): fetcher DB-read yolunda schema-derived
+        # metni markdown'dan önce kullan. Varsayılan KAPALI → mevcut davranış
+        # korunur. Fetcher `Config.INDEX_SCHEMA_MIN_CHARS` ile aynı eşik (80).
+        self.index_schema_content_enabled = (
+            (os.getenv("INDEX_SCHEMA_CONTENT_ENABLED") or "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        # Fetcher `Config.INDEX_SCHEMA_MIN_CHARS` (=200) ile AYNI olmalı — eşik
+        # farkı reindex'i canlı ile ayrıştırır (bkz. schema_index_text.py).
+        self.index_schema_min_chars = int(os.getenv("INDEX_SCHEMA_MIN_CHARS") or 200)
         default_chunk_model = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
         self.model_name = os.getenv("CHUNK_MODEL_NAME") or os.getenv("MODEL_NAME") or default_chunk_model
         self.index_path = os.getenv("CHUNK_INDEX_PATH") or os.getenv("FAISS_INDEX_PATH") or "faiss.index"
@@ -549,15 +569,6 @@ class IngestWorker:
             raise ValueError("embeddings length must match chunks length")
 
         store = self._get_store()
-        faiss_ids = store.reserve_faiss_ids(len(chunks))
-        
-        # Idempotency: check for existing chunks
-        existing_chunks = store.get_chunks_by_doc(doc_id)
-        old_faiss_ids = []
-        if existing_chunks:
-            old_faiss_ids = [c["faiss_id"] for c in existing_chunks if "faiss_id" in c]
-            deleted_count = store.delete_chunks_by_doc(doc_id)
-            log(f"Removed {deleted_count} old chunks for doc_id={doc_id}")
 
         # Explicit index_path verilmişse ona saygı göster; yoksa firma-scope'a
         # yönlendir (bayrak kapalıysa global — davranış değişmez).
@@ -568,49 +579,102 @@ class IngestWorker:
                 metadata.get("companyId") or metadata.get("company_id")
             )
 
-        if old_faiss_ids:
-            # Optimize: use replace_embeddings to save to disk only once
-            engine.replace_embeddings(old_faiss_ids, embeddings_arr, faiss_ids)
-            log(f"Replaced {len(old_faiss_ids)} old vectors with {len(faiss_ids)} new vectors for doc_id={doc_id}")
-        else:
-            engine.add_embeddings(embeddings_arr, faiss_ids)
-
         now = datetime.now(timezone.utc)
-        chunk_docs: List[Dict[str, Any]] = []
-        for idx, (chunk, faiss_id) in enumerate(zip(chunks, faiss_ids)):
-            chunk_text = chunk.get("text") or ""
-            chunk_index = chunk.get("chunk_index")
-            if chunk_index is None:
-                chunk_index = idx
-            chunk_metadata = dict(metadata)
-            if isinstance(chunk.get("metadata"), dict):
-                chunk_metadata.update(chunk["metadata"])
-            chunk_metadata.setdefault("chunk_index", chunk_index)
-            chunk_metadata.setdefault("source", source)
-            chunk_docs.append(
-                {
-                    "chunk_id": str(uuid.uuid4()),
-                    "doc_id": doc_id,
-                    "company_id": None,
-                    "chunk_index": int(chunk_index),
-                    "faiss_id": int(faiss_id),
-                    "text": chunk_text,
-                    "char_start": chunk.get("char_start"),
-                    "char_end": chunk.get("char_end"),
-                    "doc_type": doc_type,
-                    "source": source,
-                    "metadata": chunk_metadata,
-                    "options": dict(options),
-                    "created_at": now,
-                }
-            )
 
-        store.insert_chunks(chunk_docs)
-        store.update_document_status(doc_id, status="ready", chunk_count=len(chunk_docs))
-        log(f"Processed embedded chunks doc_id={doc_id} chunks={len(chunk_docs)}")
+        def build_chunk_docs(faiss_ids: Sequence[int], version: str) -> List[Dict[str, Any]]:
+            docs: List[Dict[str, Any]] = []
+            for idx, (chunk, faiss_id) in enumerate(zip(chunks, faiss_ids)):
+                chunk_index = chunk.get("chunk_index")
+                if chunk_index is None:
+                    chunk_index = idx
+                chunk_metadata = dict(metadata)
+                if isinstance(chunk.get("metadata"), dict):
+                    chunk_metadata.update(chunk["metadata"])
+                chunk_metadata.setdefault("chunk_index", chunk_index)
+                chunk_metadata.setdefault("source", source)
+                docs.append(
+                    {
+                        "chunk_id": str(uuid.uuid4()),
+                        "doc_id": doc_id,
+                        "company_id": None,
+                        "chunk_index": int(chunk_index),
+                        "faiss_id": int(faiss_id),
+                        "ingest_version": version,
+                        "text": chunk.get("text") or "",
+                        "char_start": chunk.get("char_start"),
+                        "char_end": chunk.get("char_end"),
+                        "doc_type": doc_type,
+                        "source": source,
+                        "metadata": chunk_metadata,
+                        "options": dict(options),
+                        "created_at": now,
+                    }
+                )
+            return docs
+
+        # `_chunk_and_embed` ile AYNI swap yardımcısı — iki ayrı doğruluk
+        # uygulaması olmasın. Eski hali "Mongo sil → FAISS replace → Mongo ekle"
+        # yapıyordu; bu sıra adım ortasında patlarsa iki store ayrışır.
+        self._swap_in_chunks(
+            doc_id=doc_id,
+            engine=engine,
+            embeddings=embeddings_arr,
+            build_chunk_docs=build_chunk_docs,
+            chunk_count=len(chunks),
+        )
+        store.update_document_status(doc_id, status="ready", chunk_count=len(chunks))
+        log(f"Processed embedded chunks doc_id={doc_id} chunks={len(chunks)}")
 
     # ------------------------------------------------------------------
     def _process_single_document(self, document: Dict[str, Any], context: DocumentJobContext) -> None:
+        """Doküman-başına kilit alıp asıl işi çalıştırır.
+
+        Kilit neden şart: aynı doc'a iki eşzamanlı re-ingest birbirinin sürümünü
+        yarıda kesebilir — biri swap ederken diğerinin "eskiyi temizle" adımı
+        yeni sürümü silebilir. Lease'li CAS kilit bunları serialize eder; worker
+        ölürse lease dolar ve iş devralınır. RabbitMQ redelivery'si aynı job_id
+        ile geldiğinden kendi kilidini yeniden alır (idempotent).
+
+        Kilit alma/bırakma bu sarmalayıcıda: asıl gövdenin birden çok `return`
+        yolu var, `finally` hepsini kapsar.
+        """
+        try:
+            acquired = self._get_content_store().try_acquire_ingest_lock(
+                company_id=context.company_id,
+                document_id=context.document_id,
+                job_id=context.job_id,
+                lease_seconds=self.ingest_lease_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Kilit altyapısı patlarsa ingest'i durdurmuyoruz — eski (kilitsiz)
+            # davranışa düşer; swap zaten tek başına idempotent.
+            log(f"WARNING: ingest lock alinamadi doc_id={context.document_id}: {exc}")
+            self._process_single_document_locked(document, context)
+            return
+
+        if acquired is None:
+            log(
+                f"Skipping doc_id={context.document_id}: baska bir job kilidi tutuyor "
+                f"(job_id={context.job_id})"
+            )
+            return
+
+        try:
+            self._process_single_document_locked(document, context)
+        finally:
+            try:
+                self._get_content_store().release_ingest_lock(
+                    company_id=context.company_id,
+                    document_id=context.document_id,
+                    job_id=context.job_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Bırakamazsak lease zaten dolacak → kalıcı kilit oluşmaz.
+                log(f"WARNING: ingest lock birakilamadi doc_id={context.document_id}: {exc}")
+
+    def _process_single_document_locked(
+        self, document: Dict[str, Any], context: DocumentJobContext
+    ) -> None:
         started_at = datetime.now(timezone.utc)
         log(f"Begin document doc_id={context.document_id} company_id={context.company_id} job_id={context.job_id}")
         options = context.options
@@ -1131,6 +1195,26 @@ class IngestWorker:
 
         return "\n\n---\n\n".join(selected_blocks), combined_metadata
 
+    def _schema_index_text(self, row: Dict[str, Any]) -> str:
+        """Faithful reindex: fetcher'ın schema-derived metnini yeniden üretir.
+
+        `INDEX_SCHEMA_CONTENT_ENABLED` açıkken ve `extracted.extracted_content`
+        varsa, fetcher canlı yolunun indexlediği metni BYTE-ÖZDEŞ üretir (port
+        edilmiş saf fonksiyonlar, deterministik). Şema yoksa/yetersizse ""
+        döner → çağıran markdown'a düşer (RAG v2 Faz 6 / KN1). Varsayılan KAPALI
+        → mevcut davranış korunur; reindex sürücüsü bilinçli açar.
+        """
+        if not self.index_schema_content_enabled:
+            return ""
+        extracted = row.get("extracted")
+        if not isinstance(extracted, dict):
+            return ""
+        from services.schema_index_text import index_text_from_extracted_content
+
+        return index_text_from_extracted_content(
+            extracted.get("extracted_content"), min_chars=self.index_schema_min_chars
+        )
+
     def _resolve_fetcher_page_text(
         self,
         *,
@@ -1140,10 +1224,17 @@ class IngestWorker:
         storage_preferences: List[str],
         s3_bucket: str,
     ) -> str:
+        media_text = self._serialize_fetcher_media(media_entries)
+
+        # Şema metni (varsa) markdown'dan ÖNCE gelir — fetcher canlı yolundaki
+        # `schema > clean_markdown > raw markdown` önceliğiyle birebir.
+        schema_text = self._schema_index_text(row)
+        if schema_text:
+            return self._join_fetcher_text_with_media(schema_text, media_text)
+
         clean_markdown = str(row.get("clean_markdown") or "").strip()
         markdown = str(row.get("markdown") or "").strip()
         html = str(row.get("html") or "").strip()
-        media_text = self._serialize_fetcher_media(media_entries)
 
         for target in storage_preferences:
             if target == "db":
@@ -1386,6 +1477,83 @@ class IngestWorker:
         return normalized
 
     # ------------------------------------------------------------------
+    def _swap_in_chunks(
+        self,
+        *,
+        doc_id: str,
+        engine: "EmbeddingEngine",
+        embeddings: "np.ndarray",
+        build_chunk_docs,
+        chunk_count: int,
+    ) -> str:
+        """Yeni chunk sürümünü ATOMİK-BENZERİ biçimde devreye alır.
+
+        `replace_embeddings` yalnız FAISS İÇİNDE atomiktir — Mongo+FAISS
+        bütünlüğünü kapsamaz. Naif sıra (Mongo sil → FAISS replace → Mongo ekle)
+        adım ortasında patlarsa iki store ayrışır ve doküman aranamaz hale gelir.
+
+        Bu yüzden sıra ÖNCE-EKLE / SONRA-KALDIR:
+          1) yeni faiss_id ayır, yeni vektörleri FAISS'e EKLE  (eski hâlâ duruyor)
+          2) yeni chunk'ları YENİ sürümle Mongo'ya EKLE        (eski hâlâ aktif)
+          3) active_ingest_version'ı swap et                    ← görünürlük anahtarı
+          4) eski sürümün vektör + chunk'larını temizle
+        Böylece herhangi bir adımda hata olsa bile ESKİ sürüm bütün ve aktif
+        kalır; arama asla boş/yarım sonuç görmez. Hata halinde yeni sürümün
+        yazdıklarını geri alırız (telafi).
+
+        Dönen değer: yeni `ingest_version`.
+        """
+        store = self._get_store()
+        version = uuid.uuid4().hex
+        faiss_ids = store.reserve_faiss_ids(chunk_count)
+
+        # 1) Yeni vektörler FAISS'e — eskiyi HENÜZ silmiyoruz.
+        engine.add_embeddings(embeddings, faiss_ids)
+        try:
+            # 2) Yeni chunk'lar Mongo'ya, yeni sürüm etiketiyle.
+            chunk_docs = build_chunk_docs(faiss_ids, version)
+            store.insert_chunks(chunk_docs)
+            # 3) Görünürlüğü çevir: arama artık yalnız bu sürümü görür.
+            store.set_active_ingest_version(doc_id, version)
+        except Exception:
+            # Telafi: yeni sürüm asla aktif olmadı → eski sürüm sağlam. Yeni
+            # yazdıklarımızı geri alıp hatayı yukarı bırakıyoruz.
+            try:
+                engine.remove_ids(faiss_ids)
+            except Exception as exc:  # noqa: BLE001
+                log(f"WARNING: compensation remove_ids failed doc_id={doc_id}: {exc}")
+            try:
+                store.delete_chunks_by_doc_version(doc_id, version)
+            except Exception as exc:  # noqa: BLE001
+                log(f"WARNING: compensation delete_chunks failed doc_id={doc_id}: {exc}")
+            raise
+
+        # 4) Eski sürümü temizle. Buradaki hata veriyi BOZMAZ (yalnız yetim
+        # kayıt bırakır) — aktif sürüm zaten doğru; o yüzden yutup logluyoruz.
+        try:
+            old_faiss_ids = store.get_faiss_ids_by_doc_except_version(doc_id, version)
+            if old_faiss_ids:
+                engine.remove_ids(old_faiss_ids)
+            removed = store.delete_chunks_by_doc_except_version(doc_id, version)
+            if removed:
+                log(f"Swapped doc_id={doc_id}: removed {removed} stale chunks, {len(old_faiss_ids)} vectors")
+        except Exception as exc:  # noqa: BLE001
+            log(f"WARNING: stale cleanup failed doc_id={doc_id} version={version}: {exc}")
+        return version
+
+    @staticmethod
+    def _resolve_chunk_strategy(strategy: str, text: str) -> str:
+        """'auto' stratejisini içeriğe göre çözer (Faz 7 / KN3).
+
+        'auto' → metinde ATX markdown başlığı varsa 'structure' (heading-path
+        context header fayda verir), yoksa 'char' (schema-derived düz metin
+        başlıksızdır → structure'ın heading avantajı yok, sentetik header'ı
+        yanıltıcı olur). 'char'/'structure' açık override'lar dokunulmadan geçer.
+        """
+        if strategy != "auto":
+            return strategy
+        return "structure" if _HAS_ATX_HEADING.search(text or "") else "char"
+
     def _chunk_and_embed(
         self,
         *,
@@ -1400,11 +1568,15 @@ class IngestWorker:
         chunk_size = int(options.get("chunkSize") or self.chunk_size)
         chunk_overlap = int(options.get("chunkOverlap") or self.chunk_overlap)
         min_chars = int(options.get("minChars") or 80)
-        # Chunking stratejisi: "structure" (heading-aware + context header) veya
-        # "char" (klasik karakter penceresi). options > env > default("char").
+        # Chunking stratejisi: "structure" (heading-aware + context header),
+        # "char" (klasik karakter penceresi) veya "auto". options > env >
+        # default("char"). "auto" (Faz 7 / KN3): markdown başlığı olan içerikte
+        # structure, olmayan (ör. schema-derived düz metin) içerikte char seçer —
+        # global structure schema sayfalarında faydasızdır çünkü heading yoktur.
         strategy = str(
             options.get("chunkStrategy") or os.getenv("CHUNK_STRATEGY") or "char"
         ).strip().lower()
+        strategy = self._resolve_chunk_strategy(strategy, text)
 
         md = metadata if isinstance(metadata, dict) else {}
         if strategy == "structure":
@@ -1433,39 +1605,46 @@ class IngestWorker:
                 "minChars": min_chars,
             }
 
-        faiss_ids = self._get_store().reserve_faiss_ids(len(chunks))
         engine = self._engine_for_company(company_id)
         embeddings = engine.encode([chunk.text for chunk in chunks], batch_size=self.batch_size)
-        engine.add_embeddings(embeddings, faiss_ids)
 
         now = datetime.now(timezone.utc)
-        chunk_docs: List[Dict[str, Any]] = []
-        total_chars = 0
-        total_tokens = 0
-        for chunk, faiss_id in zip(chunks, faiss_ids):
-            total_chars += len(chunk.text)
-            total_tokens += self._estimate_token_count(chunk.text)
-            chunk_metadata = dict(metadata)
-            chunk_docs.append(
+        total_chars = sum(len(chunk.text) for chunk in chunks)
+        total_tokens = sum(self._estimate_token_count(chunk.text) for chunk in chunks)
+
+        def build_chunk_docs(faiss_ids: Sequence[int], version: str) -> List[Dict[str, Any]]:
+            return [
                 {
                     "chunk_id": str(uuid.uuid4()),
                     "doc_id": doc_id,
                     "company_id": company_id,
                     "chunk_index": chunk.index,
                     "faiss_id": int(faiss_id),
+                    "ingest_version": version,
                     "text": chunk.text,
                     "char_start": chunk.char_start,
                     "char_end": chunk.char_end,
                     "doc_type": doc_type,
                     "source": source,
-                    "metadata": chunk_metadata,
+                    "metadata": dict(metadata),
                     "options": dict(options),
                     "created_at": now,
                 }
-            )
-        self._get_store().insert_chunks(chunk_docs)
+                for chunk, faiss_id in zip(chunks, faiss_ids)
+            ]
+
+        # Versiyonlu swap: bu yol eskiden yalnız EKLİYORDU (eskiyi hiç silmezdi),
+        # bu yüzden fetcher her değişen sayfayı yeniden indexlediğinde duplicate
+        # chunk + yetim vektör birikiyordu — canlı bir bug. Artık idempotent.
+        self._swap_in_chunks(
+            doc_id=doc_id,
+            engine=engine,
+            embeddings=embeddings,
+            build_chunk_docs=build_chunk_docs,
+            chunk_count=len(chunks),
+        )
         return {
-            "chunkCount": len(chunk_docs),
+            "chunkCount": len(chunks),
             "tokenCount": total_tokens,
             "charCount": total_chars,
             "chunkSize": chunk_size,

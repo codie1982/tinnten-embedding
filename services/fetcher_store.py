@@ -76,6 +76,10 @@ class FetcherStore:
             "clean_markdown": 1,
             "markdown": 1,
             "html": 1,
+            # `extracted.extracted_content`: fetcher'ın schema-çıkarım çıktısı.
+            # Faithful reindex için gerekli — bu olmadan DB-read yolu schema
+            # metnini göremez ve yalnız markdown'a düşer (RAG v2 Faz 6).
+            "extracted": 1,
             "fetched_at": 1,
             "content_preferences": 1,
             "extraction_id": 1,
