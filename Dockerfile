@@ -46,5 +46,11 @@ COPY . .
 
 EXPOSE 5003
 
-# Production: API + background workers through wsgi entrypoint
-CMD ["gunicorn", "--bind", "0.0.0.0:5003", "--workers", "1", "--timeout", "600", "wsgi:app"]
+# Production: yalnız HTTP API (arama). Ingest ayrı container'da `python worker.py`
+# koşar (compose: tinnten-embedding-ingest) — Faz 0 ayrımı.
+# --threads 8 (gthread): FAISS search + encode C++'ta GIL'i bıraktığı için istekler
+# gerçekten paralelleşir; çoklu --workers KULLANILMAZ (her worker 714MB index'i ayrıca
+# belleğe yükler ve EmbeddingEngine._lock process-local'dır).
+# --timeout 600→120: uzun istekler gthread'de heartbeat'i bloklamaz; 120 sn üstü
+# takılı istek artık worker'ı öldürüp kuyruğu temizler.
+CMD ["gunicorn", "--bind", "0.0.0.0:5003", "--workers", "1", "--threads", "8", "--timeout", "120", "wsgi:app"]
