@@ -36,21 +36,45 @@ class RabbitPublisher:
 
     def publish(self, payload: Dict[str, Any]) -> None:
         message = json.dumps(payload, ensure_ascii=False)
-        connection = self._get_connection()
-        channel = connection.channel()
-        try:
-            self._declare_queue(channel)
-            channel.basic_publish(
-                exchange="",
-                routing_key=self.queue_name,
-                body=message.encode("utf-8"),
-                properties=pika.BasicProperties(
-                    delivery_mode=2,  # make message persistent
-                    content_type="application/json",
-                ),
-            )
-        finally:
-            try:
-                channel.close()
-            except Exception:
-                pass
+        body = message.encode("utf-8")
+        props = pika.BasicProperties(
+            delivery_mode=2,  # make message persistent
+            content_type="application/json",
+        )
+        # pika BlockingConnection THREAD-SAFE DEĞİL: gunicorn gthread (Faz 0,
+        # --threads 8) altında birden çok HTTP thread'i aynı bağlantıyı sürünce
+        # ioloop bozuluyor ("pop from an empty deque" / StreamLostError) ve
+        # publish KAYBOLUYORDU (5 dk'da 38 content_index_publish_failed).
+        # Çözüm: publish'in TAMAMI kilit altında serileşir (localhost'ta ms
+        # ölçekli, ~22 msg/dk — darboğaz değil); bayat/kopmuş bağlantıda bir
+        # kez taze bağlantıyla yeniden denenir.
+        with self._lock:
+            for attempt in (1, 2):
+                try:
+                    if self._connection is None or self._connection.is_closed:
+                        self._connection = get_rabbit_connection(refresh=True)
+                    channel = self._connection.channel()
+                    try:
+                        self._declare_queue(channel)
+                        channel.basic_publish(
+                            exchange="",
+                            routing_key=self.queue_name,
+                            body=body,
+                            properties=props,
+                        )
+                        return
+                    finally:
+                        try:
+                            channel.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    # Bağlantıyı düşür; ikinci deneme taze bağlantıyla yapılır.
+                    try:
+                        if self._connection is not None:
+                            self._connection.close()
+                    except Exception:
+                        pass
+                    self._connection = None
+                    if attempt == 2:
+                        raise
