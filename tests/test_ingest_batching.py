@@ -277,6 +277,33 @@ def test_non_content_messages_bypass_batching(mocker):
     assert events == ["processed", "ack:7"]
 
 
+def test_verbose_doc_logs_are_skipped_by_default(mocker):
+    """Ara adım logları varsayılan yazılmaz (Mongo yükü); hata/nihai olay yazılır."""
+    worker = _make_worker(mocker)
+    store = MagicMock()
+    mocker.patch.object(worker, "_get_content_store", return_value=store)
+    ctx = MagicMock(company_id="A", document_id="d1", job_id="j1", user_id=None, trigger="fetcher_page")
+
+    worker._log_document_event(ctx, level="info", message="ara adım", verbose=True)
+    assert store.append_log_entry.call_count == 0
+
+    worker._log_document_event(ctx, level="info", message="Indexing job completed.")
+    worker._log_document_event(ctx, level="error", message="patladı", state="failed")
+    assert store.append_log_entry.call_count == 2
+
+
+def test_verbose_doc_logs_can_be_reenabled(mocker):
+    """INGEST_VERBOSE_DOC_LOGS=true ile ara adımlar geri gelir (tanı modu)."""
+    worker = _make_worker(mocker)
+    worker.verbose_doc_logs = True
+    store = MagicMock()
+    mocker.patch.object(worker, "_get_content_store", return_value=store)
+    ctx = MagicMock(company_id="A", document_id="d1", job_id="j1", user_id=None, trigger="fetcher_page")
+
+    worker._log_document_event(ctx, level="info", message="ara adım", verbose=True)
+    assert store.append_log_entry.call_count == 1
+
+
 def test_content_messages_are_buffered_until_batch_is_full(mocker):
     """content-index mesajları grup dolana kadar bekletilir."""
     worker = _make_worker(mocker)

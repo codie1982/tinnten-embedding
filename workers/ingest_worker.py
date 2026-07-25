@@ -189,6 +189,13 @@ class IngestWorker:
             os.getenv("INGEST_BATCH_MAX_WAIT_SECONDS") or DEFAULT_BATCH_MAX_WAIT_SECONDS
         )
         self._pending: List[Tuple[int, Dict[str, Any]]] = []
+        # Ara adım logları (bkz. `_log_document_event`): varsayılan KAPALI.
+        self.verbose_doc_logs = (os.getenv("INGEST_VERBOSE_DOC_LOGS") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self.email_events = EmbeddingEmailEvents()
         self.error_logger = EmbeddingErrorLogger(component="worker")
 
@@ -858,6 +865,7 @@ class IngestWorker:
             message="Indexing job started.",
             state="processing",
             details={"options": options},
+            verbose=True,
         )
         self.email_events.send_index_started(
             company_id=context.company_id,
@@ -903,6 +911,7 @@ class IngestWorker:
             message="Document content loaded.",
             state="processing",
             details={"source": resolved_source.get("source"), "metadataKeys": list(metadata.keys())},
+            verbose=True,
         )
 
         if options.get("cleanup"):
@@ -961,6 +970,7 @@ class IngestWorker:
             message=f"Embedding completed with {stats['chunkCount']} chunks.",
             state="processing",
             details={"chunks": stats["chunkCount"], "tokenCount": stats["tokenCount"], "charCount": stats["charCount"]},
+            verbose=True,
         )
         log(
             f"Completed doc_id={context.document_id} chunks={stats['chunkCount']} "
@@ -2214,7 +2224,18 @@ class IngestWorker:
         message: str,
         state: Optional[str] = None,
         details: Optional[Dict[str, Any]] = None,
+        verbose: bool = False,
     ) -> None:
+        """Doküman olayını `contentdocumentlogs`'a yazar.
+
+        `verbose=True` olan ara adımlar (başladı / içerik yüklendi / embedding
+        bitti) VARSAYILAN OLARAK YAZILMAZ. Doküman başına 4 yazımdı; ingest
+        hızlandıktan sonra Mongo darboğaz olunca ara adımlar kapatıldı — hata
+        kayıtları ve nihai "tamamlandı" olayı her zaman yazılır, yani tanı ve
+        denetim izi korunur. INGEST_VERBOSE_DOC_LOGS=true ile geri açılır.
+        """
+        if verbose and not self.verbose_doc_logs:
+            return
         try:
             self._get_content_store().append_log_entry(
                 company_id=context.company_id,
