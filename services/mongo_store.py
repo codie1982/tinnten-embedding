@@ -85,6 +85,16 @@ class MongoStore:
             [("metadata.companyId", ASCENDING), ("metadata.domain", ASCENDING)],
             name="chunk_company_domain_idx",
         )
+        # company_id ÜST SEVİYEDE de tutuluyor (ana ingest yolu) ve firma bazlı
+        # sayımlar `$or: [{company_id}, {metadata.companyId}]` şeklinde sorguluyor.
+        # Mongo $or'da index-union için HER dalın index'li olmasını ister; bu index
+        # olmadan company_id dalı COLLSCAN'e düşer.
+        # (company_id) tek başına da prefix olarak kullanılabildiği için compound
+        # index hem firma sayımlarını hem kullanıcı filtresini karşılar.
+        self.chunks.create_index(
+            [("company_id", ASCENDING), ("user_id", ASCENDING)],
+            name="chunk_company_user_idx",
+        )
 
     # ------------------------------------------------------------------
     # Document helpers
@@ -243,6 +253,90 @@ class MongoStore:
             "$or": [{"company_id": cid}, {"metadata.companyId": cid}],
         }
 
+    @staticmethod
+    def _company_query(company_id: str) -> Dict[str, Any]:
+        """
+        Firma kimliği iki yerde yaşayabiliyor: ana ingest yolu üst seviye
+        `company_id` yazar (ingest_worker `_chunk_and_embed`), pre-embed ve legacy
+        yollar yalnızca `metadata.companyId` bırakır. Sayımlar ikisini de kapsamalı.
+        """
+        cid = str(company_id)
+        return {"$or": [{"company_id": cid}, {"metadata.companyId": cid}]}
+
+    def count_chunks_by_company(self, company_id: str) -> int:
+        """Firmanın toplam chunk sayısı (sürüm ayrımı yapmadan)."""
+        if not str(company_id or "").strip():
+            return 0
+        return int(self.chunks.count_documents(self._company_query(company_id)))
+
+    def count_active_chunks_by_company(self, company_id: str) -> int:
+        """
+        Yalnızca AKTİF sürüme ait chunk sayısı.
+
+        Bir chunk "aktif"tir ancak ve ancak `ingest_version` == dokümanın
+        `active_ingest_version`'ı ise. Doküman kaydı ayrı bir VERİTABANINDA
+        (`tinnten` vs `tinnten-embedding`) durduğu için `$lookup` kullanılamaz —
+        iki adımda uygulama tarafında birleştiriyoruz.
+        """
+        cid = str(company_id or "").strip()
+        if not cid:
+            return 0
+
+        # Sürüm bilgisi taşımayan chunk'lar (legacy) sürüm eşleşmesine tabi değildir.
+        active_versions: Dict[str, Optional[str]] = {}
+        doc_ids = self.chunks.distinct("doc_id", self._company_query(cid))
+        if not doc_ids:
+            return 0
+        for doc in self.documents.find(
+            {"doc_id": {"$in": [str(d) for d in doc_ids]}},
+            {"doc_id": 1, "active_ingest_version": 1, "status": 1},
+        ):
+            if doc.get("status") in {"removed", "disabled"}:
+                continue
+            active_versions[str(doc["doc_id"])] = doc.get("active_ingest_version")
+
+        total = 0
+        for doc_id, version in active_versions.items():
+            query: Dict[str, Any] = {"doc_id": doc_id}
+            if version:
+                query["ingest_version"] = version
+            total += int(self.chunks.count_documents(query))
+        return total
+
+    def iter_active_faiss_ids_by_company(
+        self, company_id: str, batch_size: int = 5000
+    ):
+        """
+        Firmanın AKTİF chunk'larının faiss_id'lerini akış halinde verir.
+
+        Yeniden inşanın kaynak listesidir; sürüm filtresi ŞARTTIR — yoksa
+        `active_ingest_version` ile değiştirilmiş eski sürümler geri dirilir.
+        Tüm listeyi belleğe almamak için doküman doküman ilerler.
+        """
+        cid = str(company_id or "").strip()
+        if not cid:
+            return
+
+        doc_ids = self.chunks.distinct("doc_id", self._company_query(cid))
+        if not doc_ids:
+            return
+
+        for doc in self.documents.find(
+            {"doc_id": {"$in": [str(d) for d in doc_ids]}},
+            {"doc_id": 1, "active_ingest_version": 1, "status": 1},
+        ):
+            if doc.get("status") in {"removed", "disabled"}:
+                continue
+            query: Dict[str, Any] = {"doc_id": str(doc["doc_id"])}
+            version = doc.get("active_ingest_version")
+            if version:
+                query["ingest_version"] = version
+            cursor = self.chunks.find(query, {"faiss_id": 1}).batch_size(batch_size)
+            for chunk in cursor:
+                fid = chunk.get("faiss_id")
+                if isinstance(fid, (int, float)):
+                    yield int(fid)
+
     def get_chunk_index_by_company_domain(
         self, company_id: str, domain: str
     ) -> Dict[str, Any]:
@@ -282,11 +376,23 @@ class MongoStore:
         RRF füzyonu ÖNCESİ yeniden filtreleme hiçbir geçerli adayı düşürmesin.
         """
         query: Dict[str, Any] = {}
+        and_clauses: List[Dict[str, Any]] = []
         for key, val in (filters or {}).items():
+            # company_id iki yerde yaşayabiliyor (üst seviye VEYA metadata.companyId).
+            # Dense yol (`_passes_chunk_filters`) ikisine de bakıyor; lexical dal
+            # bakmazsa aday kümeleri ayrışır ve RRF füzyonu geçerli adayları düşürür.
+            if key in ("company_id", "companyId", "companyid"):
+                clause = {"$in": list(val["$in"])} if isinstance(val, dict) and "$in" in val else val
+                and_clauses.append(
+                    {"$or": [{"company_id": clause}, {"metadata.companyId": clause}]}
+                )
+                continue
             if isinstance(val, dict) and "$in" in val:
                 query[key] = {"$in": list(val["$in"])}
             else:
                 query[key] = val
+        if and_clauses:
+            query["$and"] = and_clauses
         return query
 
     def text_search_chunks(

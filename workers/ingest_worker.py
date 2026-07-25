@@ -15,6 +15,7 @@ import traceback
 import gzip
 import io
 from urllib.parse import unquote, urlparse
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -39,6 +40,11 @@ if load_dotenv is not None:
 
 from init.rabbit_connection import connect_rabbit_with_retry
 from services.chunker import chunk_text, chunk_markdown_structure
+from services.company_index import (
+    PER_COMPANY_FAISS_ENABLED,
+    company_index_path,
+    resolve_chunk_index_path,
+)
 from services.mongo_store import MongoStore
 from services.content_store import ContentDocumentStore, normalize_index_options
 from services.upload_store import UploadStore, UploadNotFoundError
@@ -77,6 +83,31 @@ DEFAULT_FETCHER_PAGE_LIMIT = 50
 DEFAULT_FETCHER_MAX_TEXT_CHARS = 1_500_000
 DEFAULT_FETCHER_MEDIA_PER_PAGE = 20
 DEFAULT_FETCHER_MEDIA_TEXT_CHARS = 2_000
+
+
+def _resolve_company_id(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    Metadata'dan firma kimliğini çözer (chunk'ın ÜST SEVİYE `company_id` alanına
+    yazmak için). Arama filtreleri üst seviyeye bakar; yalnız metadata'da kalan
+    chunk'lar firma filtreli hiçbir aramada görünmez.
+    """
+    meta = metadata or {}
+    value = meta.get("companyId") or meta.get("company_id")
+    value = str(value or "").strip()
+    return value or None
+
+
+def _resolve_user_id(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    Chunk'ın sahibi kullanıcı. None YAYGIN ve MEŞRUdur: fetcher/crawl içeriği hiç
+    userId taşımaz ve firma geneli sayılır. Bu yüzden filtre tarafı `user_id`'yi
+    düz eşitlikle değil, `{$in: [userId, None]}` ile sorgular — aksi halde
+    kullanıcı filtreli her arama tüm taranmış site içeriğini gizlerdi.
+    """
+    meta = metadata or {}
+    value = meta.get("userId") or meta.get("user_id")
+    value = str(value or "").strip()
+    return value or None
 
 
 def log(msg: str, *args: object) -> None:
@@ -147,16 +178,15 @@ class IngestWorker:
         self.index_schema_min_chars = int(os.getenv("INDEX_SCHEMA_MIN_CHARS") or 200)
         default_chunk_model = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
         self.model_name = os.getenv("CHUNK_MODEL_NAME") or os.getenv("MODEL_NAME") or default_chunk_model
-        self.index_path = os.getenv("CHUNK_INDEX_PATH") or os.getenv("FAISS_INDEX_PATH") or "faiss.index"
-        # Per-company FAISS rollout bayrağı (app.py ile AYNI env). Kapalıyken tüm
-        # içerik tek global index'e yazılır (davranış değişmez). Açıkken firma
-        # içeriği firma-scope index'e (`company/<id>.index`) gider.
-        self.per_company_faiss = (os.getenv("PER_COMPANY_FAISS_ENABLED") or "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        # Env anahtar sırası app.py ile AYNI olmalı — `resolve_chunk_index_path`
+        # tek kaynak. Eskiden worker yalnız CHUNK_INDEX_PATH/FAISS_INDEX_PATH'e
+        # bakıyordu; ortamda yalnız CONTENT_INDEX_PATH set edilseydi worker ile
+        # web FARKLI dosyalara gider ve bu "indexlendi ama arama 0 dönüyor"
+        # olarak sessizce görünürdü.
+        self.index_path = resolve_chunk_index_path()
+        # Per-company FAISS: sabit (bkz. services/company_index.py). Web ve worker
+        # aynı sabiti okur — ayrı env okumaları kaldırıldı.
+        self.per_company_faiss = PER_COMPANY_FAISS_ENABLED
 
         # Lazily initialised dependencies to keep startup fast and avoid blocking
         # on network connections/model downloads before consuming messages.
@@ -172,7 +202,11 @@ class IngestWorker:
         self._loader_lock = threading.RLock()
         self.engine: EmbeddingEngine | None = None
         self._engine_lock = threading.RLock()
-        self._engine_cache: Dict[str, EmbeddingEngine] = {}
+        # Firma-scope engine'ler için SINIRLI LRU. Her engine kendi FAISS index'ini
+        # bellekte tutar (üretimde ~195MB) — sınırsız bir dict, çok firmaya dokunan
+        # bir worker'da doğrudan OOM demektir. Bayrak açıldığı gün ulaşılabilir.
+        self._engine_cache: "OrderedDict[str, EmbeddingEngine]" = OrderedDict()
+        self._engine_cache_size = max(1, int(os.getenv("INGEST_ENGINE_CACHE_SIZE") or 8))
         self.connection: pika.BlockingConnection | None = None
         self.channel: pika.adapters.blocking_connection.BlockingChannel | None = None
         self._stop_event = threading.Event()
@@ -284,6 +318,7 @@ class IngestWorker:
         with self._engine_lock:
             cached = self._engine_cache.get(index_path)
             if cached is not None:
+                self._engine_cache.move_to_end(index_path)
                 return cached
             log("Initialising embedding engine (model=%s index_path=%s)...", self.model_name, index_path)
             from services.embedding_engine import EmbeddingEngine  # local import for faster startup
@@ -295,15 +330,17 @@ class IngestWorker:
                 auto_reset_on_dim_mismatch=False,
             )
             self._engine_cache[index_path] = engine
+            while len(self._engine_cache) > self._engine_cache_size:
+                # Tahliye yalnızca BELLEĞİ boşaltır; index diskte kalır ve tekrar
+                # ihtiyaç olursa yeniden yüklenir. Model paylaşımlı olduğu için
+                # yeniden kurulum maliyeti sadece index okumasıdır.
+                evicted_path, _ = self._engine_cache.popitem(last=False)
+                log("Evicted cached engine (index_path=%s)", evicted_path)
             return engine
 
     def _company_index_path(self, company_id) -> str:
-        """Firma-scope chunk index yolu (app.py `_company_chunk_index_path` ile aynı)."""
-        cid = re.sub(r"[^A-Za-z0-9_-]", "", str(company_id or "").strip())
-        if not cid:
-            return self.index_path
-        base_dir = os.path.dirname(self.index_path) or "."
-        return os.path.join(base_dir, "company", f"{cid}.index")
+        """Firma-scope chunk index yolu — app.py ile AYNI fonksiyon (tek kaynak)."""
+        return company_index_path(self.index_path, company_id)
 
     def _engine_for_company(self, company_id) -> EmbeddingEngine:
         """
@@ -792,7 +829,12 @@ class IngestWorker:
                     {
                         "chunk_id": str(uuid.uuid4()),
                         "doc_id": doc_id,
-                        "company_id": None,
+                        # Eskiden sabit None yazılıyordu; firma kimliği yalnız
+                        # metadata'da kalıyordu. Arama filtreleri üst seviye
+                        # company_id'ye baktığı için bu chunk'lar hiçbir firma
+                        # filtreli aramada görünmüyordu.
+                        "company_id": _resolve_company_id(chunk_metadata),
+                        "user_id": _resolve_user_id(chunk_metadata),
                         "chunk_index": int(chunk_index),
                         "faiss_id": int(faiss_id),
                         "ingest_version": version,
@@ -1817,6 +1859,10 @@ class IngestWorker:
                     "chunk_id": str(uuid.uuid4()),
                     "doc_id": doc_id,
                     "company_id": company_id,
+                    # Kullanıcı bazlı FİLTRELEME için üst seviyede tutulur.
+                    # None = firma geneli/paylaşılan içerik (ör. taranmış site
+                    # sayfaları hiç kullanıcı taşımaz) ve HERKESE görünür kalmalı.
+                    "user_id": _resolve_user_id(metadata),
                     "chunk_index": chunk.index,
                     "faiss_id": int(faiss_id),
                     "ingest_version": version,
@@ -1931,6 +1977,10 @@ class IngestWorker:
                 {
                     "chunk_id": str(uuid.uuid4()),
                     "doc_id": doc_id,
+                    # Legacy yol da üst seviye company_id yazmalı — aksi halde bu
+                    # chunk'lar firma filtreli aramalarda görünmez.
+                    "company_id": _resolve_company_id(metadata),
+                    "user_id": _resolve_user_id(metadata),
                     "chunk_index": chunk.index,
                     "faiss_id": int(faiss_id),
                     "text": chunk.text,

@@ -361,13 +361,25 @@ class EmbeddingEngine:
             return scores, ids
 
     def count(self) -> int:
+        """
+        Index'teki vektör sayısı.
+
+        Diskten reload eder: ingest worker AYRI bir process olduğu için, reload
+        yapılmadan okunan değer bu process'in bellekteki bayat kopyasını yansıtır
+        ve drift ölçümü sessizce yanlış çıkar.
+        """
         with self._lock:
+            self.reload_if_updated_locked()
             return int(self._index.ntotal) if self._index is not None else 0
 
     def remove_ids(self, ids: Sequence[int]) -> int:
         """
         Remove the supplied FAISS IDs from the index and persist the updated index.
-        Returns the number of IDs requested for removal (not the number actually present).
+
+        GERÇEKTEN silinen vektör sayısını döner (ntotal farkı) — talep edilen sayıyı
+        değil. Aradaki fark anlamlıdır: id'ler bu index dosyasında değilse (ör.
+        doküman global index'e yazılmışken firma index'inden silinmeye çalışılıyorsa)
+        silme sessizce hiçbir şey yapmaz. Çağıran bu farkı görüp telafi edebilmeli.
         """
         id_list = [int(i) for i in ids if i is not None]
         if not id_list:
@@ -377,13 +389,22 @@ class EmbeddingEngine:
                 if self._batch_depth == 0:
                     self.reload_if_updated_locked()
                 if self._index is None:
+                    # Sessiz no-op yerine görünür kıl: index dosyası yoksa/yüklenemediyse
+                    # hiçbir vektör silinmiyor demektir.
+                    print(
+                        f"[embedding-engine] remove_ids no-op: index yok ({self.index_path}), "
+                        f"{len(id_list)} id atlandı",
+                        flush=True,
+                    )
                     return 0
+                before = int(self._index.ntotal)
                 id_array = np.asarray(id_list, dtype=np.int64)
                 try:
                     self._index.remove_ids(id_array)
                 finally:
                     self._save_or_defer()
-        return len(id_list)
+                removed = before - int(self._index.ntotal)
+        return max(0, removed)
 
     # ------------------------------------------------------------------
     # Internal methods
@@ -490,6 +511,122 @@ class EmbeddingEngine:
             self._index_mtime = os.path.getmtime(self.index_path)
         except OSError:
             self._index_mtime = None
+
+    def rebuild_from_ids(
+        self,
+        id_iter: Iterable[int],
+        *,
+        dry_run: bool = True,
+        batch_size: int = 5000,
+        allow_empty: bool = False,
+    ) -> dict:
+        """
+        Index'i, VERİLEN faiss_id kümesinden sıfırdan yeniden inşa eder.
+
+        Neden gerekli: soft delete FAISS'e dokunmaz, dolayısıyla silinen içeriğin
+        vektörleri index'te yetim kalır ve kimlikleri geri kazanılamaz (chunk
+        satırı aynı istekte siliniyor). Bu yüzden "artıkları topla" mümkün değil;
+        tek çare, hâlâ Mongo'da karşılığı olan id'lerden temiz bir index kurmak.
+        Kaynak listede olmayan her vektör doğal olarak düşer.
+
+        Vektörler `reconstruct` ile KOPYALANIR — yeniden embed YOK, dolayısıyla
+        deterministik ve model yüklemesi gerektirmez.
+
+        Kilit, işlem boyunca tutulur: yalnızca BU firmanın ingest'i bekler
+        (kilit index dosyası başına), diğer firmalar etkilenmez.
+        """
+        with self._lock:
+            with self._maybe_write_lock():
+                self.reload_if_updated_locked()
+                if self._index is None:
+                    return {
+                        "ok": False,
+                        "reason": "index_missing",
+                        "path": self.index_path,
+                    }
+
+                before_total = int(self._index.ntotal)
+                try:
+                    before_bytes = int(os.path.getsize(self.index_path))
+                except OSError:
+                    before_bytes = 0
+
+                dim = int(self._index.d)
+                fresh = faiss.IndexIDMap2(faiss.IndexFlatIP(dim))
+                missing = 0
+                copied = 0
+                batch_vecs: list = []
+                batch_ids: list[int] = []
+
+                def flush() -> None:
+                    nonlocal batch_vecs, batch_ids
+                    if not batch_ids:
+                        return
+                    # Vektörler eklenirken zaten L2-normalize edildi; TEKRAR
+                    # normalize etmek skorları bozar.
+                    fresh.add_with_ids(
+                        np.asarray(batch_vecs, dtype="float32"),
+                        np.asarray(batch_ids, dtype="int64"),
+                    )
+                    batch_vecs = []
+                    batch_ids = []
+
+                for raw_id in id_iter:
+                    try:
+                        fid = int(raw_id)
+                    except (TypeError, ValueError):
+                        missing += 1
+                        continue
+                    try:
+                        batch_vecs.append(self._index.reconstruct(fid))
+                        batch_ids.append(fid)
+                        copied += 1
+                    except Exception:  # noqa: BLE001 — Mongo'da var, FAISS'te yok
+                        missing += 1
+                    if len(batch_ids) >= batch_size:
+                        flush()
+                flush()
+
+                after_total = int(fresh.ntotal)
+
+                # Aynı sessiz felaket kalıbı migration script'inde de vardı:
+                # her şeyi kaybedip "başarılı" dönmek. Açıkça izin verilmedikçe reddet.
+                if after_total == 0 and before_total > 0 and not allow_empty:
+                    return {
+                        "ok": False,
+                        "reason": "refusing_empty_rebuild",
+                        "before": {"ntotal": before_total, "bytes": before_bytes},
+                        "missingReconstruct": missing,
+                    }
+
+                result = {
+                    "ok": True,
+                    "dryRun": bool(dry_run),
+                    "path": self.index_path,
+                    "before": {"ntotal": before_total, "bytes": before_bytes},
+                    "after": {"ntotal": after_total, "bytes": None},
+                    "reclaimed": {"vectors": max(0, before_total - after_total), "bytes": None},
+                    "missingReconstruct": missing,
+                    "copied": copied,
+                }
+                if dry_run:
+                    return result
+
+                previous = self._index
+                self._index = fresh
+                try:
+                    self._save_index()
+                except Exception:
+                    self._index = previous  # yazım patlarsa bellekteki index'i geri al
+                    raise
+                self._backing_index = None
+                try:
+                    after_bytes = int(os.path.getsize(self.index_path))
+                except OSError:
+                    after_bytes = 0
+                result["after"]["bytes"] = after_bytes
+                result["reclaimed"]["bytes"] = max(0, before_bytes - after_bytes)
+                return result
 
     def ensure_index_persisted(self) -> dict:
         """

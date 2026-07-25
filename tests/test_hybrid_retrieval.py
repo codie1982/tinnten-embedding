@@ -17,7 +17,36 @@ def test_translate_filters_metadata_and_toplevel():
     q = MongoStore._translate_chunk_filters(
         {"company_id": "c1", "metadata.domain": "modailgi.com.tr"}
     )
-    assert q == {"company_id": "c1", "metadata.domain": "modailgi.com.tr"}
+    # metadata.* anahtarları aynen geçer
+    assert q["metadata.domain"] == "modailgi.com.tr"
+    # company_id İKİ konumu birden kapsar: ana ingest yolu üst seviyeye yazar,
+    # pre-embed/legacy yollar yalnız metadata.companyId bırakır. Dense yoldaki
+    # `_passes_chunk_filters` da ikisine bakıyor — iki dal ayrışırsa RRF füzyonu
+    # geçerli lexical adayları düşürür.
+    assert q["$and"] == [
+        {"$or": [{"company_id": "c1"}, {"metadata.companyId": "c1"}]}
+    ]
+
+
+def test_translate_filters_company_in_operator_covers_both_locations():
+    q = MongoStore._translate_chunk_filters({"company_id": {"$in": ["c1", "c2"]}})
+    assert q["$and"] == [
+        {
+            "$or": [
+                {"company_id": {"$in": ["c1", "c2"]}},
+                {"metadata.companyId": {"$in": ["c1", "c2"]}},
+            ]
+        }
+    ]
+
+
+def test_translate_filters_user_scope_includes_shared_content():
+    """
+    Kullanıcı kapsamı "benim VEYA paylaşılan"dır. Fetcher/crawl içeriği hiç
+    userId taşımaz (user_id: None); düz eşitlik filtresi onu gizlerdi.
+    """
+    q = MongoStore._translate_chunk_filters({"user_id": {"$in": ["u1", None]}})
+    assert q["user_id"] == {"$in": ["u1", None]}
 
 
 def test_translate_filters_preserves_in_operator():

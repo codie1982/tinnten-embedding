@@ -110,6 +110,8 @@ def test_remove_domain_is_scoped_to_company_engine(client, mocker):
     """remove/domain: firmanın o domain'e ait faiss'lerini KENDİ engine'inden siler,
     chunk'ları temizler; başka firmaya dokunmaz."""
     mock_engine = mocker.Mock()
+    # remove_ids artık GERÇEKTEN silinen vektör sayısını döner (talep edileni değil).
+    mock_engine.remove_ids.return_value = 3
     routed = mocker.patch("app.get_company_chunk_engine", return_value=mock_engine)
     idx_mock = mocker.patch(
         "app.chunk_store.get_chunk_index_by_company_domain",

@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from functools import lru_cache
 from threading import Lock, RLock
+from typing import Callable
 from urllib.parse import urlparse
 
 import numpy as np
@@ -25,6 +26,11 @@ from services import (
     UploadNotFoundError,
     ContentDocumentStore,
     normalize_index_options,
+)
+from services.company_index import (
+    PER_COMPANY_FAISS_ENABLED as _PER_COMPANY_FAISS_ENABLED,
+    company_index_path,
+    sanitize_company_id,
 )
 from services.embedding_engine import EmbeddingEngine
 from services.error_logger import EmbeddingErrorLogger
@@ -167,25 +173,22 @@ def _company_chunk_index_path(company_id: str | None) -> str:
     Firma-scope chunk FAISS index yolu. company_id yoksa/boşsa GLOBAL chunk
     index'e düşer (personal/company'siz içerik orada kalır). Per-company index'ler
     global index'in yanında `company/<companyId>.index` olarak tutulur.
-    company_id dosya-adı-güvenli hâle getirilir (path traversal savunması).
+
+    Yol üretimi `services.company_index`'te TEKTİR — ingest worker ve migration
+    script'i de aynı fonksiyonu kullanır (bkz. o modülün docstring'i).
     """
-    cid = re.sub(r"[^A-Za-z0-9_-]", "", str(company_id or "").strip())
-    if not cid:
-        return CHUNK_INDEX_PATH
-    base_dir = os.path.dirname(CHUNK_INDEX_PATH) or "."
-    return os.path.join(base_dir, "company", f"{cid}.index")
+    return company_index_path(CHUNK_INDEX_PATH, company_id)
 
 
-# Per-company FAISS rollout bayrağı. KAPALI (default) iken tüm firma içeriği
-# eskisi gibi tek global chunk index'te kalır (davranış DEĞİŞMEZ, sıfır risk).
-# Migration tamamlanınca AÇILIR; o zaman search + ingest + remove per-company
-# index'e yönlenir. Search ve ingest AYNI bayrağı okumalı ki tutarlı olsun.
-PER_COMPANY_FAISS_ENABLED = (os.getenv("PER_COMPANY_FAISS_ENABLED") or "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+# Per-company FAISS: ARTIK SABİT (True), env'den okunmaz. Tanım
+# `services.company_index`'te — ingest worker AYNI sabiti oradan alır, böylece
+# iki process'in farklı değer görmesi imkânsız hâle gelir.
+#
+# GERİ ALMA: env override YOK — geri dönüş kod revert + rebuild ile olur.
+# Buna karşılık okuma yolu `PER_COMPANY_FAISS_DUAL_READ` ile korunuyor: firma
+# index'i henüz doldurulmamışsa arama global'e düşer, yani migration koşmadan
+# deploy edilse bile retrieval kesilmez (bkz. `resolve_search_engines`).
+PER_COMPANY_FAISS_ENABLED = _PER_COMPANY_FAISS_ENABLED
 
 # FAZ 5 — hybrid retrieval + opsiyonel reranker (varsayılan KAPALI; açılmadıkça
 # davranış birebir korunur). HYBRID_SEARCH_ENABLED açıkken metin sorgularında
@@ -211,7 +214,13 @@ RERANKER_MODEL = (os.getenv("RERANKER_MODEL") or "").strip()
 RERANK_TOP_N = max(1, int(os.getenv("RERANK_TOP_N") or 30))
 
 
-@lru_cache(maxsize=128)
+# Her cache'lenmiş engine kendi FAISS index'ini bellekte tutar (üretimde ~195MB).
+# Eski 128'lik sınır ~25GB'lik bir tavan demekti ve bayrak açıldığı gün ulaşılabilir
+# hale geliyordu. Sınır SAYIya göre, bayta göre değil — kutuya göre ayarlayın.
+COMPANY_ENGINE_CACHE_SIZE = max(1, int(os.getenv("COMPANY_ENGINE_CACHE_SIZE") or 16))
+
+
+@lru_cache(maxsize=COMPANY_ENGINE_CACHE_SIZE)
 def _get_company_chunk_engine_cached(company_id: str) -> EmbeddingEngine:
     return EmbeddingEngine(
         model_name=CHUNK_MODEL_NAME, index_path=_company_chunk_index_path(company_id)
@@ -231,6 +240,67 @@ def get_company_chunk_engine(company_id: str | None) -> EmbeddingEngine:
     if not cid or not PER_COMPANY_FAISS_ENABLED:
         return get_chunk_engine()
     return _get_company_chunk_engine_cached(cid)
+
+
+# Dual-read fallback: bayrak geçişini geri alınabilir kılar.
+# Bayrak AÇILDIĞINDA migration henüz koşmadıysa firma index'i boştur ve arama
+# sessizce {"results": []} + HTTP 200 döner — hata yok, log yok: firma başına TAM
+# retrieval kesintisi, çağırana "eşleşme yok" gibi görünür. Fallback bunu kapatır.
+# SİMETRİK olması kritik: bayrak KAPALIYKEN de firma index'i fallback olarak
+# okunur, böylece yazımlar per-company'ye düştükten sonra yapılan bir geri alma
+# da o vektörleri bulur. Geçiş bittiğinde (global_fallback oranı 0 olunca) kapatılır.
+PER_COMPANY_FAISS_DUAL_READ = (
+    os.getenv("PER_COMPANY_FAISS_DUAL_READ") or "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+_FALLBACK_LOG_TTL = float(os.getenv("PER_COMPANY_FALLBACK_LOG_TTL") or 300)
+_fallback_log_seen: dict[str, float] = {}
+
+
+def _log_index_fallback(company_id: str | None, scope: str, reason: str, index_path: str) -> None:
+    """Firma başına en fazla TTL'de bir logla — tek bozuk firma logu boğmasın."""
+    key = f"{company_id}:{scope}:{reason}"
+    now = time.time()
+    last = _fallback_log_seen.get(key, 0.0)
+    if now - last < _FALLBACK_LOG_TTL:
+        return
+    _fallback_log_seen[key] = now
+    app.logger.warning(
+        "per_company_index_fallback companyId=%s scope=%s reason=%s index=%s",
+        company_id,
+        scope,
+        reason,
+        index_path,
+    )
+
+
+def resolve_search_engines(company_id: str | None) -> list[tuple[str, Callable[[], EmbeddingEngine]]]:
+    """
+    Arama için sıralı okuma planı: [(scope, engine_factory), ...] — ilk isabet kazanır.
+
+    Factory'ler TEMBELdir: fallback motoru yalnızca gerçekten gerekirse kurulur.
+    Aksi halde her sorgu, hiç kullanılmayacak ikinci bir index'i diskten okurdu.
+
+    Birincil motor her iki bayrak durumunda da `get_company_chunk_engine` ile
+    çözülür (bayrak kapalıyken zaten global'e delege ediyor) — tek çözüm noktası.
+
+    YALNIZCA okuma yolunda kullanılır. Yazma/silme yolu asla fallback yapmamalı,
+    yoksa aynı vektör iki index dosyasına dağılır ve silme muhasebesi bozulur.
+    """
+    cid = str(company_id or "").strip()
+    if not cid:
+        return [("global", get_chunk_engine)]
+
+    primary = lambda: get_company_chunk_engine(cid)  # noqa: E731
+    if PER_COMPANY_FAISS_ENABLED:
+        plan: list[tuple[str, Callable[[], EmbeddingEngine]]] = [("company", primary)]
+        if PER_COMPANY_FAISS_DUAL_READ:
+            plan.append(("global_fallback", get_chunk_engine))
+    else:
+        plan = [("global", primary)]
+        if PER_COMPANY_FAISS_DUAL_READ:
+            plan.append(("company_fallback", lambda: _get_company_chunk_engine_cached(cid)))
+    return plan
 
 
 def warmup_embedding_models() -> None:
@@ -1312,9 +1382,71 @@ def _vector_search_response(target_store, label: str = "search", payload: dict |
         return jsonify({"error": f"{label} failed: {exc}"}), 400
 
 
+def _chunk_company_id(chunk: dict) -> str | None:
+    """
+    Chunk'ın firma kimliği İKİ yerde olabilir: ana ingest yolu üst seviye
+    `company_id` yazar, pre-embed (`_process_embedded_chunks`) ve legacy yollar
+    yalnızca `metadata.companyId` bırakır. Yalnız birine bakmak, o yollarla
+    yazılmış chunk'ları HER firma filtreli aramada görünmez kılar.
+    """
+    top = chunk.get("company_id")
+    if top:
+        return str(top)
+    meta = chunk.get("metadata") or {}
+    val = meta.get("companyId") or meta.get("company_id")
+    return str(val) if val else None
+
+
+_COMPANY_FILTER_KEYS = (
+    "company_id",
+    "companyId",
+    "companyid",
+    "metadata.companyId",
+    "metadata.company_id",
+)
+
+
+def _company_id_from_filters(filters: dict | None) -> str | None:
+    """
+    Arama filtresinden ROUTING için firma kimliğini çıkarır.
+
+    `metadata.companyId` formunu da kabul etmek ZORUNLU: `_passes_chunk_filters`
+    ve `MongoStore._translate_chunk_filters` bu formu zaten anlıyor, ama routing
+    yalnız top-level anahtarlara bakıyordu. Aradaki boşluk sessizdi — bu formu
+    gönderen çağıran firma index'i yerine global'i sorgular, hata almaz, sadece
+    0 sonuç görür.
+
+    Değer tek bir string'e indirgenemiyorsa (çok firmalı `$in`, dict, liste)
+    None döner: o durumda tek bir firma index'ine yönlendirmek YANLIŞ olurdu,
+    global + dual-read yolu doğru cevabı verir.
+    """
+    for key in _COMPANY_FILTER_KEYS:
+        if key not in (filters or {}):
+            continue
+        val = (filters or {})[key]
+        if isinstance(val, dict):
+            candidates = val.get("$in")
+            # Tek elemanlı $in yönlendirilebilir; çoklu olan yönlendirilemez.
+            if isinstance(candidates, (list, tuple)) and len(candidates) == 1:
+                val = candidates[0]
+            else:
+                return None
+        if isinstance(val, (list, tuple)):
+            if len(val) != 1:
+                return None
+            val = val[0]
+        if isinstance(val, (str, int)):
+            text = str(val).strip()
+            if text:
+                return text
+    return None
+
+
 def _passes_chunk_filters(chunk: dict, filters: dict) -> bool:
     for key, val in (filters or {}).items():
-        if key.startswith("metadata."):
+        if key in ("company_id", "companyId", "companyid"):
+            chunk_val = _chunk_company_id(chunk)
+        elif key.startswith("metadata."):
             sub = key.split(".", 1)[1]
             chunk_val = (chunk.get("metadata") or {}).get(sub)
         else:
@@ -1615,10 +1747,9 @@ def _chunk_search_response(payload: dict):
     # İzolasyon yapısal olduğundan over-fetch gerekmez; company_id yoksa global
     # chunk index'e düşer (personal / company'siz içerik).
     filters = payload.get("filter") or {}
-    company_id = (
-        filters.get("company_id") or filters.get("companyId") or filters.get("companyid")
-    )
-    engine = get_company_chunk_engine(company_id)
+    company_id = _company_id_from_filters(filters)
+    search_plan = resolve_search_engines(company_id)
+    engine = search_plan[0][1]()  # birincil motor: sorgu vektörünü de bu üretir
 
     vector = payload.get("vector")
     raw_text = payload.get("text")
@@ -1662,25 +1793,59 @@ def _chunk_search_response(payload: dict):
             min(filtered_candidates, FILTERED_SEARCH_MAX_CANDIDATES),
         )
 
-    try:
-        scores, ids = engine.search(query_vec, n_dense)
-    except RuntimeError:
-        return jsonify({"results": []})
-    except ValueError as exc:
-        index_obj = getattr(engine, "_index", None)
-        index_dim = getattr(index_obj, "d", None)
-        return (
-            jsonify(
-                {
-                    "error": str(exc),
-                    "hint": "Embedding dimension mismatch: ensure CHUNK_MODEL_NAME matches the model used to build the index.",
-                    "index_path": CHUNK_INDEX_PATH,
-                    "model_name": getattr(get_chunk_engine(), "model_name", None),
-                    "index_dim": index_dim,
-                    "query_dim": int(query_vec.shape[1]),
-                }
-            ),
-            400,
+    # Okuma planını sırayla dene: isabet gelen ilk index kazanır.
+    scores = ids = None
+    served_scope: str | None = None
+    fallback_reason: str | None = None
+
+    for plan_index, (scope, make_engine) in enumerate(search_plan):
+        candidate = engine if plan_index == 0 else make_engine()
+        try:
+            cand_scores, cand_ids = candidate.search(query_vec, n_dense)
+        except RuntimeError:
+            # Index dosyası yok ya da boş — sessizce yutmak yerine görünür kıl.
+            fallback_reason = "index_missing_or_empty"
+            _log_index_fallback(company_id, scope, fallback_reason, candidate.index_path)
+            continue
+        except ValueError as exc:
+            # Boyut uyuşmazlığı bir KONFİGÜRASYON hatasıdır; fallback yapmak onu
+            # gizler. Eskiden olduğu gibi 400 dönüyoruz.
+            index_obj = getattr(candidate, "_index", None)
+            index_dim = getattr(index_obj, "d", None)
+            return (
+                jsonify(
+                    {
+                        "error": str(exc),
+                        "hint": "Embedding dimension mismatch: ensure CHUNK_MODEL_NAME matches the model used to build the index.",
+                        "index_path": candidate.index_path,
+                        "model_name": getattr(get_chunk_engine(), "model_name", None),
+                        "index_dim": index_dim,
+                        "query_dim": int(query_vec.shape[1]),
+                    }
+                ),
+                400,
+            )
+
+        has_hits = any(int(x) != -1 for x in cand_ids[0])
+        if scores is None or has_hits:
+            scores, ids, served_scope, engine = cand_scores, cand_ids, scope, candidate
+        if has_hits:
+            break
+        if fallback_reason is None:
+            fallback_reason = "empty_results"
+        if scope != search_plan[-1][0]:
+            _log_index_fallback(company_id, scope, "empty_results", candidate.index_path)
+
+    if scores is None:
+        # Plandaki hiçbir index arama yapamadı.
+        return jsonify(
+            {
+                "results": [],
+                "retrieval_meta": {
+                    "index_scope": None,
+                    "fallback_reason": fallback_reason or "index_missing_or_empty",
+                },
+            }
         )
 
     faiss_ids = [int(i) for i in ids[0] if i != -1]
@@ -1712,6 +1877,10 @@ def _chunk_search_response(payload: dict):
                     "rerank_applied": False,
                     "dense_count": len(dense_results),
                     "lexical_count": 0,
+                    # Rollout metriği: "global_fallback" oranı 0'a inmeden
+                    # PER_COMPANY_FAISS_DUAL_READ kapatılmamalı.
+                    "index_scope": served_scope,
+                    "fallback_reason": fallback_reason,
                     **_reranker_status(),
                 },
             }
@@ -1757,6 +1926,8 @@ def _chunk_search_response(payload: dict):
                 "rrf_k_constant": RRF_K_CONSTANT,
                 "dense_count": len(dense_results),
                 "lexical_count": len(lexical_results),
+                "index_scope": served_scope,
+                "fallback_reason": fallback_reason,
                 **_reranker_status(),
             },
         }
@@ -2915,6 +3086,45 @@ def reconstruct_document(doc_id: str):
     )
 
 
+def _remove_chunk_vectors(chunks: list[dict], fallback_company_id) -> tuple[int, dict[str, int]]:
+    """
+    Chunk'ların vektörlerini AİT OLDUKLARI firma index'inden siler.
+
+    Neden gruplama: `companyId` bu endpoint'te OPSİYONEL ve tinnten-server onu
+    her zaman göndermiyor. Eskiden gönderilmediğinde `get_company_chunk_engine(None)`
+    global engine'e düşüyordu; per-company açıkken bu, silmeyi SESSİZ bir no-op
+    yapardı — chunk metadata gider, vektör firma index'inde SONSUZA DEK kalırdı
+    (kimliği de kaybolduğu için sonradan toplanamaz, ancak tam yeniden inşa ile).
+    Bu yüzden firmayı payload'a değil, chunk'ın KENDİSİNE soruyoruz; payload
+    yalnızca chunk'ta firma bilgisi hiç yoksa yedek olarak kullanılır.
+
+    Dönüş: (toplam_silinen, firma_bazlı_silinen).
+    """
+    by_company: dict[str, list[int]] = {}
+    for chunk in chunks:
+        if "faiss_id" not in chunk:
+            continue
+        cid = _chunk_company_id(chunk) or (str(fallback_company_id or "").strip() or "")
+        by_company.setdefault(cid, []).append(int(chunk["faiss_id"]))
+
+    removed_total = 0
+    removed_by_company: dict[str, int] = {}
+    for cid, ids in by_company.items():
+        unique_ids = sorted(set(ids))
+        removed = get_company_chunk_engine(cid or None).remove_ids(unique_ids)
+        removed_total += removed
+        removed_by_company[cid or "__global__"] = removed
+        if removed < len(unique_ids):
+            app.logger.warning(
+                "faiss remove incomplete companyId=%s requested=%s removed=%s index=%s",
+                cid or "(global)",
+                len(unique_ids),
+                removed,
+                _company_chunk_index_path(cid or None),
+            )
+    return removed_total, removed_by_company
+
+
 @app.route("/api/v10/content/index/remove", methods=["POST"])
 def remove_document():
     """
@@ -2922,8 +3132,13 @@ def remove_document():
 
     Modes:
         soft       — keep FAISS vectors, delete chunk metadata, mark removed.
-                     (FAISS IDs accumulate as `pending_faiss_ids`; a janitor
-                     job is expected to sweep them later.)
+                     DEFAULT, and the mode tinnten-server sends.
+                     UYARI: yetim vektörlerin ID'leri KALICI OLARAK KAYBOLUR —
+                     onları taşıyan chunk satırları aynı istekte siliniyor ve
+                     hiçbir yerde kalıcılaştırılmıyor. Dolayısıyla bunları
+                     toplayacak bir "janitor" işi YAZILAMAZ; biriken israfın
+                     tek çaresi firma indeksinin TAM YENİDEN İNŞASIDIR.
+                     Drift `GET /api/v10/company/<id>/index-stats` ile ölçülür.
         deactivate — remove FAISS vectors so the doc no longer appears in
                      semantic search, but keep chunk metadata in Mongo for
                      audit/history. This is the right choice when a user
@@ -2959,6 +3174,7 @@ def remove_document():
     should_delete_chunks = remove_mode in {"soft", "hard"}
 
     faiss_removed = 0
+    faiss_removed_by_company: dict[str, int] = {}
     if should_remove_faiss:
         app.logger.info(
             "%s remove requested for documentId=%s faiss_ids=%s",
@@ -2967,11 +3183,12 @@ def remove_document():
             len(faiss_ids),
         )
         try:
-            # Per-company FAISS: vektörler firmanın KENDİ index'inden silinir
-            # (bayrak kapalıysa global — davranış değişmez). Böylece bir firmanın
-            # silmesi diğer firmaların index'ine dokunmaz.
-            get_company_chunk_engine(company_id).remove_ids(faiss_ids)
-            faiss_removed = len(faiss_ids)
+            # Per-company FAISS: vektörler AİT OLDUKLARI firmanın index'inden
+            # silinir — firma payload'dan değil chunk'tan çözülür, çünkü
+            # `companyId` opsiyonel ve her zaman gönderilmiyor (bkz.
+            # `_remove_chunk_vectors`). Böylece bir firmanın silmesi diğer
+            # firmaların index'ine dokunmaz ve sessiz no-op olmaz.
+            faiss_removed, faiss_removed_by_company = _remove_chunk_vectors(chunks, company_id)
         except Exception as exc:  # noqa: BLE001
             _log_api_error(
                 f"{remove_mode}_remove_failed",
@@ -2982,7 +3199,8 @@ def remove_document():
             return jsonify({"error": f"failed to remove from FAISS: {exc}"}), 500
     else:
         app.logger.warning(
-            "Soft remove applied for documentId=%s (skipping FAISS mutation, pending_faiss_ids=%s)",
+            "Soft remove applied for documentId=%s (skipping FAISS mutation, "
+            "orphaned_vectors=%s — recoverable only by full index rebuild)",
             doc_id_str,
             len(faiss_ids),
         )
@@ -3009,8 +3227,13 @@ def remove_document():
         {
             "documentId": doc_id_str,
             "mode": remove_mode,
+            "faissRequested": len(faiss_ids),
             "faissRemoved": faiss_removed,
-            "faissPendingCleanup": max(0, len(faiss_ids) - faiss_removed),
+            # "pending" DEĞİL: bunlar bekleyen iş değil, kalıcı yetim vektörler.
+            "faissOrphaned": max(0, len(faiss_ids) - faiss_removed),
+            # Hangi firma index'inden kaç vektör düştü — silme sessizce global'e
+            # kaymışsa burada "__global__" olarak görünür.
+            "faissRemovedByCompany": faiss_removed_by_company,
             "chunksDeleted": deleted_chunks,
             "chunksRetained": len(chunks) - deleted_chunks,
             "state": "removed",
@@ -3032,7 +3255,8 @@ def remove_domain_index():
     Body: { companyId (req), domain (req), mode: soft|deactivate|hard (default hard) }
       hard       — FAISS vektörleri + chunk metadata silinir (tam temizlik).
       deactivate — FAISS vektörleri silinir, chunk'lar audit için kalır.
-      soft       — chunk'lar silinir, FAISS mutasyonu yok (janitor toplar).
+      soft       — chunk'lar silinir, FAISS mutasyonu yok. Yetim vektörler kalıcıdır
+                   (kimlikleri kaybolur); temizlik yalnızca tam yeniden inşa ile.
     """
     payload = request.get_json(silent=True) or {}
     company_id = _get_payload_value(payload, "companyId", "company_id", "companyid")
@@ -3054,8 +3278,7 @@ def remove_domain_index():
     if should_remove_faiss and faiss_ids:
         try:
             # SADECE bu firmanın index'inden sil.
-            get_company_chunk_engine(company_id).remove_ids(faiss_ids)
-            faiss_removed = len(faiss_ids)
+            faiss_removed = get_company_chunk_engine(company_id).remove_ids(faiss_ids)
         except Exception as exc:  # noqa: BLE001
             _log_api_error(
                 "remove_domain_faiss_failed",
@@ -3462,6 +3685,11 @@ def provision_company_faiss(company_id):
     cid = str(company_id or "").strip()
     if not cid:
         return jsonify({"error": "company_id required"}), 400
+    # Sanitizasyondan sonra boşalan id (ör. "..", "!!!") firma index'i ÜRETEMEZ —
+    # `_company_chunk_index_path` böyle bir id'de GLOBAL yola düşer. Erken
+    # reddetmezsek burada global index'i "firma provision'ı" diye yaratırdık.
+    if not sanitize_company_id(cid):
+        return jsonify({"error": "company_id is not a valid index identifier"}), 400
     if not PER_COMPANY_FAISS_ENABLED:
         return jsonify({"ok": True, "companyId": cid, "skipped": "feature_disabled"}), 200
     try:
@@ -3470,6 +3698,129 @@ def provision_company_faiss(company_id):
         return jsonify({"ok": True, "companyId": cid, **info}), 200
     except Exception as exc:  # noqa: BLE001
         _log_api_error("provision_company_faiss", exc=exc)
+        return jsonify({"ok": False, "companyId": cid, "error": str(exc)}), 500
+
+
+@app.route("/api/v10/company/<company_id>/index-stats", methods=["GET"])
+def company_index_stats(company_id):
+    """
+    Firma indeks sağlığı — CMS drift göstergesinin veri kaynağı.
+
+    İŞARET KONVANSİYONU (CMS bunlara göre iki AYRI alarm gösterir):
+      drift = mongoActiveChunks - ntotal
+        > 0 → Mongo'da olup FAISS'te olmayan chunk'lar = ARAMA İÇERİK KAÇIRIYOR (acil)
+      orphanEstimate = max(0, ntotal - mongoActiveChunks)
+        > 0 → FAISS'te karşılığı olmayan yetim vektörler = ALAN İSRAFI (rutin)
+
+    Yetim vektörlerin KİMLİĞİ geri kazanılamaz (soft delete'te chunk satırı aynı
+    istekte siliniyor), bu yüzden burada bir sayı döneriz, liste değil. Düzeltmenin
+    tek yolu tam yeniden inşadır.
+
+    ntotal `ensure_index_persisted()` üzerinden okunur: diskten reload eder, yani
+    ayrı process olan ingest worker'ın yazdığını da görür. `EmbeddingEngine.count()`
+    reload etmediği için burada KULLANILAMAZ (bayat değer döner).
+    YAN ETKİ: index dosyası yoksa boş bir index yaratır (idempotent provision).
+    """
+    cid = str(company_id or "").strip()
+    if not cid:
+        return jsonify({"error": "company_id required"}), 400
+    # Geçersiz id global index'e düşer ve GLOBAL ntotal'ı bu firmanınmış gibi
+    # raporlardık — CMS'teki drift alarmını tamamen yanlış beslerdi.
+    if not sanitize_company_id(cid):
+        return jsonify({"error": "company_id is not a valid index identifier"}), 400
+
+    try:
+        engine = get_company_chunk_engine(cid)
+        info = engine.ensure_index_persisted()
+        ntotal = int(info.get("ntotal") or 0)
+        index_path = info.get("path") or engine.index_path
+        try:
+            index_bytes = int(os.path.getsize(index_path))
+        except OSError:
+            index_bytes = None
+
+        mongo_chunks = chunk_store.count_chunks_by_company(cid)
+        mongo_active = chunk_store.count_active_chunks_by_company(cid)
+        drift = mongo_active - ntotal
+        denom = mongo_active or ntotal or 0
+
+        return jsonify({
+            "ok": True,
+            "companyId": cid,
+            "indexPath": index_path,
+            "ntotal": ntotal,
+            "indexBytes": index_bytes,
+            "indexDim": engine.index_dimension(),
+            "modelDim": engine.model_dimension(),
+            "mongoChunks": mongo_chunks,
+            "mongoActiveChunks": mongo_active,
+            "drift": drift,
+            "driftPct": round((drift / denom) * 100, 2) if denom else 0.0,
+            "orphanEstimate": max(0, ntotal - mongo_active),
+            "perCompanyEnabled": PER_COMPANY_FAISS_ENABLED,
+        }), 200
+    except Exception as exc:  # noqa: BLE001
+        _log_api_error("company_index_stats", exc=exc, context={"companyId": cid})
+        return jsonify({"ok": False, "companyId": cid, "error": str(exc)}), 500
+
+
+@app.route("/api/v10/company/<company_id>/rebuild-index", methods=["POST"])
+def rebuild_company_index(company_id):
+    """
+    Firmanın FAISS index'ini Mongo'daki AKTİF chunk'lardan sıfırdan kurar.
+
+    Soft delete FAISS'e dokunmadığı için yetim vektörler birikir ve kimlikleri
+    geri kazanılamaz — "artıkları topla" mümkün değildir. Temizliğin TEK yolu
+    budur: hâlâ karşılığı olan id'lerden temiz bir index kurmak.
+
+    Body: { dryRun (varsayılan TRUE), batchSize, allowEmpty }
+    dryRun bilerek varsayılan: yıkıcı olan tarafı çağıranın açıkça istemesi gerekir.
+
+    UYARI: işlem boyunca o firmanın index yazma kilidi tutulur — büyük tenant'ta
+    dakikalar sürebilir ve o firmanın ingest'i kuyrukta bekler (kaybolmaz).
+    """
+    cid = str(company_id or "").strip()
+    if not cid:
+        return jsonify({"error": "company_id required"}), 400
+    if not PER_COMPANY_FAISS_ENABLED:
+        # Global index'i "bir firma için" yeniden kurmak diğer firmaları silerdi.
+        return jsonify({
+            "ok": False,
+            "companyId": cid,
+            "error": "per-company FAISS disabled; refusing to rebuild the shared global index",
+        }), 409
+
+    payload = request.get_json(silent=True) or {}
+    dry_run = payload.get("dryRun")
+    dry_run = True if dry_run is None else bool(dry_run)
+    batch_size = max(1, int(payload.get("batchSize") or 5000))
+    allow_empty = bool(payload.get("allowEmpty"))
+
+    started = time.time()
+    try:
+        engine = get_company_chunk_engine(cid)
+        result = engine.rebuild_from_ids(
+            chunk_store.iter_active_faiss_ids_by_company(cid, batch_size=batch_size),
+            dry_run=dry_run,
+            batch_size=batch_size,
+            allow_empty=allow_empty,
+        )
+        result["companyId"] = cid
+        result["mongoActiveChunks"] = chunk_store.count_active_chunks_by_company(cid)
+        result["durationMs"] = int((time.time() - started) * 1000)
+        if result.get("missingReconstruct"):
+            # Mongo'da var ama FAISS'te yok: dual-read açıkken global'de olabilir,
+            # kapandıktan sonra bu KALICI retrieval kaybıdır.
+            app.logger.warning(
+                "rebuild_index missing_reconstruct companyId=%s missing=%s dualRead=%s",
+                cid,
+                result["missingReconstruct"],
+                PER_COMPANY_FAISS_DUAL_READ,
+            )
+        status = 200 if result.get("ok") else 409
+        return jsonify(result), status
+    except Exception as exc:  # noqa: BLE001
+        _log_api_error("rebuild_company_index", exc=exc, context={"companyId": cid})
         return jsonify({"ok": False, "companyId": cid, "error": str(exc)}), 500
 
 
