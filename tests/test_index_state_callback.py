@@ -4,6 +4,8 @@ Per-sayfa (fetcher_page/initial) doc'larda callback body'si `metadata.domain` +
 `stats.domainChunks` taşımalı ki server website ENTRY'sini domain ile bulup
 badge'i güncellesin. Diğer source'larda bu alanlar OLMAMALI.
 """
+import queue
+import threading
 from unittest.mock import MagicMock, patch
 
 from services.tinnten_server_client import TinntenServerClient
@@ -72,6 +74,11 @@ def _worker_for_state_callback(chunk_docs):
     store.chunks.count_documents.return_value = len(chunk_docs)
     w.store = store
     w.content_store = MagicMock()
+    # Bildirim artık arka plan thread'inden gidiyor (doküman yolunu bekletmemek
+    # için); `__init__` atlandığından kuyruk/kilit burada kurulur.
+    w._callback_queue = queue.Queue(maxsize=100)
+    w._callback_thread = None
+    w._callback_lock = threading.RLock()
     return w
 
 
@@ -92,6 +99,8 @@ def _run_safe_update(worker, **kwargs):
             callback_domain=kwargs.get("callback_domain"),
             callback_source=kwargs.get("callback_source"),
         )
+        # Bildirim asenkron: patch hâlâ aktifken teslimin bitmesini bekle.
+        worker._callback_queue.join()
         return get_cli.return_value.update_document_index_state.call_args.kwargs
 
 

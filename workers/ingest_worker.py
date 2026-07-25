@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import signal
 import sys
@@ -61,6 +62,8 @@ DEFAULT_INGEST_LEASE_SECONDS = 900
 # ack'lenmemiş mesaj penceresini genişletir (bkz. `_flush_company_group`).
 DEFAULT_BATCH_MAX_MESSAGES = 16
 DEFAULT_BATCH_MAX_WAIT_SECONDS = 5.0
+# tinnten-server bildirim kuyruğu tavanı (bkz. `_submit_index_state_callback`).
+DEFAULT_CALLBACK_QUEUE_SIZE = 2000
 
 # 'auto' chunk stratejisi: metinde ATX markdown başlığı var mı? (Faz 7 / KN3)
 # Yalnız satır başı '#'ler heading sayılır — böylece schema-derived düz metinde
@@ -196,6 +199,15 @@ class IngestWorker:
             "yes",
             "on",
         }
+        # tinnten-server index-state bildirimleri (bkz. `_callback_loop`):
+        # doküman yolundan çıkarıldı. Tek tüketici → FIFO sıra korunur.
+        # Kuyruk sınırlı: dolarsa senkron gönderime düşülür (backpressure),
+        # böylece backend yavaşlığı sessiz bildirim kaybına dönüşmez.
+        self._callback_queue: queue.Queue = queue.Queue(
+            maxsize=int(os.getenv("INGEST_CALLBACK_QUEUE_SIZE") or DEFAULT_CALLBACK_QUEUE_SIZE)
+        )
+        self._callback_thread: Optional[threading.Thread] = None
+        self._callback_lock = threading.RLock()
         self.email_events = EmbeddingEmailEvents()
         self.error_logger = EmbeddingErrorLogger(component="worker")
 
@@ -356,6 +368,19 @@ class IngestWorker:
                 self._flush_pending()
         except Exception as exc:  # noqa: BLE001
             log(f"WARNING: shutdown flush failed: {exc}")
+        # Bekleyen bildirimleri kapanmadan teslim et (best-effort, sınırlı süre):
+        # aksi halde tamamlanan dokümanların durumu tinnten-server'a hiç gitmez.
+        try:
+            with self._callback_lock:
+                thread = self._callback_thread
+            if thread is not None and thread.is_alive():
+                pending = self._callback_queue.qsize()
+                if pending:
+                    log(f"Draining {pending} pending callback(s) before shutdown...")
+                self._callback_queue.put(None)
+                thread.join(timeout=30)
+        except Exception as exc:  # noqa: BLE001
+            log(f"WARNING: callback drain failed: {exc}")
         try:
             if self.channel and self.channel.is_open:
                 self.channel.stop_consuming()
@@ -2282,64 +2307,125 @@ class IngestWorker:
         except Exception as exc:  # noqa: BLE001
             log(f"Failed to update index state for {context.document_id}: {exc}")
 
-        # Notify tinnten-server so it can sync its own contentdocuments record
+        # Notify tinnten-server so it can sync its own contentdocuments record.
+        # ASENKRON: HTTP çağrısı + domain/chunk sayımı doküman işleme yolundan
+        # çıkarıldı. Bu bildirim best-effort (hatası zaten yutuluyordu), o yüzden
+        # turu bekletmesi gereksizdi; senkronken doküman başına ölçülebilir
+        # gecikme ekliyordu. Sıra korunur: tek tüketici thread, FIFO kuyruk.
         if state in ("completed", "failed", "indexing"):
+            self._submit_index_state_callback(
+                context=context,
+                state=state,
+                stats=None if stats is UPDATE_UNSET else stats,
+                error_msg=None if error is UPDATE_UNSET else (str(error) if error else None),
+                callback_domain=callback_domain,
+                callback_source=callback_source,
+            )
+
+    # ------------------------------------------------------------------
+    def _ensure_callback_worker(self) -> None:
+        with self._callback_lock:
+            if self._callback_thread is not None and self._callback_thread.is_alive():
+                return
+            self._callback_thread = threading.Thread(
+                target=self._callback_loop, name="IndexStateCallback", daemon=True
+            )
+            self._callback_thread.start()
+
+    def _callback_loop(self) -> None:
+        """tinnten-server bildirimlerini sırayla, ana yoldan bağımsız gönderir."""
+        while True:
+            item = self._callback_queue.get()
             try:
-                server_client = get_tinnten_server_client()
-                stats_payload = None if stats is UPDATE_UNSET else stats
-                error_msg = None if error is UPDATE_UNSET else (str(error) if error else None)
+                if item is None:  # kapanış sinyali
+                    return
+                self._deliver_index_state_callback(**item)
+            except Exception as exc:  # noqa: BLE001
+                log(f"[callback] delivery failed: {exc}")
+            finally:
+                self._callback_queue.task_done()
 
-                # Per-sayfa (fetcher_page/initial) doc'ları website ENTRY'sine
-                # bağlamak için domain + domainChunks gönder. Entry'nin tek
-                # faissIndexId'i per-sayfa docId'lerle eşleşmez → server domain ile
-                # bulur, chunkCount'u SET eder (badge "İndeksleniyor"→"Tamamlandı").
-                page_domain = None
-                page_source = None
-                domain_chunks = None
-                if str(context.trigger or "") in ("fetcher_page", "fetcher_initial"):
-                    # Domain önce çağıran taraftan gelen hint'ten (content-load
-                    # metadata'sı). chunks=0 tamamlanmada kayıtlı chunk YOK →
-                    # chunk-tabanlı çözüm domain'siz kalır, callback metadata'sız
-                    # gider ve server website entry'sini bulamaz (abonelik
-                    # embedding-state köprüsü hiç tetiklenmez).
-                    if callback_domain:
-                        page_domain = str(callback_domain)
-                        page_source = str(callback_source or context.trigger)
-                    try:
-                        if not page_domain:
-                            for c in self._get_store().get_chunks_by_doc(context.document_id):
-                                md = c.get("metadata") or {}
-                                if md.get("domain"):
-                                    page_domain = md.get("domain")
-                                    page_source = str(md.get("source") or context.trigger)
-                                    break
-                        if not page_source:
-                            page_source = str(context.trigger)
-                        if page_domain:
-                            domain_chunks = self._get_store().chunks.count_documents(
-                                {
-                                    "metadata.domain": page_domain,
-                                    "$or": [
-                                        {"company_id": context.company_id},
-                                        {"metadata.companyId": context.company_id},
-                                    ],
-                                }
-                            )
-                    except Exception:  # noqa: BLE001
-                        pass
+    def _submit_index_state_callback(self, **payload: Any) -> None:
+        """Bildirimi arka plana kuyruklar.
 
-                server_client.update_document_index_state(
-                    document_id=context.document_id,
-                    state=state,
-                    error_msg=error_msg,
-                    stats=stats_payload if isinstance(stats_payload, dict) else None,
-                    company_id=context.company_id,
-                    domain=page_domain,
-                    source=page_source,
-                    domain_chunks=domain_chunks,
-                )
-            except Exception as cb_exc:  # noqa: BLE001
-                log(f"[callback] Failed to notify tinnten-server for {context.document_id}: {cb_exc}")
+        Kuyruk dolarsa (backend yavaş/erişilemez) SENKRON gönderime düşer:
+        sessizce düşürmek yerine doğal backpressure uygular, böylece bildirim
+        kaybı yaşanmaz ve yavaşlama görünür olur.
+        """
+        self._ensure_callback_worker()
+        try:
+            self._callback_queue.put_nowait(payload)
+        except queue.Full:
+            log("WARNING: [callback] kuyruk dolu — senkron gönderiliyor (backend yavaş?)")
+            try:
+                self._deliver_index_state_callback(**payload)
+            except Exception as exc:  # noqa: BLE001
+                log(f"[callback] sync fallback failed: {exc}")
+
+    def _deliver_index_state_callback(
+        self,
+        *,
+        context: DocumentJobContext,
+        state: Optional[str],
+        stats: Optional[Dict[str, Any]],
+        error_msg: Optional[str],
+        callback_domain: Optional[str],
+        callback_source: Optional[str],
+    ) -> None:
+        try:
+            server_client = get_tinnten_server_client()
+
+            # Per-sayfa (fetcher_page/initial) doc'ları website ENTRY'sine
+            # bağlamak için domain + domainChunks gönder. Entry'nin tek
+            # faissIndexId'i per-sayfa docId'lerle eşleşmez → server domain ile
+            # bulur, chunkCount'u SET eder (badge "İndeksleniyor"→"Tamamlandı").
+            page_domain = None
+            page_source = None
+            domain_chunks = None
+            if str(context.trigger or "") in ("fetcher_page", "fetcher_initial"):
+                # Domain önce çağıran taraftan gelen hint'ten (content-load
+                # metadata'sı). chunks=0 tamamlanmada kayıtlı chunk YOK →
+                # chunk-tabanlı çözüm domain'siz kalır, callback metadata'sız
+                # gider ve server website entry'sini bulamaz (abonelik
+                # embedding-state köprüsü hiç tetiklenmez).
+                if callback_domain:
+                    page_domain = str(callback_domain)
+                    page_source = str(callback_source or context.trigger)
+                try:
+                    if not page_domain:
+                        for c in self._get_store().get_chunks_by_doc(context.document_id):
+                            md = c.get("metadata") or {}
+                            if md.get("domain"):
+                                page_domain = md.get("domain")
+                                page_source = str(md.get("source") or context.trigger)
+                                break
+                    if not page_source:
+                        page_source = str(context.trigger)
+                    if page_domain:
+                        domain_chunks = self._get_store().chunks.count_documents(
+                            {
+                                "metadata.domain": page_domain,
+                                "$or": [
+                                    {"company_id": context.company_id},
+                                    {"metadata.companyId": context.company_id},
+                                ],
+                            }
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+
+            server_client.update_document_index_state(
+                document_id=context.document_id,
+                state=state,
+                error_msg=error_msg,
+                stats=stats if isinstance(stats, dict) else None,
+                company_id=context.company_id,
+                domain=page_domain,
+                source=page_source,
+                domain_chunks=domain_chunks,
+            )
+        except Exception as cb_exc:  # noqa: BLE001
+            log(f"[callback] Failed to notify tinnten-server for {context.document_id}: {cb_exc}")
 
     def _notify_index_failure(
         self,

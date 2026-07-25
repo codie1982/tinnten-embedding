@@ -304,6 +304,51 @@ def test_verbose_doc_logs_can_be_reenabled(mocker):
     assert store.append_log_entry.call_count == 1
 
 
+def test_index_state_callback_is_async(mocker):
+    """Bildirim doküman yolunu BEKLETMEZ: kuyruğa atılır, arka planda gider."""
+    worker = _make_worker(mocker)
+    delivered = []
+    started = __import__("threading").Event()
+
+    def slow_deliver(**payload):
+        started.set()
+        delivered.append(payload["context"].document_id)
+
+    mocker.patch.object(worker, "_deliver_index_state_callback", side_effect=slow_deliver)
+    ctx = MagicMock(company_id="A", document_id="d1", job_id="j1", user_id=None, trigger="fetcher_page")
+
+    worker._submit_index_state_callback(
+        context=ctx, state="completed", stats=None, error_msg=None,
+        callback_domain=None, callback_source=None,
+    )
+    assert started.wait(timeout=5), "arka plan thread'i bildirimi işlemeliydi"
+    worker._callback_queue.join()
+    assert delivered == ["d1"]
+
+
+def test_callback_queue_full_falls_back_to_sync(mocker):
+    """Kuyruk dolduğunda bildirim DÜŞÜRÜLMEZ, senkron gönderilir (backpressure)."""
+    worker = _make_worker(mocker)
+    sent = []
+    mocker.patch.object(worker, "_ensure_callback_worker")  # tüketici başlatma
+    mocker.patch.object(
+        worker, "_deliver_index_state_callback", side_effect=lambda **p: sent.append(p["state"])
+    )
+    # Kuyruğu doldur
+    while True:
+        try:
+            worker._callback_queue.put_nowait({"dummy": True})
+        except Exception:
+            break
+
+    ctx = MagicMock(company_id="A", document_id="d1", job_id="j1", user_id=None, trigger="x")
+    worker._submit_index_state_callback(
+        context=ctx, state="completed", stats=None, error_msg=None,
+        callback_domain=None, callback_source=None,
+    )
+    assert sent == ["completed"], "kuyruk doluyken senkron gönderilmeliydi"
+
+
 def test_content_messages_are_buffered_until_batch_is_full(mocker):
     """content-index mesajları grup dolana kadar bekletilir."""
     worker = _make_worker(mocker)
