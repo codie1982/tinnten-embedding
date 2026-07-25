@@ -103,6 +103,10 @@ class EmbeddingEngine:
         self._dimension: int | None = None
         self._model_dimension: int | None = None
         self._index_mtime: float | None = None
+        # Toplu yazım durumu (bkz. `batch_writes`): blok içindeyken tek tek
+        # mutasyonlar diske YAZMAZ, yalnız "kirli" işaretler; çıkışta tek save.
+        self._batch_depth = 0
+        self._batch_dirty = False
         self._cleanup_tmp_files()
         self._load_index()
 
@@ -161,20 +165,78 @@ class EmbeddingEngine:
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
+    @contextmanager
+    def _maybe_write_lock(self) -> Iterator[None]:
+        """Batch içindeysek dosya kilidi zaten bizde — yeniden almaya kalkma.
+
+        `_write_lock` her çağrıda YENİ bir fd açıp flock'lar. flock kilitleri
+        süreç başına değil açık-dosya-tanımı başına tutulduğu için, aynı süreçte
+        ikinci kez çağırmak kendi kilidimizde bloke olur → deadlock.
+        """
+        if self._batch_depth > 0:
+            yield
+            return
+        with self._write_lock():
+            yield
+
+    def _save_or_defer(self) -> None:
+        """Batch dışında hemen kaydeder; batch içinde kaydı blok çıkışına erteler."""
+        if self._batch_depth > 0:
+            self._batch_dirty = True
+            return
+        self._save_index()
+
+    @contextmanager
+    def batch_writes(self) -> Iterator[None]:
+        """Blok boyunca yapılan tüm mutasyonları TEK diske-yazımda toplar.
+
+        Neden: index dosyası firma başına yüzlerce MB (canlıda 195MB) ve her
+        `add_embeddings`/`remove_ids` çağrısı dosyanın TAMAMINI yeniden yazıyor.
+        Doküman başına 2 tam yazım (ekle + eski sürümü temizle) ingest'in tek
+        darboğazıydı: ~390MB disk yazımı/doküman. Blok başına tek yazımla bu
+        maliyet gruptaki doküman sayısına bölünür.
+
+        Blok boyunca hem süreç-içi RLock hem süreçler-arası dosya kilidi TUTULUR:
+        - Başka bir worker araya girip dosyayı değiştiremez → bellekteki index
+          diskle ayrışmaz, çıkıştaki tek save kimsenin yazdığını ezmez.
+        - Kilit index YOLUNA özeldir; farklı firmalar birbirini beklemez.
+
+        Dayanıklılık sözleşmesi — çağıran uymak zorunda: blok başarıyla bitene
+        kadar vektörler YALNIZ BELLEKTEDİR. Mesajlar ancak bloktan çıkıldıktan
+        SONRA ack'lenmeli; aksi halde çıkıştan önceki bir çökme, Mongo'da
+        "tamamlandı" görünüp diskteki index'te bulunmayan chunk'lar bırakır.
+        """
+        with self._lock:
+            with self._maybe_write_lock():
+                if self._batch_depth == 0:
+                    self.reload_if_updated_locked()
+                self._batch_depth += 1
+                try:
+                    yield
+                finally:
+                    self._batch_depth -= 1
+                    if self._batch_depth == 0 and self._batch_dirty:
+                        # Save patlarsa `_batch_dirty` True kalır: hata yukarı
+                        # gider (çağıran ack'lemez) ve bir sonraki blok çıkışı
+                        # tekrar kaydetmeyi dener.
+                        self._save_index()
+                        self._batch_dirty = False
+
     def add_embeddings(self, embeddings: np.ndarray, ids: Sequence[int]) -> None:
         if embeddings.ndim != 2:
             raise ValueError("embeddings must be 2D")
         if len(ids) != embeddings.shape[0]:
             raise ValueError("ids length must match embeddings rows")
         with self._lock:
-            with self._write_lock():
-                self.reload_if_updated_locked()
+            with self._maybe_write_lock():
+                if self._batch_depth == 0:
+                    self.reload_if_updated_locked()
                 self._maybe_refresh_index(expected_dim=embeddings.shape[1])
                 self._ensure_index(embeddings.shape[1])
                 faiss.normalize_L2(embeddings)
                 id_array = np.asarray(list(ids), dtype=np.int64)
                 self._index.add_with_ids(embeddings, id_array)
-                self._save_index()
+                self._save_or_defer()
 
     def replace_embeddings(
         self,
@@ -194,8 +256,9 @@ class EmbeddingEngine:
         old_id_list = [int(i) for i in old_ids if i is not None]
         
         with self._lock:
-            with self._write_lock():
-                self.reload_if_updated_locked()
+            with self._maybe_write_lock():
+                if self._batch_depth == 0:
+                    self.reload_if_updated_locked()
                 self._maybe_refresh_index(expected_dim=new_embeddings.shape[1])
                 self._ensure_index(new_embeddings.shape[1])
                 
@@ -208,9 +271,9 @@ class EmbeddingEngine:
                 faiss.normalize_L2(new_embeddings)
                 new_id_array = np.asarray(list(new_ids), dtype=np.int64)
                 self._index.add_with_ids(new_embeddings, new_id_array)
-                
+
                 # 3. Save once
-                self._save_index()
+                self._save_or_defer()
                 
         return len(old_id_list)
 
@@ -310,15 +373,16 @@ class EmbeddingEngine:
         if not id_list:
             return 0
         with self._lock:
-            with self._write_lock():
-                self.reload_if_updated_locked()
+            with self._maybe_write_lock():
+                if self._batch_depth == 0:
+                    self.reload_if_updated_locked()
                 if self._index is None:
                     return 0
                 id_array = np.asarray(id_list, dtype=np.int64)
                 try:
                     self._index.remove_ids(id_array)
                 finally:
-                    self._save_index()
+                    self._save_or_defer()
         return len(id_list)
 
     # ------------------------------------------------------------------

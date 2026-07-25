@@ -55,6 +55,12 @@ DEFAULT_CHUNK_SIZE = 1200
 DEFAULT_CHUNK_OVERLAP = 200
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_INGEST_LEASE_SECONDS = 900
+# Toplu tüketim: kaç content-index mesajı biriktirilip tek seferde işlenecek ve
+# yarım grup en fazla ne kadar bekletilecek. Grup büyüdükçe FAISS yazımı daha
+# çok dokümana bölünür; fazla büyütmek tek mesajın gecikmesini artırır ve
+# ack'lenmemiş mesaj penceresini genişletir (bkz. `_flush_company_group`).
+DEFAULT_BATCH_MAX_MESSAGES = 16
+DEFAULT_BATCH_MAX_WAIT_SECONDS = 5.0
 
 # 'auto' chunk stratejisi: metinde ATX markdown başlığı var mı? (Faz 7 / KN3)
 # Yalnız satır başı '#'ler heading sayılır — böylece schema-derived düz metinde
@@ -167,6 +173,22 @@ class IngestWorker:
         self.connection: pika.BlockingConnection | None = None
         self.channel: pika.adapters.blocking_connection.BlockingChannel | None = None
         self._stop_event = threading.Event()
+        # Toplu tüketim: content-index mesajları tek tek değil grup halinde
+        # işlenir; aynı firmanınkiler TEK FAISS yazımında toplanır. Kapatmak
+        # için INGEST_BATCH_ENABLED=false (yeniden başlatma yeter, build değil).
+        self.batch_enabled = (os.getenv("INGEST_BATCH_ENABLED") or "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.batch_max_messages = max(
+            1, int(os.getenv("INGEST_BATCH_MAX_MESSAGES") or DEFAULT_BATCH_MAX_MESSAGES)
+        )
+        self.batch_max_wait_seconds = float(
+            os.getenv("INGEST_BATCH_MAX_WAIT_SECONDS") or DEFAULT_BATCH_MAX_WAIT_SECONDS
+        )
+        self._pending: List[Tuple[int, Dict[str, Any]]] = []
         self.email_events = EmbeddingEmailEvents()
         self.error_logger = EmbeddingErrorLogger(component="worker")
 
@@ -292,10 +314,24 @@ class IngestWorker:
         )
         self.connection = connect_rabbit_with_retry()
         self.channel = self.connection.channel()
-        self.channel.basic_qos(prefetch_count=1)
+        # Toplu modda tampon dolabilsin diye prefetch grup boyutu kadar olmalı;
+        # prefetch=1 ile broker ikinci mesajı ilki ack'lenmeden göndermez ve
+        # gruplama hiç oluşmaz.
+        prefetch = self.batch_max_messages if self.batch_enabled else 1
+        self.channel.basic_qos(prefetch_count=prefetch)
         for queue_name in self.queue_names:
             self.channel.queue_declare(queue=queue_name, durable=True, auto_delete=False, exclusive=False)
             self.channel.basic_consume(queue=queue_name, on_message_callback=self._handle_message, auto_ack=False)
+        if self.batch_enabled:
+            log(
+                "Batch mode ON: max_messages=%s max_wait=%ss prefetch=%s",
+                self.batch_max_messages,
+                self.batch_max_wait_seconds,
+                prefetch,
+            )
+            self._schedule_flush_timer()
+        else:
+            log("Batch mode OFF: mesajlar tek tek islenecek (prefetch=1)")
         log(f"Awaiting messages on queues: {', '.join(self.queue_names)}")
         try:
             self.channel.start_consuming()
@@ -305,6 +341,14 @@ class IngestWorker:
     def stop(self) -> None:
         log("Stopping worker...")
         self._stop_event.set()
+        # Bekleyen grubu kapanmadan önce boşalt: aksi halde ack'lenmemiş
+        # mesajlar broker'a döner (veri kaybı yok) ama yapılan iş boşa gider.
+        try:
+            if self._pending:
+                log(f"Flushing {len(self._pending)} pending message(s) before shutdown...")
+                self._flush_pending()
+        except Exception as exc:  # noqa: BLE001
+            log(f"WARNING: shutdown flush failed: {exc}")
         try:
             if self.channel and self.channel.is_open:
                 self.channel.stop_consuming()
@@ -325,67 +369,187 @@ class IngestWorker:
         body: bytes,
     ) -> None:
         delivery_tag = method.delivery_tag
-        payload: Dict[str, Any] = {}
         try:
-            payload = json.loads(body.decode("utf-8"))
-            self._process_payload(payload)
-            channel.basic_ack(delivery_tag=delivery_tag)
+            payload: Dict[str, Any] = json.loads(body.decode("utf-8"))
         except Exception as exc:  # noqa: BLE001
-            log(f"Error processing message: {exc}")
+            log(f"Error decoding message: {exc}")
+            self._log_worker_error("message_decode_failed", exc=exc, context={})
+            self._safe_settle(delivery_tag, ack=False, requeue=False)
+            return
+
+        # Toplu mod YALNIZ content-index mesajlarına uygulanır — FAISS yazımını
+        # amorti eden yol bu. embedded_chunks/legacy mesajları eskisi gibi anında
+        # işlenir (nadir + farklı kod yolu; gruplamanın kazancı yok).
+        if self.batch_enabled and self._is_content_index_message(payload):
+            self._pending.append((delivery_tag, payload))
+            if len(self._pending) >= self.batch_max_messages:
+                self._flush_pending()
+            return
+
+        try:
+            self._process_payload(payload)
+            self._safe_settle(delivery_tag, ack=True)
+        except Exception as exc:  # noqa: BLE001
+            self._report_message_failure(payload, exc)
+            self._safe_settle(delivery_tag, ack=False, requeue=False)
+
+    # ------------------------------------------------------------------
+    def _safe_settle(self, delivery_tag: int, *, ack: bool, requeue: bool = False) -> None:
+        """Mesajı ack/nack eder; kanal kapalıysa sessizce geçer.
+
+        Kanal koptuysa ack de nack da anlamsız — ack'lenmemiş mesajları broker
+        zaten geri alır. Burada patlamak, grubun KALAN mesajlarının settle
+        edilmesini engellerdi.
+        """
+        try:
+            if self.channel is None or not self.channel.is_open:
+                return
+            if ack:
+                self.channel.basic_ack(delivery_tag=delivery_tag)
+            else:
+                self.channel.basic_nack(delivery_tag=delivery_tag, requeue=requeue)
+        except Exception as exc:  # noqa: BLE001
+            log(f"WARNING: settle failed delivery_tag={delivery_tag} ack={ack}: {exc}")
+
+    def _schedule_flush_timer(self) -> None:
+        """Yarım kalan grubu süreyle boşaltmak için tekrarlayan zamanlayıcı.
+
+        Grup dolmadan trafik kesilirse (ör. kuyruğun sonu) mesajlar tamponda
+        asılı kalmasın diye gerekli. Kendini yeniden kurar; pika'nın ioloop'unda
+        çalıştığı için ack'ler aynı thread'den yapılır.
+        """
+        if not self.batch_enabled or self._stop_event.is_set():
+            return
+        if self.connection is None or not self.connection.is_open:
+            return
+        try:
+            self.connection.call_later(self.batch_max_wait_seconds, self._on_flush_timer)
+        except Exception as exc:  # noqa: BLE001
+            log(f"WARNING: flush timer scheduling failed: {exc}")
+
+    def _on_flush_timer(self) -> None:
+        try:
+            if self._pending:
+                self._flush_pending()
+        except Exception as exc:  # noqa: BLE001
+            log(f"WARNING: timed flush failed: {exc}")
+        finally:
+            self._schedule_flush_timer()
+
+    def _flush_pending(self) -> None:
+        """Tamponu firma bazında gruplayıp her grubu tek FAISS yazımıyla işler."""
+        if not self._pending:
+            return
+        pending = self._pending
+        self._pending = []
+
+        groups: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
+        for delivery_tag, payload in pending:
+            company_id = self._coalesce(payload, "companyId", "company_id", "companyid")
+            groups.setdefault(str(company_id or ""), []).append((delivery_tag, payload))
+
+        log(f"Flushing {len(pending)} message(s) in {len(groups)} company group(s)")
+        for company_id, items in groups.items():
+            self._flush_company_group(company_id, items)
+
+    def _flush_company_group(
+        self, company_id: str, items: List[Tuple[int, Dict[str, Any]]]
+    ) -> None:
+        """Bir firmanın mesajlarını TEK FAISS yazımı altında işler.
+
+        Ack'ler blok BİTTİKTEN sonra verilir. `batch_writes` sözleşmesi gereği
+        vektörler blok çıkışına kadar yalnız bellektedir; erken ack'lersek
+        çıkıştan önceki bir çökme mesajı da yok eder → chunk Mongo'da
+        "tamamlandı" görünür ama index'te bulunmaz (sessiz kayıp). Ack'i
+        geciktirince aynı çökme mesajları geri getirir ve doküman yeniden
+        indexlenir; sürümlü swap bunu idempotent kılar.
+        """
+        engine = self._engine_for_company(company_id or None)
+        acks: List[int] = []
+        try:
+            with engine.batch_writes():
+                for delivery_tag, payload in items:
+                    try:
+                        self._process_payload(payload)
+                        acks.append(delivery_tag)
+                    except Exception as exc:  # noqa: BLE001
+                        # Tek mesajın hatası grubu düşürmez: kendi defterini
+                        # tutup düşer, kardeşleri işlenmeye devam eder.
+                        self._report_message_failure(payload, exc)
+                        self._safe_settle(delivery_tag, ack=False, requeue=False)
+        except Exception as exc:  # noqa: BLE001
+            # Grubun toplu index kaydı patladı: başarılı görünen mesajları
+            # ack'lemek onları yok saymak olurdu (vektörler diske inmedi).
+            # Requeue ile geri gönderiyoruz — yeniden işlemek güvenli.
+            log(f"WARNING: batch index save failed company_id={company_id}: {exc}")
             self._log_worker_error(
-                "message_processing_failed",
+                "batch_index_save_failed",
                 exc=exc,
-                context={"payload": self._summarize_payload_for_log(payload)},
+                context={"companyId": company_id, "messageCount": len(items)},
             )
-            # attempt to mark document(s) as failed if possible
-            try:
-                if isinstance(payload, dict):
-                    doc_id = payload.get("doc_id")
-                    if doc_id:
-                        self._get_store().update_document_status(doc_id, status="failed", error=str(exc))
-                        company_id = self._coalesce(payload, "companyId", "company_id", "companyid")
-                        if company_id:
-                            self.email_events.send_index_failed(
-                                company_id=company_id,
-                                document_id=str(doc_id),
-                                job_id=str(payload.get("jobId") or payload.get("job_id") or uuid.uuid4()),
-                                source=str(payload.get("source") or "unknown"),
-                                stage="message_processing",
-                                reason=str(exc),
+            for delivery_tag in acks:
+                self._safe_settle(delivery_tag, ack=False, requeue=True)
+            return
+
+        for delivery_tag in acks:
+            self._safe_settle(delivery_tag, ack=True)
+
+    def _report_message_failure(self, payload: Dict[str, Any], exc: Exception) -> None:
+        """Hata kaydını yazar ve doküman(lar)ı 'failed' işaretler (settle ETMEZ)."""
+        log(f"Error processing message: {exc}")
+        self._log_worker_error(
+            "message_processing_failed",
+            exc=exc,
+            context={"payload": self._summarize_payload_for_log(payload)},
+        )
+        # attempt to mark document(s) as failed if possible
+        try:
+            if isinstance(payload, dict):
+                doc_id = payload.get("doc_id")
+                if doc_id:
+                    self._get_store().update_document_status(doc_id, status="failed", error=str(exc))
+                    company_id = self._coalesce(payload, "companyId", "company_id", "companyid")
+                    if company_id:
+                        self.email_events.send_index_failed(
+                            company_id=company_id,
+                            document_id=str(doc_id),
+                            job_id=str(payload.get("jobId") or payload.get("job_id") or uuid.uuid4()),
+                            source=str(payload.get("source") or "unknown"),
+                            stage="message_processing",
+                            reason=str(exc),
+                        )
+                else:
+                    document_ids = self._coalesce(payload, "documentIds", "document_ids", "documentids")
+                    company_id = self._coalesce(payload, "companyId", "company_id", "companyid")
+                    if company_id and document_ids:
+                        ids = document_ids if isinstance(document_ids, Sequence) else [document_ids]
+                        for document_id in ids:
+                            document_id_str = str(document_id)
+                            job_id_value = str(
+                                payload.get("jobId") or payload.get("job_id") or uuid.uuid4()
                             )
-                    else:
-                        document_ids = self._coalesce(payload, "documentIds", "document_ids", "documentids")
-                        company_id = self._coalesce(payload, "companyId", "company_id", "companyid")
-                        if company_id and document_ids:
-                            ids = document_ids if isinstance(document_ids, Sequence) else [document_ids]
-                            for document_id in ids:
-                                document_id_str = str(document_id)
-                                job_id_value = str(
-                                    payload.get("jobId") or payload.get("job_id") or uuid.uuid4()
-                                )
-                                self._safe_update_index_state(
-                                    DocumentJobContext(
-                                        company_id=company_id,
-                                        document_id=document_id_str,
-                                        job_id=job_id_value,
-                                        user_id=self._coalesce(payload, "userId", "userid", "user_id"),
-                                        trigger=self._coalesce(payload, "trigger"),
-                                        options={},
-                                    ),
-                                    state="failed",
-                                    error=str(exc),
-                                )
-                                self.email_events.send_index_failed(
+                            self._safe_update_index_state(
+                                DocumentJobContext(
                                     company_id=company_id,
                                     document_id=document_id_str,
                                     job_id=job_id_value,
-                                    source="unknown",
-                                    stage="message_processing",
-                                    reason=str(exc),
-                                )
-            except Exception:
-                pass
-            channel.basic_nack(delivery_tag=delivery_tag, requeue=False)
+                                    user_id=self._coalesce(payload, "userId", "userid", "user_id"),
+                                    trigger=self._coalesce(payload, "trigger"),
+                                    options={},
+                                ),
+                                state="failed",
+                                error=str(exc),
+                            )
+                            self.email_events.send_index_failed(
+                                company_id=company_id,
+                                document_id=document_id_str,
+                                job_id=job_id_value,
+                                source="unknown",
+                                stage="message_processing",
+                                reason=str(exc),
+                            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     def _process_payload(self, payload: Dict[str, Any]) -> None:
