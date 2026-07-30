@@ -36,6 +36,7 @@ from services.embedding_engine import EmbeddingEngine
 from services.error_logger import EmbeddingErrorLogger
 from services.mongo_store import MongoStore
 from services.fetcher_store import FetcherStore
+from constants import FeatureFlags
 from services.rabbit_publisher import RabbitPublisher
 from services.keycloak_service import get_keycloak_service, KeycloakError, KeycloakTokenError
 from init.db import get_database
@@ -233,17 +234,6 @@ HYBRID_SEARCH_ENABLED = (os.getenv("HYBRID_SEARCH_ENABLED") or "").strip().lower
     "on",
 }
 HYBRID_OVERFETCH = max(1, int(os.getenv("HYBRID_OVERFETCH") or 4))
-
-# RAG kaynak kartlarında og:image önizlemesi (varsayılan KAPALI; açılmadıkça
-# davranış birebir korunur). Açıkken arama yanıtındaki website-RAG sonuçlarına,
-# sonuç URL'sine göre crawl_results.extracted.og'dan og:image BATCH olarak eklenir
-# → mevcut indexli içerik YENİDEN INDEXLENMEDEN görsel alır. Salt-okuma + best-effort.
-RAG_PREVIEW_IMAGES_ENABLED = (os.getenv("RAG_PREVIEW_IMAGES_ENABLED") or "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
 FILTERED_SEARCH_OVERFETCH = max(1, int(os.getenv("FILTERED_SEARCH_OVERFETCH") or 200))
 FILTERED_SEARCH_MIN_CANDIDATES = max(
     1, int(os.getenv("FILTERED_SEARCH_MIN_CANDIDATES") or 5000)
@@ -1790,7 +1780,7 @@ def _enrich_preview_images(results: list[dict]) -> list[dict]:
     gibi döner — arama ASLA görsel yüzünden kırılmaz. Yalnız top-K çağrılır, yani
     lookup en fazla K URL'dir.
     """
-    if not RAG_PREVIEW_IMAGES_ENABLED or not results:
+    if not FeatureFlags.RAG_PREVIEW_IMAGES_ENABLED or not results:
         return results
     url_by_index: dict[int, str] = {}
     for i, row in enumerate(results):
