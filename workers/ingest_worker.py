@@ -83,6 +83,41 @@ DEFAULT_FETCHER_PAGE_LIMIT = 50
 DEFAULT_FETCHER_MAX_TEXT_CHARS = 1_500_000
 DEFAULT_FETCHER_MEDIA_PER_PAGE = 20
 DEFAULT_FETCHER_MEDIA_TEXT_CHARS = 2_000
+# Tek dokümanın chunk'lanabilecek en uzun metni. `DEFAULT_FETCHER_MAX_TEXT_CHARS`
+# domain-crawl yoluna aittir ve TEKİL dokümanı kapsamaz — bu yüzden 2026-07-30'da
+# 9.999.918 karakterlik tek bir elle.com.tr sayfası buraya kadar geldi, 19 dakika
+# %600 CPU'da chunk'landı ve o süre boyunca firmanın FAISS index kilidini tuttuğu
+# için iki worker da dondu; 16.335 mesajlık kuyruk tamamen durdu.
+#
+# API girişinde de aynı sınır var (app.py MAX_INDEX_TEXT_CHARS) ama bu katman
+# ayrıca gerekli: worker metni MONGO'DAN okur, dolayısıyla API sınırı konmadan
+# ÖNCE kaydedilmiş dev dokümanlar oradan hâlâ gelebilir.
+MAX_DOCUMENT_TEXT_CHARS = int(os.getenv("EMBED_MAX_TEXT_CHARS") or 300_000)
+
+
+def _cap_document_text(
+    text: str,
+    metadata: Dict[str, Any],
+    context: "DocumentJobContext",
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Kaçak dokümanı chunk'lamadan ÖNCE kırpar. Reddetmek yerine kırpmak seçildi:
+    kaçak sayfaların baş kısmı genelde gerçek içeriktir, kuyruğu tekrar eden
+    çöptür — ve `failed` bırakmak sayfayı sonraki crawl'da yeniden denetir.
+    """
+    if MAX_DOCUMENT_TEXT_CHARS <= 0 or not text:
+        return text, metadata
+    original_len = len(text)
+    if original_len <= MAX_DOCUMENT_TEXT_CHARS:
+        return text, metadata
+    meta = dict(metadata or {})
+    meta["truncatedFrom"] = original_len
+    meta["truncatedReason"] = "max_document_text_chars"
+    log(
+        f"Truncated doc_id={context.document_id} {original_len} -> "
+        f"{MAX_DOCUMENT_TEXT_CHARS} chars (url={meta.get('url')})"
+    )
+    return text[:MAX_DOCUMENT_TEXT_CHARS], meta
 
 
 def _resolve_company_id(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -943,6 +978,7 @@ class IngestWorker:
         )
         try:
             text, metadata = self._load_document_content(document, resolved_source, context)
+            text, metadata = _cap_document_text(text, metadata, context)
         except Exception as exc:  # noqa: BLE001
             finished_at = datetime.now(timezone.utc)
             error_msg = f"Failed to load document content: {exc}"

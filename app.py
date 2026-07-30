@@ -113,6 +113,15 @@ ATTRIBUTE_META_COLLECTION = os.getenv("ATTRIBUTE_META_COLLECTION", "attribute_fa
 DEFAULT_INDEX_CHUNK_SIZE = int(os.getenv("EMBED_CHUNK_SIZE") or 1200)
 DEFAULT_INDEX_CHUNK_OVERLAP = int(os.getenv("EMBED_CHUNK_OVERLAP") or 200)
 DEFAULT_INDEX_MIN_CHARS = int(os.getenv("EMBED_MIN_CHARS") or 80)
+# Tek dokümanın indekslenebilecek en uzun metni. ALT sınır (MIN_CHARS) yıllardır
+# vardı, ÜST sınır yoktu: 2026-07-30'da elle.com.tr'nin sonsuz galeri döngüsüne
+# düşmüş tek bir sayfası 9.999.918 karakterle geldi (o firmanın normalde en uzun
+# sayfası 58K). Chunk'lanması 19 dakika %600 CPU sürdü ve blok boyunca firmanın
+# 322MB FAISS index'inin süreçler-arası kilidini tuttuğu için İKİ ingest worker
+# da dondu — 16.335 mesajlık kuyruğun tamamı tek sayfa yüzünden durdu.
+# Kırpmak reddetmekten iyidir: kaçak sayfaların baş kısmı genelde gerçek içerik,
+# kuyruğu tekrar eden çöptür. `metadata.truncatedFrom` ile iz bırakılır.
+MAX_INDEX_TEXT_CHARS = int(os.getenv("EMBED_MAX_TEXT_CHARS") or 300000)
 DEFAULT_WEBSEARCH_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 WEBSEARCH_MODEL_NAME = os.getenv("WEBSEARCH_MODEL") or os.getenv("CHUNK_MODEL_NAME") or DEFAULT_WEBSEARCH_MODEL
 WEBSEARCH_INDEX_PATH = _resolve_index_path(os.getenv("WEBSEARCH_INDEX_PATH"), os.path.join(BASE_DIR, "websearch.index"))
@@ -3500,6 +3509,20 @@ def _queue_content_index_payload(payload: dict, *, default_trigger: str) -> tupl
             source_text = text
         if not isinstance(source_text, str) or not source_text.strip():
             return jsonify({"error": "text source requires non-empty text"}), 400
+        # Üst sınır: bkz. MAX_INDEX_TEXT_CHARS. Kuyruğa girmeden ÖNCE kırpılır —
+        # worker'a ulaşan bir kaçak doküman tüm pipeline'ı kilitler.
+        original_len = len(source_text)
+        if MAX_INDEX_TEXT_CHARS > 0 and original_len > MAX_INDEX_TEXT_CHARS:
+            source_text = source_text[:MAX_INDEX_TEXT_CHARS]
+            metadata["truncatedFrom"] = original_len
+            metadata["truncatedReason"] = "max_index_text_chars"
+            app.logger.warning(
+                "[content-index] metin kırpıldı: %s -> %s karakter (url=%s company=%s)",
+                original_len,
+                MAX_INDEX_TEXT_CHARS,
+                metadata.get("url"),
+                metadata.get("companyId"),
+            )
         source["text"] = source_text
         metadata.setdefault("textSize", len(source_text))
 
