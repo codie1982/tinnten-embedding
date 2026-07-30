@@ -130,3 +130,50 @@ class FetcherStore:
                 continue
             bucket.append(row)
         return grouped
+
+    def preview_images_by_urls(self, urls: List[str]) -> Dict[str, str]:
+        """`{sayfa_url: gorsel_url}` — verilen taranmış sayfa URL'leri için önizleme görseli.
+
+        Öncelik: og:image (`extracted.og["og:image"]` + secure/url varyantları) →
+        yoksa sayfadaki ilk `<img>` (`extracted.images[0].src`). Salt-okunur ve
+        best-effort: Mongo hatasında boş döner ki arama akışı görsel olmadan sürsün.
+        `crawl_results.url` benzersiz indexli olduğundan `$in` sorgusu ucuzdur.
+        """
+        url_values = [str(u).strip() for u in urls if str(u).strip()]
+        if not url_values:
+            return {}
+
+        projection = {"_id": 0, "url": 1, "extracted.og": 1, "extracted.images": 1}
+        images: Dict[str, str] = {}
+        try:
+            cursor = self.crawl_results.find({"url": {"$in": url_values}}, projection)
+        except PyMongoError:
+            return {}
+        for row in cursor:
+            page_url = str(row.get("url") or "").strip()
+            if not page_url or page_url in images:
+                continue
+            extracted = row.get("extracted")
+            if not isinstance(extracted, dict):
+                continue
+            image = self._pick_preview_image(extracted)
+            if image:
+                images[page_url] = image
+        return images
+
+    @staticmethod
+    def _pick_preview_image(extracted: Dict[str, Any]) -> Optional[str]:
+        og = extracted.get("og")
+        if isinstance(og, dict):
+            for key in ("og:image", "og:image:secure_url", "og:image:url"):
+                value = og.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        gallery = extracted.get("images")
+        if isinstance(gallery, list):
+            for item in gallery:
+                if isinstance(item, dict):
+                    src = item.get("src")
+                    if isinstance(src, str) and src.strip():
+                        return src.strip()
+        return None

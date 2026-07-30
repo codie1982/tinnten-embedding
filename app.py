@@ -35,6 +35,7 @@ from services.company_index import (
 from services.embedding_engine import EmbeddingEngine
 from services.error_logger import EmbeddingErrorLogger
 from services.mongo_store import MongoStore
+from services.fetcher_store import FetcherStore
 from services.rabbit_publisher import RabbitPublisher
 from services.keycloak_service import get_keycloak_service, KeycloakError, KeycloakTokenError
 from init.db import get_database
@@ -163,6 +164,28 @@ content_store = ContentDocumentStore()
 job_publisher = RabbitPublisher()
 chunk_store = MongoStore()
 
+# Website-RAG önizleme görselleri (og:image) için crawl store'a SALT-OKUNUR erişim.
+# Lazy + tek-denemelik: init başarısızsa (fetcher DB erişilemez) bir daha denenmez
+# ve arama akışı görselsiz sürer. FetcherStore kendi MongoClient'ını
+# FETCHER_MONGO_URI/MONGO_URI üzerinden kurar (chunk index DB'sinden ayrı).
+_search_fetcher_store = None
+_search_fetcher_store_failed = False
+
+
+def _get_search_fetcher_store():
+    global _search_fetcher_store, _search_fetcher_store_failed
+    if _search_fetcher_store is not None:
+        return _search_fetcher_store
+    if _search_fetcher_store_failed:
+        return None
+    try:
+        _search_fetcher_store = FetcherStore()
+    except Exception as exc:  # pragma: no cover - env/bağlantı hatası
+        _search_fetcher_store_failed = True
+        logger.warning("RAG preview images disabled — FetcherStore init failed: %s", exc)
+        return None
+    return _search_fetcher_store
+
 
 @lru_cache(maxsize=1)
 def get_chunk_engine() -> EmbeddingEngine:
@@ -210,6 +233,17 @@ HYBRID_SEARCH_ENABLED = (os.getenv("HYBRID_SEARCH_ENABLED") or "").strip().lower
     "on",
 }
 HYBRID_OVERFETCH = max(1, int(os.getenv("HYBRID_OVERFETCH") or 4))
+
+# RAG kaynak kartlarında og:image önizlemesi (varsayılan KAPALI; açılmadıkça
+# davranış birebir korunur). Açıkken arama yanıtındaki website-RAG sonuçlarına,
+# sonuç URL'sine göre crawl_results.extracted.og'dan og:image BATCH olarak eklenir
+# → mevcut indexli içerik YENİDEN INDEXLENMEDEN görsel alır. Salt-okuma + best-effort.
+RAG_PREVIEW_IMAGES_ENABLED = (os.getenv("RAG_PREVIEW_IMAGES_ENABLED") or "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 FILTERED_SEARCH_OVERFETCH = max(1, int(os.getenv("FILTERED_SEARCH_OVERFETCH") or 200))
 FILTERED_SEARCH_MIN_CANDIDATES = max(
     1, int(os.getenv("FILTERED_SEARCH_MIN_CANDIDATES") or 5000)
@@ -1747,6 +1781,42 @@ def _promote_title_matches(query_text: str | None, results: list[dict]) -> list[
     return deduped
 
 
+def _enrich_preview_images(results: list[dict]) -> list[dict]:
+    """Website-RAG sonuçlarına og:image ekle (query-time, best-effort, in-place).
+
+    Yalnız sayfa URL'si taşıyan (taranmış web) sonuçlar için `crawl_results`'tan
+    og:image batch çekilir; yüklenen dosyalarda eşleşme olmadığından no-op'tur.
+    Bayrak kapalıysa, sonuç yoksa ya da fetcher store erişilemezse liste olduğu
+    gibi döner — arama ASLA görsel yüzünden kırılmaz. Yalnız top-K çağrılır, yani
+    lookup en fazla K URL'dir.
+    """
+    if not RAG_PREVIEW_IMAGES_ENABLED or not results:
+        return results
+    url_by_index: dict[int, str] = {}
+    for i, row in enumerate(results):
+        meta = row.get("metadata")
+        if not isinstance(meta, dict) or meta.get("og_image"):
+            continue
+        url = str(meta.get("url") or row.get("url") or "").strip()
+        if url:
+            url_by_index[i] = url
+    if not url_by_index:
+        return results
+    store = _get_search_fetcher_store()
+    if store is None:
+        return results
+    try:
+        images = store.preview_images_by_urls(list(set(url_by_index.values())))
+    except Exception as exc:  # pragma: no cover - best-effort
+        logger.warning("RAG preview image lookup failed: %s", exc)
+        return results
+    for i, url in url_by_index.items():
+        image = images.get(url)
+        if image:
+            results[i]["metadata"]["og_image"] = image
+    return results
+
+
 def _chunk_search_response(payload: dict):
     k = int(payload.get("k") or 5)
     if k <= 0:
@@ -1878,7 +1948,7 @@ def _chunk_search_response(payload: dict):
             row["retrieval"] = "dense"
         return jsonify(
             {
-                "results": dense_results[:k],
+                "results": _enrich_preview_images(dense_results[:k]),
                 "retrieval_meta": {
                     "retrieval": "dense",
                     "hybrid_applied": False,
@@ -1925,7 +1995,7 @@ def _chunk_search_response(payload: dict):
         row["retrieval"] = "hybrid"
     return jsonify(
         {
-            "results": fused[:k],
+            "results": _enrich_preview_images(fused[:k]),
             "retrieval_meta": {
                 "retrieval": "hybrid",
                 "hybrid_applied": True,
