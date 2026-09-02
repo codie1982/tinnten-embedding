@@ -3481,6 +3481,22 @@ def _queue_content_index_payload(payload: dict, *, default_trigger: str) -> tupl
         return jsonify({"error": "metadata must be an object"}), 400
 
     existing_doc = content_store.get_document(company_id, document_id)
+    existing_index = existing_doc.get("index") if isinstance(existing_doc, dict) else None
+    # Sayfa bazli "indexten cikar" kalici bir kullanici kararidir. Fetcher daha
+    # sonra ayni URL'de icerik degisikligi gorurse normal fan-out istegi 202 alir
+    # fakat dokumani sessizce yeniden aktive etmez. Acik kullanici reindex'i
+    # farkli trigger ile gelir ve bu kapidan bilincli olarak gecer.
+    if (
+        isinstance(existing_index, dict)
+        and existing_index.get("enabled") is False
+        and str(trigger or "") in {"fetcher_page", "fetcher_initial"}
+    ):
+        return jsonify({
+            "queued": False,
+            "documentId": document_id,
+            "state": "disabled",
+            "skipped": "document_disabled",
+        }), 202
     metadata = {}
     if isinstance(existing_doc, dict) and isinstance(existing_doc.get("metadata"), dict):
         metadata.update(existing_doc["metadata"])

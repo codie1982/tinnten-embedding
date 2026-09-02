@@ -58,3 +58,37 @@ def test_url_only_payload_does_not_become_text_source(client, mocker):
     )
     assert 200 <= resp.status_code < 300
     assert upsert.call_args.kwargs["source"]["type"] in {"url", "import_url", "web"}
+
+
+def test_disabled_fetcher_page_is_not_silently_reindexed(client, mocker):
+    """Per-page deindex survives later crawler content changes."""
+    import app
+
+    mocker.patch.object(
+        app.content_store,
+        "get_document",
+        return_value={"index": {"enabled": False, "state": "disabled"}},
+    )
+    upsert = mocker.patch.object(app.content_store, "upsert_document_with_source")
+    publish = mocker.patch("app._publish_content_index_message")
+
+    resp = client.post(
+        "/api/v10/content/index",
+        json={
+            "companyId": "C1",
+            "documentId": "disabled-page",
+            "text": "crawler found newer content",
+            "metadata": {"domain": "example.com", "url": "https://example.com/p1"},
+            "trigger": "fetcher_page",
+        },
+    )
+
+    assert resp.status_code == 202
+    assert resp.get_json() == {
+        "queued": False,
+        "documentId": "disabled-page",
+        "state": "disabled",
+        "skipped": "document_disabled",
+    }
+    upsert.assert_not_called()
+    publish.assert_not_called()
