@@ -1511,7 +1511,9 @@ def _reconstruct_from_chunks(chunks: list[dict]) -> str:
     buffer: list[str] = []
     current_len = 0
     for chunk in ordered:
-        text = chunk.get("text") or ""
+        raw_text = chunk.get("body_text") if chunk.get("body_text") is not None else chunk.get("text") or ""
+        prefix_chars = 0 if chunk.get("body_text") is not None else int(chunk.get("context_prefix_chars") or 0)
+        text = raw_text[prefix_chars:]
         start = int(chunk.get("char_start") or current_len)
         if start > current_len:
             buffer.append(" " * (start - current_len))
@@ -1571,7 +1573,11 @@ def _assemble_chunk_result(
             return None
     if not _passes_chunk_filters(chunk, filters):
         return None
-    combined_text = chunk.get("text")
+    matched_text = chunk.get("text") or ""
+    combined_text = matched_text
+    context_chunk_ids = [str(chunk.get("chunk_id"))] if chunk.get("chunk_id") else []
+    context_start = chunk.get("char_start")
+    context_end = chunk.get("char_end")
     if radius > 0:
         doc_id = str(chunk.get("doc_id") or "")
         chunk_index = chunk.get("chunk_index") if "chunk_index" in chunk else chunk.get("index")
@@ -1579,15 +1585,27 @@ def _assemble_chunk_result(
             if doc_id not in doc_chunk_cache:
                 doc_chunk_cache[doc_id] = chunk_store.get_chunks_by_doc(doc_id)
             all_chunks = doc_chunk_cache.get(doc_id) or []
+            # During versioned ingest, old and new chunks briefly coexist.
+            # Parent/neighbor context must never stitch two revisions together.
+            active_version = doc_info.get("active_ingest_version") if doc_info else None
+            if active_version:
+                all_chunks = [c for c in all_chunks if c.get("ingest_version") == active_version]
             try:
                 target_idx = next(
                     i for i, c in enumerate(all_chunks) if int(c.get("chunk_index", -1)) == int(chunk_index)
                 )
                 start = max(0, target_idx - radius)
                 end = min(len(all_chunks), target_idx + radius + 1)
-                combined_text = _reconstruct_from_chunks(all_chunks[start:end])
+                context_chunks = all_chunks[start:end]
+                combined_body = _reconstruct_from_chunks(context_chunks)
+                combined_text = f"{chunk.get('context_header') or ''}{combined_body}"
+                context_chunk_ids = [str(c.get("chunk_id")) for c in context_chunks if c.get("chunk_id")]
+                starts = [int(c["char_start"]) for c in context_chunks if c.get("char_start") is not None]
+                ends = [int(c["char_end"]) for c in context_chunks if c.get("char_end") is not None]
+                context_start = min(starts) if starts else context_start
+                context_end = max(ends) if ends else context_end
             except StopIteration:
-                combined_text = chunk.get("text")
+                combined_text = matched_text
     return {
         "type": "chunk",
         "id": int(faiss_id),
@@ -1595,6 +1613,14 @@ def _assemble_chunk_result(
         "chunk_id": chunk.get("chunk_id"),
         "doc_id": chunk.get("doc_id"),
         "text": combined_text,
+        "match_text": matched_text,
+        "context_expanded": len(context_chunk_ids) > 1,
+        "context_chunk_ids": context_chunk_ids,
+        "context_start": context_start,
+        "context_end": context_end,
+        "heading_path": chunk.get("heading_path") or [],
+        "context_header": chunk.get("context_header") or "",
+        "content_fingerprint": chunk.get("content_fingerprint") or "",
         "metadata": chunk.get("metadata") or {},
         "char_start": chunk.get("char_start"),
         "char_end": chunk.get("char_end"),
@@ -1602,6 +1628,14 @@ def _assemble_chunk_result(
         "source": chunk.get("source"),
         "radius": radius,
     }
+
+
+def _safe_index_generation_id(engine) -> str | None:
+    try:
+        value = engine.generation_id()
+        return value if isinstance(value, str) and value else None
+    except (AttributeError, OSError, RuntimeError):
+        return None
 
 
 def _rrf_fuse(dense: list[dict], lexical: list[dict], *, k_const: int = 60) -> list[dict]:
@@ -1949,6 +1983,7 @@ def _chunk_search_response(payload: dict):
                     # Rollout metriği: "global_fallback" oranı 0'a inmeden
                     # PER_COMPANY_FAISS_DUAL_READ kapatılmamalı.
                     "index_scope": served_scope,
+                    "index_generation_id": _safe_index_generation_id(engine),
                     "fallback_reason": fallback_reason,
                     **_reranker_status(),
                 },
@@ -1996,6 +2031,7 @@ def _chunk_search_response(payload: dict):
                 "dense_count": len(dense_results),
                 "lexical_count": len(lexical_results),
                 "index_scope": served_scope,
+                "index_generation_id": _safe_index_generation_id(engine),
                 "fallback_reason": fallback_reason,
                 **_reranker_status(),
             },
@@ -2106,7 +2142,11 @@ def generate_vector():
         data = request.get_json() or {}
         text = data.get("text")
         vec = store.vectorize_text(text)
-        return jsonify({"vector": vec})
+        return jsonify({
+            "vector": vec,
+            "model": MODEL_NAME,
+            "dimension": len(vec),
+        })
     except Exception as e:
         _log_api_error(
             "vectorization_failed",
@@ -3840,6 +3880,12 @@ def company_index_stats(company_id):
 
         mongo_chunks = chunk_store.count_chunks_by_company(cid)
         mongo_active = chunk_store.count_active_chunks_by_company(cid)
+        duplicate_stats = chunk_store.active_chunk_duplicate_stats_by_company(
+            cid, int(request.args.get("duplicate_samples") or 50000)
+        )
+        embedding_profile = chunk_store.active_chunk_embedding_profile_by_company(
+            cid, int(request.args.get("profile_samples") or 50000)
+        )
         drift = mongo_active - ntotal
         denom = mongo_active or ntotal or 0
 
@@ -3850,16 +3896,176 @@ def company_index_stats(company_id):
             "ntotal": ntotal,
             "indexBytes": index_bytes,
             "indexDim": engine.index_dimension(),
+            "generationId": _safe_index_generation_id(engine),
             "modelDim": engine.model_dimension(),
             "mongoChunks": mongo_chunks,
             "mongoActiveChunks": mongo_active,
             "drift": drift,
             "driftPct": round((drift / denom) * 100, 2) if denom else 0.0,
             "orphanEstimate": max(0, ntotal - mongo_active),
+            "duplicateVectorRatio": duplicate_stats.get("ratio"),
+            "duplicateChunkCount": int(duplicate_stats.get("duplicates") or 0),
+            "duplicateScanCount": int(duplicate_stats.get("scanned") or 0),
+            "duplicateMeasurementSampled": bool(duplicate_stats.get("sampled")),
+            "indexModel": str(getattr(engine, "model_name", "") or "") or None,
+            "embeddingModels": embedding_profile.get("models") or [],
+            "embeddingDimensions": embedding_profile.get("dimensions") or [],
+            "embeddingProfileScanCount": int(embedding_profile.get("scanned") or 0),
+            "embeddingProfileSampled": bool(embedding_profile.get("sampled")),
+            "embeddingUnknownCount": int(embedding_profile.get("unknown") or 0),
+            "embeddingUnknownRatio": embedding_profile.get("unknownRatio"),
             "perCompanyEnabled": PER_COMPANY_FAISS_ENABLED,
         }), 200
     except Exception as exc:  # noqa: BLE001
         _log_api_error("company_index_stats", exc=exc, context={"companyId": cid})
+        return jsonify({"ok": False, "companyId": cid, "error": str(exc)}), 500
+
+
+def _audit_faiss_candidates(company_id: str, faiss_ids: list[int]) -> dict:
+    """Classify raw ANN hits before normal retrieval filters hide dead vectors."""
+    ids = [int(value) for value in faiss_ids if int(value) != -1]
+    chunks = chunk_store.get_chunks_by_faiss_ids(ids)
+    documents = chunk_store.get_documents_by_ids({row.get("doc_id") for row in chunks.values() if row})
+    valid_ids: list[int] = []
+    reasons = {"missing_chunk": 0, "disabled_document": 0, "stale_version": 0, "foreign_company": 0}
+    for faiss_id in ids:
+        chunk = chunks.get(faiss_id)
+        if not chunk:
+            reasons["missing_chunk"] += 1
+            continue
+        if not _passes_chunk_filters(chunk, {"company_id": company_id}):
+            reasons["foreign_company"] += 1
+            continue
+        document = documents.get(chunk.get("doc_id"))
+        if document and str(document.get("status") or "").lower() in {"disabled", "removed"}:
+            reasons["disabled_document"] += 1
+            continue
+        active_version = document.get("active_ingest_version") if document else None
+        if active_version and chunk.get("ingest_version") != active_version:
+            reasons["stale_version"] += 1
+            continue
+        valid_ids.append(faiss_id)
+    return {
+        "rawCount": len(ids),
+        "validCount": len(valid_ids),
+        "deadCount": len(ids) - len(valid_ids),
+        "validIds": valid_ids,
+        "deadReasons": reasons,
+    }
+
+
+@app.route("/api/v10/company/<company_id>/retrieval-health", methods=["GET"])
+def company_retrieval_health(company_id):
+    """Measure how inactive/orphan vectors affect real top-M ANN results.
+
+    The probe derives queries from a bounded sample of active tenant chunks, so
+    it has no LLM/question-generation cost and persists no customer text.
+    """
+    cid = str(company_id or "").strip()
+    if not cid or not sanitize_company_id(cid):
+        return jsonify({"error": "company_id is not a valid index identifier"}), 400
+    try:
+        sample_count = max(1, min(int(request.args.get("samples") or 8), 24))
+        target_k = max(1, min(int(request.args.get("k") or 10), 50))
+        raw_m = max(target_k, min(int(request.args.get("raw_m") or 50), 250))
+        samples = chunk_store.sample_active_chunks_by_company(cid, sample_count)
+        texts = [str(row.get("text") or "").strip()[:1000] for row in samples]
+        texts = [text for text in texts if text]
+        if not texts:
+            return jsonify({
+                "ok": True, "companyId": cid, "queryCount": 0,
+                "deadHitRate": None, "resultFillRate": None, "p95LatencyMs": None,
+                "annRecallAtK": None, "activeRecallAtK": None,
+                "indexType": None, "indexWrapper": None, "exactSearch": None,
+                "exactReferenceAvailable": False, "exactReferenceReason": "no_active_probe_chunks",
+                "exactReferenceVectorCount": 0,
+                "rawCandidateCount": 0, "validCandidateCount": 0, "deadCandidateCount": 0,
+                "deadReasons": {}, "targetK": target_k, "rawM": raw_m,
+                "reason": "no_active_probe_chunks",
+            }), 200
+
+        engine = get_company_chunk_engine(cid)
+        engine.ensure_index_persisted()
+        profile_candidate = engine.index_profile()
+        index_profile = profile_candidate if isinstance(profile_candidate, dict) else {}
+        vectors = engine.encode(texts, batch_size=min(8, len(texts)))
+        total_raw = total_valid = total_dead = 0
+        filled = 0
+        latencies: list[float] = []
+        ann_valid_rows: list[list[int]] = []
+        reason_totals = {"missing_chunk": 0, "disabled_document": 0, "stale_version": 0, "foreign_company": 0}
+        for vector in vectors:
+            started = time.perf_counter()
+            _, ids = engine.search(vector.reshape(1, -1), raw_m)
+            latencies.append((time.perf_counter() - started) * 1000)
+            audited = _audit_faiss_candidates(cid, [int(value) for value in ids[0] if int(value) != -1])
+            total_raw += audited["rawCount"]
+            total_valid += audited["validCount"]
+            total_dead += audited["deadCount"]
+            filled += min(target_k, audited["validCount"])
+            ann_valid_rows.append(audited["validIds"])
+            for key, value in audited["deadReasons"].items():
+                reason_totals[key] += value
+
+        query_count = len(texts)
+        result_fill_rate = round(filled / (query_count * target_k), 6)
+        exact_search = bool(index_profile.get("exact"))
+        reference_limit = max(100, min(int(request.args.get("exact_reference_max") or 10000), 50000))
+        if exact_search:
+            exact_reference = {
+                "available": True,
+                "reason": "native_exact_index",
+                "recallAtK": 1.0,
+                "activeVectorCount": chunk_store.count_active_chunks_by_company(cid),
+            }
+        else:
+            active_count = chunk_store.count_active_chunks_by_company(cid)
+            if active_count > reference_limit:
+                exact_reference = {
+                    "available": False,
+                    "reason": "exact_reference_too_large",
+                    "recallAtK": None,
+                    "activeVectorCount": active_count,
+                    "maxVectors": reference_limit,
+                }
+            else:
+                active_ids = list(chunk_store.iter_active_faiss_ids_by_company(cid))
+                exact_reference = engine.exact_reference_recall(
+                    vectors, active_ids, ann_valid_rows, k=target_k, max_vectors=reference_limit
+                )
+        return jsonify({
+            "ok": True,
+            "companyId": cid,
+            "measuredAt": datetime.now(timezone.utc).isoformat(),
+            "queryCount": query_count,
+            "targetK": target_k,
+            "rawM": raw_m,
+            "rawCandidateCount": total_raw,
+            "validCandidateCount": total_valid,
+            "deadCandidateCount": total_dead,
+            "deadHitRate": round(total_dead / total_raw, 6) if total_raw else 0.0,
+            "resultFillRate": result_fill_rate,
+            # Flat indexes are exhaustive: ANN recall is exact by design.  The
+            # active recall reports the separate, operational loss caused by
+            # dead candidates that are removed after the FAISS search.
+            "annRecallAtK": exact_reference.get("recallAtK"),
+            "activeRecallAtK": result_fill_rate,
+            "exactReferenceAvailable": bool(exact_reference.get("available")),
+            "exactReferenceReason": exact_reference.get("reason"),
+            "exactReferenceVectorCount": int(exact_reference.get("activeVectorCount") or 0),
+            "exactReferenceMaxVectors": int(exact_reference.get("maxVectors") or reference_limit),
+            "indexType": index_profile.get("base"),
+            "indexWrapper": index_profile.get("wrapper"),
+            "exactSearch": exact_search,
+            "indexGenerationId": index_profile.get("generationId"),
+            "p95LatencyMs": round(float(np.percentile(latencies, 95)), 3) if latencies else None,
+            "deadReasons": reason_totals,
+            "reason": None,
+        }), 200
+    except (TypeError, ValueError):
+        return jsonify({"error": "samples, k and raw_m must be integers"}), 400
+    except Exception as exc:  # noqa: BLE001
+        _log_api_error("company_retrieval_health", exc=exc, context={"companyId": cid})
         return jsonify({"ok": False, "companyId": cid, "error": str(exc)}), 500
 
 

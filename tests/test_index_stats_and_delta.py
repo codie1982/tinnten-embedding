@@ -52,6 +52,42 @@ def test_remove_ids_on_missing_index_is_zero_not_requested_count():
         assert eng.remove_ids([1, 2, 3]) == 0
 
 
+def test_generation_id_changes_when_persisted_index_changes():
+    with tempfile.TemporaryDirectory() as tmp:
+        eng = _engine(os.path.join(tmp, "generation.index"))
+        eng.add_embeddings(_vecs(1), [1])
+        first = eng.generation_id()
+        eng.add_embeddings(_vecs(1), [2])
+        second = eng.generation_id()
+        assert first and first.startswith("faiss-")
+        assert second and second != first
+
+
+def test_exact_reference_recall_compares_the_same_active_vector_universe():
+    with tempfile.TemporaryDirectory() as tmp:
+        eng = _engine(os.path.join(tmp, "recall.index"))
+        vectors = _vecs(3)
+        eng.add_embeddings(vectors, [10, 11, 12])
+
+        exact = eng.exact_reference_recall(vectors[:1], [10, 11, 12], [[10]], k=1)
+        missed = eng.exact_reference_recall(vectors[:1], [10, 11, 12], [[12]], k=1)
+
+        assert exact["available"] is True
+        assert exact["recallAtK"] == 1.0
+        assert missed["recallAtK"] == 0.0
+        assert exact["reconstructedVectorCount"] == 3
+
+
+def test_exact_reference_recall_refuses_partial_large_corpus():
+    with tempfile.TemporaryDirectory() as tmp:
+        eng = _engine(os.path.join(tmp, "recall-cap.index"))
+        result = eng.exact_reference_recall(
+            np.zeros((1, DIM), dtype=np.float32), range(101), [[1]], k=1, max_vectors=100
+        )
+        assert result["available"] is False
+        assert result["reason"] == "exact_reference_too_large"
+
+
 def test_count_reloads_writes_from_another_process():
     """
     İki ayrı engine nesnesi = iki ayrı process'i taklit eder (API vs ingest worker).
@@ -70,7 +106,7 @@ def test_count_reloads_writes_from_another_process():
         assert a.count() == 5
 
 
-def test_company_filter_matches_both_storage_locations():
+def test_company_filter_matches_both_storage_locations(app_with_mocks):
     """
     `company_id` chunk'ta iki yerde olabiliyor (üst seviye VEYA metadata.companyId).
     Yalnız üst seviyeye bakmak, pre-embed/legacy yollarla yazılmış chunk'ları her
@@ -107,6 +143,70 @@ def _patch_chunk_lookups(mocker):
         return_value={10: {"doc_id": "d1", "text": "t", "chunk_id": "c10", "metadata": {}}},
     )
     mocker.patch("app.chunk_store.get_documents_by_ids", return_value={"d1": {"status": "active"}})
+
+
+def test_audit_faiss_candidates_separates_dead_reasons(mocker, app_with_mocks):
+    from app import _audit_faiss_candidates
+
+    mocker.patch("app.chunk_store.get_chunks_by_faiss_ids", return_value={
+        10: {"doc_id": "active", "company_id": "CID", "ingest_version": "v2"},
+        11: {"doc_id": "disabled", "company_id": "CID"},
+        12: {"doc_id": "stale", "company_id": "CID", "ingest_version": "v1"},
+        13: {"doc_id": "foreign", "company_id": "OTHER"},
+    })
+    mocker.patch("app.chunk_store.get_documents_by_ids", return_value={
+        "active": {"status": "active", "active_ingest_version": "v2"},
+        "disabled": {"status": "disabled"},
+        "stale": {"status": "active", "active_ingest_version": "v2"},
+        "foreign": {"status": "active"},
+    })
+
+    result = _audit_faiss_candidates("CID", [10, 11, 12, 13, 99])
+
+    assert result["validIds"] == [10]
+    assert result["deadCount"] == 4
+    assert result["deadReasons"] == {
+        "missing_chunk": 1,
+        "disabled_document": 1,
+        "stale_version": 1,
+        "foreign_company": 1,
+    }
+
+
+def test_retrieval_health_reports_dead_hit_and_fill_rate(client, mocker):
+    engine = mocker.Mock()
+    engine.ensure_index_persisted.return_value = {"ntotal": 8}
+    engine.index_profile.return_value = {
+        "wrapper": "IndexIDMap2",
+        "base": "IndexFlatIP",
+        "exact": True,
+        "ntotal": 8,
+        "generationId": "faiss-test-generation",
+    }
+    engine.encode.return_value = np.zeros((2, 8), dtype=np.float32)
+    engine.search.side_effect = [
+        (np.array([[0.9, 0.8, 0.7, 0.6]]), np.array([[1, 2, 3, 4]])),
+        (np.array([[0.9, 0.8, 0.7, 0.6]]), np.array([[5, 6, 7, 8]])),
+    ]
+    mocker.patch("app.get_company_chunk_engine", return_value=engine)
+    mocker.patch("app.chunk_store.sample_active_chunks_by_company", return_value=[{"text": "one"}, {"text": "two"}])
+    mocker.patch("app._audit_faiss_candidates", side_effect=[
+        {"rawCount": 4, "validCount": 1, "deadCount": 3, "validIds": [1], "deadReasons": {"missing_chunk": 3, "disabled_document": 0, "stale_version": 0, "foreign_company": 0}},
+        {"rawCount": 4, "validCount": 2, "deadCount": 2, "validIds": [5, 6], "deadReasons": {"missing_chunk": 0, "disabled_document": 1, "stale_version": 1, "foreign_company": 0}},
+    ])
+
+    response = client.get("/api/v10/company/CID/retrieval-health?samples=2&k=2&raw_m=4")
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["queryCount"] == 2
+    assert body["deadHitRate"] == 0.625
+    assert body["resultFillRate"] == 0.75
+    assert body["annRecallAtK"] == 1.0
+    assert body["activeRecallAtK"] == 0.75
+    assert body["indexType"] == "IndexFlatIP"
+    assert body["exactSearch"] is True
+    assert body["indexGenerationId"] == "faiss-test-generation"
+    assert body["deadCandidateCount"] == 5
 
 
 def test_dual_read_falls_back_when_primary_index_missing(client, mocker):

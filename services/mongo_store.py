@@ -3,6 +3,7 @@ MongoDB persistence helpers for embedding metadata and FAISS bookkeeping.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import uuid
 from datetime import datetime, timezone
@@ -163,7 +164,19 @@ class MongoStore:
         docs = list(chunks)
         if not docs:
             return
+        # Exact duplicate health can then scan compact hashes instead of pulling
+        # every full chunk body. Legacy rows without the field remain supported
+        # by ``active_chunk_duplicate_stats_by_company`` below.
+        for doc in docs:
+            if not doc.get("content_fingerprint") and isinstance(doc.get("text"), str):
+                doc["content_fingerprint"] = self.content_fingerprint(doc["text"])
         self.chunks.insert_many(docs, ordered=False, session=session)
+
+    @staticmethod
+    def content_fingerprint(text: str) -> str:
+        """Stable exact-content identity after harmless whitespace/case folding."""
+        normalized = " ".join(str(text or "").casefold().split())
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else ""
 
     def get_chunks_by_faiss_ids(self, faiss_ids: Sequence[int]) -> Dict[int, Dict[str, Any]]:
         if not faiss_ids:
@@ -302,6 +315,178 @@ class MongoStore:
                 query["ingest_version"] = version
             total += int(self.chunks.count_documents(query))
         return total
+
+    def sample_active_chunks_by_company(self, company_id: str, limit: int = 8) -> List[Dict[str, Any]]:
+        """Return a small, bounded set of active chunks for retrieval probes.
+
+        Health probes use real tenant text but never generate or persist new
+        questions. Sampling one or more chunks across active documents keeps the
+        audit cheap while exercising the same embedding/index path as production.
+        """
+        cid = str(company_id or "").strip()
+        sample_limit = max(1, min(int(limit or 8), 24))
+        if not cid:
+            return []
+
+        doc_ids = self.chunks.distinct("doc_id", self._company_query(cid))
+        if not doc_ids:
+            return []
+        documents = list(self.documents.find(
+            {"doc_id": {"$in": [str(doc_id) for doc_id in doc_ids]}, "status": {"$nin": ["removed", "disabled"]}},
+            {"doc_id": 1, "active_ingest_version": 1},
+        ))
+        samples: List[Dict[str, Any]] = []
+        for document in documents:
+            query: Dict[str, Any] = {
+                "$and": [self._company_query(cid), {"doc_id": str(document["doc_id"])}],
+                "text": {"$type": "string", "$ne": ""},
+            }
+            version = document.get("active_ingest_version")
+            if version:
+                query["ingest_version"] = version
+            chunk = self.chunks.find_one(query, sort=[("chunk_index", ASCENDING)])
+            if chunk:
+                samples.append(chunk)
+            if len(samples) >= sample_limit:
+                break
+        return samples
+
+    def active_chunk_duplicate_stats_by_company(
+        self, company_id: str, limit: int = 50000
+    ) -> Dict[str, Any]:
+        """Measure exact duplicate content over a bounded active-chunk sample.
+
+        Documents and chunks live in separate databases, so active-version
+        validation is performed while streaming one company-scoped cursor. The
+        cap protects the health endpoint for unusually large tenants; the API
+        explicitly reports whether the result is sampled.
+        """
+        cid = str(company_id or "").strip()
+        scan_limit = max(100, min(int(limit or 50000), 200000))
+        empty = {"scanned": 0, "unique": 0, "duplicates": 0, "ratio": None, "sampled": False}
+        if not cid:
+            return empty
+
+        doc_ids = self.chunks.distinct("doc_id", self._company_query(cid))
+        if not doc_ids:
+            return empty
+        active_versions: Dict[str, Optional[str]] = {}
+        for document in self.documents.find(
+            {"doc_id": {"$in": [str(doc_id) for doc_id in doc_ids]}, "status": {"$nin": ["removed", "disabled"]}},
+            {"doc_id": 1, "active_ingest_version": 1},
+        ):
+            active_versions[str(document["doc_id"])] = document.get("active_ingest_version")
+
+        fingerprints: set[str] = set()
+        scanned = 0
+        cursor = self.chunks.find(
+            self._company_query(cid),
+            {"doc_id": 1, "ingest_version": 1, "content_fingerprint": 1, "text": 1},
+        ).batch_size(1000)
+        for chunk in cursor:
+            doc_id = str(chunk.get("doc_id") or "")
+            if doc_id not in active_versions:
+                continue
+            active_version = active_versions[doc_id]
+            if active_version and chunk.get("ingest_version") != active_version:
+                continue
+            fingerprint = str(chunk.get("content_fingerprint") or "")
+            if not fingerprint:
+                fingerprint = self.content_fingerprint(chunk.get("text") or "")
+            if not fingerprint:
+                continue
+            fingerprints.add(fingerprint)
+            scanned += 1
+            if scanned >= scan_limit:
+                break
+
+        active_total = self.count_active_chunks_by_company(cid)
+        duplicate_count = max(0, scanned - len(fingerprints))
+        return {
+            "scanned": scanned,
+            "unique": len(fingerprints),
+            "duplicates": duplicate_count,
+            "ratio": round(duplicate_count / scanned, 6) if scanned else None,
+            "sampled": active_total > scanned,
+            "activeTotal": active_total,
+        }
+
+    def active_chunk_embedding_profile_by_company(
+        self, company_id: str, limit: int = 50000
+    ) -> Dict[str, Any]:
+        """Summarise model/dimension metadata for active chunk versions.
+
+        The FAISS file cannot reveal which model produced each vector. New
+        ingests therefore persist this provenance beside every chunk. Legacy
+        rows remain visible as ``unknown`` instead of being silently treated as
+        the current model. The bounded scan keeps the health endpoint safe for
+        large tenants and reports when the distribution is sampled.
+        """
+        cid = str(company_id or "").strip()
+        scan_limit = max(100, min(int(limit or 50000), 200000))
+        empty = {
+            "scanned": 0,
+            "sampled": False,
+            "unknown": 0,
+            "unknownRatio": None,
+            "models": [],
+            "dimensions": [],
+        }
+        if not cid:
+            return empty
+
+        doc_ids = self.chunks.distinct("doc_id", self._company_query(cid))
+        if not doc_ids:
+            return empty
+        active_versions: Dict[str, Optional[str]] = {}
+        for document in self.documents.find(
+            {"doc_id": {"$in": [str(doc_id) for doc_id in doc_ids]}, "status": {"$nin": ["removed", "disabled"]}},
+            {"doc_id": 1, "active_ingest_version": 1},
+        ):
+            active_versions[str(document["doc_id"])] = document.get("active_ingest_version")
+
+        models: Dict[str, int] = {}
+        dimensions: Dict[int, int] = {}
+        unknown = 0
+        scanned = 0
+        cursor = self.chunks.find(
+            self._company_query(cid),
+            {"doc_id": 1, "ingest_version": 1, "embedding_model": 1, "embedding_dimension": 1},
+        ).batch_size(1000)
+        for chunk in cursor:
+            doc_id = str(chunk.get("doc_id") or "")
+            if doc_id not in active_versions:
+                continue
+            active_version = active_versions[doc_id]
+            if active_version and chunk.get("ingest_version") != active_version:
+                continue
+            model = str(chunk.get("embedding_model") or "").strip()
+            dimension = chunk.get("embedding_dimension")
+            if model:
+                models[model] = models.get(model, 0) + 1
+            else:
+                unknown += 1
+            if isinstance(dimension, (int, float)) and int(dimension) > 0:
+                dimensions[int(dimension)] = dimensions.get(int(dimension), 0) + 1
+            scanned += 1
+            if scanned >= scan_limit:
+                break
+
+        active_total = self.count_active_chunks_by_company(cid)
+        return {
+            "scanned": scanned,
+            "sampled": active_total > scanned,
+            "unknown": unknown,
+            "unknownRatio": round(unknown / scanned, 6) if scanned else None,
+            "models": [
+                {"model": model, "count": count}
+                for model, count in sorted(models.items(), key=lambda item: (-item[1], item[0]))
+            ],
+            "dimensions": [
+                {"dimension": dimension, "count": count}
+                for dimension, count in sorted(dimensions.items(), key=lambda item: (-item[1], item[0]))
+            ],
+        }
 
     def iter_active_faiss_ids_by_company(
         self, company_id: str, batch_size: int = 5000

@@ -47,6 +47,7 @@ from services.company_index import (
 )
 from services.mongo_store import MongoStore
 from services.content_store import ContentDocumentStore, normalize_index_options
+from services.dynamic_chunking import resolve_dynamic_chunking
 from services.upload_store import UploadStore, UploadNotFoundError
 from services.fetcher_store import FetcherStore
 from services.document_loader import DocumentDownloadError, DocumentParseError
@@ -1842,6 +1843,7 @@ class IngestWorker:
         text: str,
         options: Dict[str, Any],
     ) -> Dict[str, Any]:
+        options = resolve_dynamic_chunking(options, len(text or ""))
         chunk_size = int(options.get("chunkSize") or self.chunk_size)
         chunk_overlap = int(options.get("chunkOverlap") or self.chunk_overlap)
         min_chars = int(options.get("minChars") or 80)
@@ -1903,6 +1905,11 @@ class IngestWorker:
                     "faiss_id": int(faiss_id),
                     "ingest_version": version,
                     "text": chunk.text,
+                    "heading_path": list(chunk.heading_path),
+                    "context_header": chunk.context_header,
+                    "context_prefix_chars": len(chunk.context_header),
+                    "embedding_model": str(getattr(engine, "model_name", "") or ""),
+                    "embedding_dimension": int(embeddings.shape[1]),
                     "char_start": chunk.char_start,
                     "char_end": chunk.char_end,
                     "doc_type": doc_type,
@@ -1931,6 +1938,9 @@ class IngestWorker:
             "chunkSize": chunk_size,
             "chunkOverlap": chunk_overlap,
             "minChars": min_chars,
+            "chunkMode": options.get("chunkMode") or "manual",
+            "chunkPolicy": options.get("chunkPolicy"),
+            "chunkCharacterCount": options.get("chunkCharacterCount") or len(text or ""),
         }
 
     # ------------------------------------------------------------------
@@ -2020,6 +2030,11 @@ class IngestWorker:
                     "chunk_index": chunk.index,
                     "faiss_id": int(faiss_id),
                     "text": chunk.text,
+                    "heading_path": [],
+                    "context_header": "",
+                    "context_prefix_chars": 0,
+                    "embedding_model": str(getattr(engine, "model_name", "") or ""),
+                    "embedding_dimension": int(embeddings.shape[1]),
                     "char_start": chunk.char_start,
                     "char_end": chunk.char_end,
                     "doc_type": doc_type,
@@ -2509,6 +2524,7 @@ class IngestWorker:
                 domain=page_domain,
                 source=page_source,
                 domain_chunks=domain_chunks,
+                job_id=context.job_id,
             )
         except Exception as cb_exc:  # noqa: BLE001
             log(f"[callback] Failed to notify tinnten-server for {context.document_id}: {cb_exc}")

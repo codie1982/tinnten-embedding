@@ -119,6 +119,74 @@ def test_set_active_ingest_version(mocker):
     assert store.documents.find_one({"doc_id": "d1"})["active_ingest_version"] == "v9"
 
 
+def test_insert_chunks_adds_normalized_content_fingerprint(mocker):
+    store = _store(mocker)
+    store.insert_chunks([
+        {"doc_id": "d1", "faiss_id": 1, "text": "  AYNI\n CONTENT  "},
+        {"doc_id": "d1", "faiss_id": 2, "text": "ayni content"},
+    ])
+    rows = list(store.chunks.find({"doc_id": "d1"}).sort("faiss_id", 1))
+    assert rows[0]["content_fingerprint"]
+    assert rows[0]["content_fingerprint"] == rows[1]["content_fingerprint"]
+
+
+def test_duplicate_health_counts_only_active_document_versions(mocker):
+    store = _store(mocker)
+    store.documents.insert_many([
+        {"doc_id": "d1", "status": "ready", "active_ingest_version": "v2"},
+        {"doc_id": "d2", "status": "ready"},
+        {"doc_id": "d3", "status": "disabled"},
+    ])
+    store.insert_chunks([
+        {"doc_id": "d1", "company_id": "CID", "faiss_id": 1, "ingest_version": "v1", "text": "eski tekrar"},
+        {"doc_id": "d1", "company_id": "CID", "faiss_id": 2, "ingest_version": "v2", "text": "Aynı içerik"},
+        {"doc_id": "d1", "company_id": "CID", "faiss_id": 3, "ingest_version": "v2", "text": "aynı   içerik"},
+        {"doc_id": "d2", "company_id": "CID", "faiss_id": 4, "text": "benzersiz"},
+        {"doc_id": "d3", "company_id": "CID", "faiss_id": 5, "text": "aynı içerik"},
+    ])
+
+    result = store.active_chunk_duplicate_stats_by_company("CID", 100)
+
+    assert result == {
+        "scanned": 3,
+        "unique": 2,
+        "duplicates": 1,
+        "ratio": 0.333333,
+        "sampled": False,
+        "activeTotal": 3,
+    }
+
+
+def test_embedding_profile_reports_mixed_models_and_legacy_unknowns(mocker):
+    store = _store(mocker)
+    store.documents.insert_many([
+        {"doc_id": "d1", "status": "ready", "active_ingest_version": "v2"},
+        {"doc_id": "d2", "status": "ready"},
+        {"doc_id": "disabled", "status": "disabled"},
+    ])
+    store.insert_chunks([
+        {"doc_id": "d1", "company_id": "CID", "faiss_id": 1, "ingest_version": "v1", "text": "old", "embedding_model": "old-model", "embedding_dimension": 384},
+        {"doc_id": "d1", "company_id": "CID", "faiss_id": 2, "ingest_version": "v2", "text": "new", "embedding_model": "new-model", "embedding_dimension": 768},
+        {"doc_id": "d2", "company_id": "CID", "faiss_id": 3, "text": "other", "embedding_model": "other-model", "embedding_dimension": 768},
+        {"doc_id": "d2", "company_id": "CID", "faiss_id": 4, "text": "legacy"},
+        {"doc_id": "disabled", "company_id": "CID", "faiss_id": 5, "text": "ignore", "embedding_model": "old-model", "embedding_dimension": 384},
+    ])
+
+    result = store.active_chunk_embedding_profile_by_company("CID", 100)
+
+    assert result == {
+        "scanned": 3,
+        "sampled": False,
+        "unknown": 1,
+        "unknownRatio": 0.333333,
+        "models": [
+            {"model": "new-model", "count": 1},
+            {"model": "other-model", "count": 1},
+        ],
+        "dimensions": [{"dimension": 768, "count": 2}],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Swap sözleşmesi — worker'ın _swap_in_chunks mantığını birebir uygular
 # ---------------------------------------------------------------------------
@@ -242,6 +310,27 @@ def test_search_unaffected_when_doc_has_no_active_version(app_with_mocks, mocker
     chunk = {"doc_id": "d1", "chunk_id": "c1", "text": "legacy", "metadata": {}}
     row = app._assemble_chunk_result(chunk, 1, 0.9, {}, 0, doc_status_map, {})
     assert row is not None and row["chunk_id"] == "c1"
+
+
+def test_parent_child_context_expands_only_active_revision(app_with_mocks, mocker):
+    """Child hit gains neighbor context, but never from a stale document version."""
+    import app
+
+    doc_status_map = {"d1": {"status": "active", "active_ingest_version": "v2"}}
+    chunks = [
+        {"doc_id": "d1", "chunk_id": "old", "chunk_index": 0, "text": "STALE", "char_start": 0, "char_end": 5, "ingest_version": "v1", "metadata": {}},
+        {"doc_id": "d1", "chunk_id": "a", "chunk_index": 0, "text": "Alpha ", "char_start": 0, "char_end": 6, "ingest_version": "v2", "metadata": {}},
+        {"doc_id": "d1", "chunk_id": "b", "chunk_index": 1, "text": "Beta", "char_start": 6, "char_end": 10, "ingest_version": "v2", "metadata": {}},
+    ]
+    mocker.patch.object(app.chunk_store, "get_chunks_by_doc", return_value=chunks)
+
+    row = app._assemble_chunk_result(chunks[2], 2, 0.9, {}, 1, doc_status_map, {})
+
+    assert row["match_text"] == "Beta"
+    assert row["text"] == "Alpha Beta"
+    assert row["context_expanded"] is True
+    assert row["context_chunk_ids"] == ["a", "b"]
+    assert "STALE" not in row["text"]
 
 
 # ---------------------------------------------------------------------------

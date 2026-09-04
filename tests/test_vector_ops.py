@@ -9,6 +9,8 @@ def test_generate_vector(client, mocker):
     assert response.status_code == 200
     data = response.get_json()
     assert data["vector"] == mock_vec
+    assert isinstance(data["model"], str)
+    assert data["dimension"] == len(mock_vec)
 
 def test_upsert_vector(client, mocker):
     mock_response = {"id": 1, "status": "success"}

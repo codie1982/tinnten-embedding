@@ -21,6 +21,8 @@ class Chunk:
     index: int
     char_start: int
     char_end: int
+    heading_path: Tuple[str, ...] = ()
+    context_header: str = ""
 
 
 def normalize_text(text: str) -> str:
@@ -179,7 +181,14 @@ def chunk_markdown_structure(
             return
         head = header_for(path)
         if len(body) <= chunk_size:
-            chunks.append(Chunk(text=head + body, index=idx, char_start=s, char_end=e))
+            chunks.append(Chunk(
+                text=head + body,
+                index=idx,
+                char_start=s,
+                char_end=e,
+                heading_path=tuple(path),
+                context_header=head,
+            ))
             idx += 1
             return
         # Oversize bölüm → karakter penceresi (offset kaydırmalı), her pencereye header.
@@ -190,6 +199,8 @@ def chunk_markdown_structure(
                     index=idx,
                     char_start=s + sub.char_start,
                     char_end=s + sub.char_end,
+                    heading_path=tuple(path),
+                    context_header=head,
                 )
             )
             idx += 1

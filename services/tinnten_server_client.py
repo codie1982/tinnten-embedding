@@ -65,6 +65,7 @@ class TinntenServerClient:
         domain: str | None = None,
         source: str | None = None,
         domain_chunks: int | None = None,
+        job_id: str | None = None,
     ) -> bool:
         """Notify tinnten-server of a document index state change.
 
@@ -87,6 +88,8 @@ class TinntenServerClient:
         mapped_state = state_map.get(state, state)
 
         body = {"state": mapped_state}
+        if job_id:
+            body["jobId"] = str(job_id)
         if error_msg:
             body["errorMsg"] = error_msg
         if stats and isinstance(stats, dict):

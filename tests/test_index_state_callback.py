@@ -51,6 +51,11 @@ def test_non_fetcher_source_omits_domain_metadata():
     assert "domainChunks" not in body.get("stats", {})
 
 
+def test_callback_carries_the_ingest_job_id_for_precise_operation_matching():
+    body = _capture_patch_body(_client(), company_id="C1", job_id="space-index:op-42")
+    assert body["jobId"] == "space-index:op-42"
+
+
 def test_domain_without_fetcher_source_is_ignored():
     # domain var ama source fetcher_page değil → metadata eklenmez (güvenli)
     body = _capture_patch_body(
@@ -112,6 +117,7 @@ def test_zero_chunk_completed_callback_carries_domain_from_hint():
     assert kwargs["domain"] == "grntsoftware.com"
     assert kwargs["source"] == "fetcher_page"
     assert kwargs["domain_chunks"] == 0  # 0-chunk'ta da aggregate sayım gönderilir
+    assert kwargs["job_id"] == "J1"
 
 
 def test_zero_chunk_without_hint_keeps_legacy_gap():

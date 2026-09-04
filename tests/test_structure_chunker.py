@@ -31,6 +31,8 @@ def test_context_header_prepended_with_title_and_url():
     assert len(chunks) == 1
     assert chunks[0].text.startswith("ACME Mağaza — Ürünler (https://acme.com/p)")
     assert "Ayakkabı listesi" in chunks[0].text
+    assert chunks[0].heading_path == ("Ürünler",)
+    assert chunks[0].context_header.startswith("ACME Mağaza — Ürünler")
 
 
 def test_char_offsets_reference_body_not_header():
@@ -73,3 +75,13 @@ def test_no_headings_behaves_like_single_section():
     assert chunks[0].text.endswith(md)  # header yalnız url
     # title/path yokken header bare url (parantezsiz) — doğru davranış
     assert chunks[0].text.startswith("https://x.com")
+
+
+def test_reconstruction_uses_body_instead_of_synthetic_context_header(app_with_mocks):
+    import app
+
+    reconstructed = app._reconstruct_from_chunks([
+        {"text": "Title — Section\n\nAlpha", "context_prefix_chars": len("Title — Section\n\n"), "char_start": 0, "char_end": 5, "chunk_index": 0},
+        {"text": "Title — Section\n\nBeta", "context_prefix_chars": len("Title — Section\n\n"), "char_start": 6, "char_end": 10, "chunk_index": 1},
+    ])
+    assert reconstructed == "Alpha Beta"

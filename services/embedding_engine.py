@@ -4,6 +4,7 @@ Shared embedding + FAISS index management utilities.
 from __future__ import annotations
 
 import os
+import hashlib
 import threading
 import time
 import uuid
@@ -371,6 +372,127 @@ class EmbeddingEngine:
         with self._lock:
             self.reload_if_updated_locked()
             return int(self._index.ntotal) if self._index is not None else 0
+
+    def index_profile(self) -> dict:
+        """Return the persisted FAISS topology without exposing the index object.
+
+        ``IndexIDMap2(IndexFlatIP)`` is an exact nearest-neighbour index.  Its
+        algorithmic ANN recall is therefore 1.0; inactive/stale vectors can
+        still reduce the number of *usable* results after Mongo validation.
+        Keeping those two concepts separate prevents the health UI from
+        presenting filtering loss as an ANN approximation problem.
+        """
+        with self._lock:
+            self.reload_if_updated_locked()
+            if self._index is None:
+                return {"wrapper": None, "base": None, "exact": False, "ntotal": 0}
+
+            wrapper = type(self._index).__name__
+            inner = getattr(self._index, "index", None)
+            if inner is not None:
+                try:
+                    inner = faiss.downcast_index(inner)
+                except (AttributeError, RuntimeError):
+                    pass
+            base = type(inner).__name__ if inner is not None else wrapper
+            exact = base in {"IndexFlat", "IndexFlatIP", "IndexFlatL2"}
+            return {
+                "wrapper": wrapper,
+                "base": base,
+                "exact": exact,
+                "ntotal": int(self._index.ntotal),
+                "generationId": self._generation_id_locked(),
+            }
+
+    def _generation_id_locked(self) -> str | None:
+        """Identify one persisted index-file revision without hashing GBs of data."""
+        if self._index is None:
+            return None
+        try:
+            stat = os.stat(self.index_path)
+            signature = ":".join([
+                str(stat.st_mtime_ns),
+                str(stat.st_size),
+                str(int(self._index.ntotal)),
+                str(int(self._index.d)),
+                self.model_name,
+            ])
+        except OSError:
+            signature = ":".join([
+                "memory",
+                str(int(self._index.ntotal)),
+                str(int(self._index.d)),
+                self.model_name,
+            ])
+        return f"faiss-{hashlib.sha256(signature.encode('utf-8')).hexdigest()[:20]}"
+
+    def generation_id(self) -> str | None:
+        with self._lock:
+            self.reload_if_updated_locked()
+            return self._generation_id_locked()
+
+    def exact_reference_recall(
+        self,
+        query_vectors: np.ndarray,
+        active_ids: Iterable[int],
+        ann_ids: Sequence[Sequence[int]],
+        *,
+        k: int = 10,
+        max_vectors: int = 10000,
+    ) -> dict:
+        """Compare ANN results with an exact FlatIP index over active vectors.
+
+        This is intentionally bounded and refuses partial corpora: comparing a
+        sampled exact index with a full ANN index would produce a misleading
+        recall number because their candidate universes differ.
+        """
+        ids = [int(value) for value in active_ids]
+        cap = max(100, min(int(max_vectors or 10000), 50000))
+        if len(ids) > cap:
+            return {"available": False, "reason": "exact_reference_too_large", "activeVectorCount": len(ids), "maxVectors": cap}
+        if not ids:
+            return {"available": False, "reason": "no_active_vectors", "activeVectorCount": 0, "maxVectors": cap}
+
+        with self._lock:
+            self.reload_if_updated_locked()
+            if self._index is None:
+                return {"available": False, "reason": "index_missing", "activeVectorCount": len(ids), "maxVectors": cap}
+            vectors = []
+            reconstructed_ids = []
+            for faiss_id in ids:
+                try:
+                    vectors.append(self._index.reconstruct(faiss_id))
+                    reconstructed_ids.append(faiss_id)
+                except Exception:  # noqa: BLE001 — drift is reported explicitly
+                    continue
+            if not vectors:
+                return {"available": False, "reason": "reconstruct_failed", "activeVectorCount": len(ids), "maxVectors": cap}
+
+            reference = faiss.IndexIDMap2(faiss.IndexFlatIP(int(self._index.d)))
+            reference.add_with_ids(
+                np.asarray(vectors, dtype="float32"),
+                np.asarray(reconstructed_ids, dtype="int64"),
+            )
+            queries = np.asarray(query_vectors, dtype="float32").copy()
+            faiss.normalize_L2(queries)
+            target_k = max(1, min(int(k or 10), 50))
+            _, exact_ids = reference.search(queries, target_k)
+
+        recalls = []
+        for exact_row, ann_row in zip(exact_ids, ann_ids):
+            expected = [int(value) for value in exact_row if int(value) != -1]
+            actual = [int(value) for value in ann_row if int(value) != -1][:target_k]
+            if expected:
+                recalls.append(len(set(expected).intersection(actual)) / len(expected))
+        return {
+            "available": bool(recalls),
+            "reason": None if recalls else "no_comparable_queries",
+            "recallAtK": round(float(np.mean(recalls)), 6) if recalls else None,
+            "queryCount": len(recalls),
+            "activeVectorCount": len(ids),
+            "reconstructedVectorCount": len(reconstructed_ids),
+            "maxVectors": cap,
+        }
 
     def remove_ids(self, ids: Sequence[int]) -> int:
         """
