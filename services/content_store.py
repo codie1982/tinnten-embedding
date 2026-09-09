@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence
 from bson import ObjectId
 from bson.errors import InvalidId
 from pymongo import ASCENDING, ReturnDocument
+from pymongo.errors import DuplicateKeyError
 from pymongo.collection import Collection
 
 from init.db import get_database, get_mongo_client
@@ -18,9 +19,40 @@ from init.db import get_database, get_mongo_client
 DEFAULT_CONTENT_DB_NAME = "tinnten"
 CONTENT_DOCUMENTS_COLL = "contentdocuments"
 CONTENT_DOCUMENT_LOGS_COLL = "contentdocumentlogs"
+EMBEDDING_DOCUMENT_LOGS_COLL = "embedding_contentdocumentlogs"
 
 # Sentinel for optional update fields
 _UNSET = object()
+
+
+_CANONICAL_INDEX_STATES = {
+    "processing": "indexing",
+    "completed": "indexed",
+    "failed": "error",
+    "ready": "indexed",
+    "pending": "queued",
+}
+
+
+def _canonical_index_state(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    return _CANONICAL_INDEX_STATES.get(value.strip().lower(), value)
+
+
+class IndexJobConflictError(RuntimeError):
+    """A newer enqueue won the document-level compare-and-set race."""
+
+    def __init__(
+        self,
+        document_id: str,
+        current_job_id: Optional[str] = None,
+        current_attempt: Optional[int] = None,
+    ) -> None:
+        super().__init__(f"a newer index job already owns document {document_id}")
+        self.document_id = str(document_id)
+        self.current_job_id = str(current_job_id) if current_job_id else None
+        self.current_attempt = current_attempt
 
 
 def _coerce_bool(value: Any) -> bool:
@@ -104,12 +136,19 @@ class ContentDocumentStore:
 
     def __init__(self, db_name: Optional[str] = None) -> None:
         name = (
-            (db_name or os.getenv("DB_TINNTEN") or "").strip()
+            (
+                db_name
+                or os.getenv("CONTENT_DOCUMENT_DB_NAME")
+                or os.getenv("EMBED_DOCUMENT_DB_NAME")
+                or os.getenv("DB_TINNTEN")
+                or ""
+            ).strip()
             or DEFAULT_CONTENT_DB_NAME
         )
         self.db = get_database(name)
         self.documents: Collection = self.db[CONTENT_DOCUMENTS_COLL]
         self.logs: Collection = self.db[CONTENT_DOCUMENT_LOGS_COLL]
+        self.embedding_logs: Collection = self.db[EMBEDDING_DOCUMENT_LOGS_COLL]
         self._ensure_indexes()
 
     # ------------------------------------------------------------------
@@ -135,6 +174,10 @@ class ContentDocumentStore:
             [("companyId", ASCENDING), ("documentId", ASCENDING), ("createdAt", ASCENDING)],
             name="document_log_idx",
         )
+        self.embedding_logs.create_index(
+            [("companyId", ASCENDING), ("documentId", ASCENDING), ("createdAt", ASCENDING)],
+            name="embedding_document_log_idx",
+        )
 
     @staticmethod
     def start_session():
@@ -157,58 +200,19 @@ class ContentDocumentStore:
         """
         if not document_ids:
             return {}
-        doc_ids = [str(doc_id) for doc_id in document_ids]
+        doc_ids = list(dict.fromkeys(str(doc_id) for doc_id in document_ids))
         documents: Dict[str, Dict[str, Any]] = {}
 
-        base_filter: Dict[str, Any] = {"documentId": {"$in": doc_ids}}
-        if company_id:
-            company_obj = _safe_object_id(company_id)
-            company_filters: List[Dict[str, Any]] = [{"companyId": company_id}, {"companyid": company_id}]
-            if company_obj is not None:
-                company_filters.extend([{"companyId": company_obj}, {"companyid": company_obj}])
-            base_filter = {"$and": [{"$or": company_filters}, base_filter]}
-
-        cursor = self.documents.find(base_filter, projection)
+        selectors = [self._document_selector(company_id, doc_id) for doc_id in doc_ids]
+        query = selectors[0] if len(selectors) == 1 else {"$or": selectors}
+        cursor = self.documents.find(query, projection)
         for doc in cursor:
             key = str(doc.get("documentId") or doc.get("_id"))
             documents[key] = doc
-
-        missing_ids = [doc_id for doc_id in doc_ids if doc_id not in documents]
-        if missing_ids:
-            object_ids = [oid for oid in (_safe_object_id(doc_id) for doc_id in missing_ids) if oid]
-            if object_ids:
-                cursor = self.documents.find(
-                    {"$and": [{"$or": company_filters}, {"_id": {"$in": object_ids}}]},
-                    projection,
-                )
-                for doc in cursor:
-                    key = str(doc.get("documentId") or doc.get("_id"))
-                    documents[key] = doc
         return documents
 
     def get_document(self, company_id: Optional[str], document_id: str) -> Optional[Dict[str, Any]]:
-        doc_id_str = str(document_id)
-        doc_obj = _safe_object_id(doc_id_str)
-
-        if company_id:
-            company_obj = _safe_object_id(company_id)
-            company_filters: List[Dict[str, Any]] = [{"companyId": company_id}, {"companyid": company_id}]
-            if company_obj is not None:
-                company_filters.extend([{"companyId": company_obj}, {"companyid": company_obj}])
-
-            selectors: List[Dict[str, Any]] = [
-                {"$and": [{"$or": company_filters}, {"documentId": doc_id_str}]},
-            ]
-            if doc_obj is not None:
-                selectors.append({"$and": [{"$or": company_filters}, {"documentId": doc_obj}]})
-                selectors.append({"$and": [{"$or": company_filters}, {"_id": doc_obj}]})
-        else:
-            selectors = [{"documentId": doc_id_str}]
-            if doc_obj is not None:
-                selectors.append({"documentId": doc_obj})
-                selectors.append({"_id": doc_obj})
-
-        return self.documents.find_one({"$or": selectors})
+        return self.documents.find_one(self._document_selector(company_id, document_id))
 
     # ------------------------------------------------------------------
     # Index state helpers
@@ -216,7 +220,7 @@ class ContentDocumentStore:
     def update_index_fields(
         self,
         *,
-        company_id: str,
+        company_id: Optional[str],
         document_id: str,
         state: Optional[str] = None,
         stats: Any = _UNSET,
@@ -234,8 +238,9 @@ class ContentDocumentStore:
         now = datetime.now(timezone.utc)
         updates: Dict[str, Any] = {"index.lastRunAt": now}
         if state is not None:
-            updates["index.state"] = state
-            updates["indexState"] = state
+            canonical_state = _canonical_index_state(state)
+            updates["index.state"] = canonical_state
+            updates["indexState"] = canonical_state
         if stats is not _UNSET:
             updates["index.stats"] = stats
         if error is not _UNSET:
@@ -252,38 +257,19 @@ class ContentDocumentStore:
             for key, value in extra_updates.items():
                 updates[key] = value
 
-        # companyId opsiyonel — personal documents için company_id=None olabilir
-        if company_id:
-            query = {"companyId": company_id, "documentId": document_id}
-        else:
-            query = {"documentId": document_id}
+        query = self._document_selector(company_id, document_id)
+        # A worker may finish after a newer request replaced index.jobId.  Match
+        # the same job (or a legacy record without one) before writing terminal
+        # state.  The successful first write canonicalises missing jobId.
+        if job_id is not _UNSET:
+            query = {"$and": [query, self._current_job_selector(job_id)]}
 
-        result = self.documents.find_one_and_update(
+        return self.documents.find_one_and_update(
             query,
             {"$set": updates},
             return_document=ReturnDocument.AFTER,
             session=session,
         )
-        if result is None and company_id:
-            company_obj = _safe_object_id(company_id) or company_id
-            doc_obj = _safe_object_id(document_id)
-            if doc_obj:
-                result = self.documents.find_one_and_update(
-                    {"companyid": company_obj, "_id": doc_obj},
-                    {"$set": updates},
-                    return_document=ReturnDocument.AFTER,
-                    session=session,
-                )
-        if result is None:
-            doc_obj = _safe_object_id(document_id)
-            if doc_obj:
-                result = self.documents.find_one_and_update(
-                    {"_id": doc_obj},
-                    {"$set": updates},
-                    return_document=ReturnDocument.AFTER,
-                    session=session,
-                )
-        return result
 
     def reset_index_error(
         self,
@@ -306,8 +292,8 @@ class ContentDocumentStore:
     #   * lease  → worker ölürse kilit kalıcı olmaz, süresi dolunca devralınır
     #   * job_id → kilidi yalnız sahibi bırakabilir/ilerletebilir
     #   * CAS    → eski bir job, yeni job'ın durumunu ezemez
-    # RabbitMQ redelivery'si aynı job_id ile gelir → aynı job kendi kilidini
-    # yeniden alabilir (idempotent).
+    # RabbitMQ redelivery'si aynı job_id ile gelse bile canlı kilidi yeniden
+    # alamaz. Aynı işi iki worker'ın eşzamanlı yürütmesi de veri yarışıdır.
     # ------------------------------------------------------------------
     def try_acquire_ingest_lock(
         self,
@@ -320,26 +306,37 @@ class ContentDocumentStore:
     ) -> Optional[Dict[str, Any]]:
         """Kilidi almayı dener. Alırsa güncel dokümanı, alamazsa None döner.
 
-        Kilit şu durumlarda alınır:
+        Kilit yalnız dokümanın güncel jobId'si için ve şu durumlarda alınır:
           * hiç kilit yoksa,
-          * lease süresi dolmuşsa (ölü worker),
-          * kilit zaten AYNI job_id'nin ise (redelivery → idempotent).
+          * lease süresi dolmuşsa (ölü worker).
+
+        Canlı kilit aynı job_id'ye ait olsa dahi alınamaz. RabbitMQ aynı mesajı
+        eşzamanlı yeniden teslim edebilir; ikinci worker'ın aynı sürümü paralel
+        swap etmesi idempotent değil, veri yarışıdır.
         """
         now = datetime.now(timezone.utc)
         lease_until = now + timedelta(seconds=int(lease_seconds))
         base = self._document_selector(company_id, document_id)
-        free_or_ours = {
-            "$or": [
-                {"index.lock": None},
-                {"index.lock.jobId": job_id},
-                {"index.lock.leaseUntil": {"$lt": now}},
+        # The current-job selector must also cover the expired-lease branch.
+        # Otherwise job A can load the document, job B can be enqueued, and A
+        # can then steal its expired lock and overwrite index.jobId back to A.
+        query = {
+            "$and": [
+                base,
+                self._current_job_selector(job_id),
+                {
+                    "$or": [
+                        {"index.lock": None},
+                        {"index.lock.leaseUntil": {"$lt": now}},
+                    ]
+                },
             ]
         }
-        query = {"$and": [base, free_or_ours]}
         updates = {
             "index.lock": {"jobId": job_id, "acquiredAt": now, "leaseUntil": lease_until},
-            "index.state": "processing",
-            "indexState": "processing",
+            "index.jobId": job_id,
+            "index.state": "indexing",
+            "indexState": "indexing",
             "index.startedAt": now,
             "index.lastRunAt": now,
         }
@@ -364,7 +361,9 @@ class ContentDocumentStore:
         query = {
             "$and": [
                 self._document_selector(company_id, document_id),
+                self._current_job_selector(job_id),
                 {"index.lock.jobId": job_id},
+                {"index.lock.leaseUntil": {"$gt": now}},
             ]
         }
         result = self.documents.update_one(
@@ -373,6 +372,26 @@ class ContentDocumentStore:
             session=session,
         )
         return int(result.matched_count or 0) > 0
+
+    def owns_ingest_lock(
+        self,
+        *,
+        company_id: Optional[str],
+        document_id: str,
+        job_id: str,
+        session=None,
+    ) -> bool:
+        """Return whether ``job_id`` still owns a live, canonical lease."""
+        now = datetime.now(timezone.utc)
+        query = {
+            "$and": [
+                self._document_selector(company_id, document_id),
+                self._current_job_selector(job_id),
+                {"index.lock.jobId": job_id},
+                {"index.lock.leaseUntil": {"$gt": now}},
+            ]
+        }
+        return self.documents.count_documents(query, limit=1, session=session) > 0
 
     def release_ingest_lock(
         self,
@@ -391,27 +410,86 @@ class ContentDocumentStore:
         düşüremez. Kilit bizde değilse hiçbir şey yazılmaz ve False döner.
         """
         now = datetime.now(timezone.utc)
-        query = {
+        owner_query = {
             "$and": [
                 self._document_selector(company_id, document_id),
                 {"index.lock.jobId": job_id},
             ]
         }
+        query = {"$and": [owner_query, self._current_job_selector(job_id)]}
         updates: Dict[str, Any] = {"index.lock": None, "index.finishedAt": now, "index.lastRunAt": now}
         if state is not None:
-            updates["index.state"] = state
-            updates["indexState"] = state
+            canonical_state = _canonical_index_state(state)
+            updates["index.state"] = canonical_state
+            updates["indexState"] = canonical_state
         if error is not _UNSET:
             updates["index.errorMsg"] = error
         result = self.documents.update_one(query, {"$set": updates}, session=session)
-        return int(result.matched_count or 0) > 0
+        if int(result.matched_count or 0) > 0:
+            return True
+
+        # A newer enqueue can replace index.jobId while this worker still owns
+        # the old lease.  Clear only that stale lease so the new job can start;
+        # do not touch its state/timestamps/error.
+        self.documents.update_one(
+            owner_query,
+            {"$set": {"index.lock": None}},
+            session=session,
+        )
+        return False
 
     @staticmethod
     def _document_selector(company_id: Optional[str], document_id: str) -> Dict[str, Any]:
-        """Kilit sorguları için doküman seçici (companyId opsiyonel — personal docs)."""
-        if company_id:
-            return {"companyId": company_id, "documentId": document_id}
-        return {"documentId": document_id}
+        """Match canonical and Node/Mongoose legacy identities safely.
+
+        Canonical rows use ``companyId`` + ``documentId``.  Older Node rows use
+        ``companyid`` + Mongo ``_id``.  When a company is supplied every branch
+        remains company-scoped; there is no unscoped ``_id`` fallback.
+        """
+        document_text = str(document_id)
+        document_obj = _safe_object_id(document_id)
+        document_filters: List[Dict[str, Any]] = [{"documentId": document_text}]
+        if document_obj is not None:
+            document_filters.extend(
+                [
+                    {"documentId": document_obj},
+                    {"_id": document_obj},
+                ]
+            )
+        document_selector: Dict[str, Any] = {"$or": document_filters}
+
+        if not company_id:
+            return document_selector
+
+        company_text = str(company_id)
+        company_obj = _safe_object_id(company_id)
+        company_filters: List[Dict[str, Any]] = [
+            {"companyId": company_text},
+            {"companyid": company_text},
+        ]
+        if company_obj is not None:
+            company_filters.extend(
+                [
+                    {"companyId": company_obj},
+                    {"companyid": company_obj},
+                ]
+            )
+        return {
+            "$and": [
+                {"$or": company_filters},
+                document_selector,
+            ]
+        }
+
+    @staticmethod
+    def _current_job_selector(job_id: Any) -> Dict[str, Any]:
+        """Accept this job or a pre-jobId legacy record, reject newer jobs."""
+        return {
+            "$or": [
+                {"index.jobId": str(job_id)},
+                {"index.jobId": None},
+            ]
+        }
 
     def upsert_document_with_source(
         self,
@@ -427,10 +505,39 @@ class ContentDocumentStore:
         title: Optional[str] = None,
         doc_type: Optional[str] = None,
         state: str = "queued",
+        attempt: Optional[int] = None,
+        expected_job_id: Any = _UNSET,
         session=None,
     ) -> Dict[str, Any]:
         now = datetime.now(timezone.utc)
         existing_doc = self.get_document(company_id, document_id)
+        existing_index = (
+            existing_doc.get("index")
+            if isinstance(existing_doc, dict) and isinstance(existing_doc.get("index"), dict)
+            else {}
+        )
+        # API callers pass the job id observed at request admission. This makes
+        # enqueue itself a CAS: a slow request cannot overwrite a newer job
+        # which reached Mongo first. Direct/legacy callers retain the same
+        # behaviour by deriving the expectation from the row read above.
+        enqueue_expected_job_id = (
+            existing_index.get("jobId")
+            if expected_job_id is _UNSET
+            else expected_job_id
+        )
+        if attempt is not None:
+            attempt = int(attempt)
+            if attempt < 1:
+                raise ValueError("index attempt must be a positive integer")
+        current_attempt = existing_index.get("attempt")
+        if attempt is None and current_attempt is not None:
+            # Once a producer adopts monotonic attempts, an older caller which
+            # carries no ordering information must never supersede it.
+            raise IndexJobConflictError(
+                document_id,
+                existing_index.get("jobId"),
+                current_attempt,
+            )
         stats = {
             "chunkCount": 0,
             "tokenCount": 0,
@@ -440,12 +547,13 @@ class ContentDocumentStore:
             "minChars": int(options.get("minChars") or 0),
         }
 
+        canonical_state = _canonical_index_state(state)
         set_updates: Dict[str, Any] = {
-            "source": source,
             "metadata": metadata or {},
             "updatedAt": now,
-            "index.state": state,
-            "indexState": state,
+            "index.source": source,
+            "index.state": canonical_state,
+            "indexState": canonical_state,
             "index.jobId": job_id,
             "index.options": options,
             "index.stats": stats,
@@ -457,6 +565,8 @@ class ContentDocumentStore:
             "index.startedAt": None,
             "index.finishedAt": None,
         }
+        if attempt is not None:
+            set_updates["index.attempt"] = attempt
         if title:
             set_updates["title"] = title
         if trigger:
@@ -480,17 +590,59 @@ class ContentDocumentStore:
                 query["companyid"] = existing_doc["companyid"]
             upsert = False
         else:
-            query = {"companyId": company_id, "documentId": document_id}
+            query = {
+                "companyId": company_id,
+                "documentId": document_id,
+            }
             set_updates["companyId"] = company_id
             set_updates["documentId"] = document_id
             upsert = True
 
-        self.documents.update_one(
-            query,
-            {"$set": set_updates, "$setOnInsert": set_on_insert},
-            upsert=upsert,
-            session=session,
-        )
+        if attempt is None:
+            query["index.attempt"] = None
+            query["index.jobId"] = enqueue_expected_job_id
+        else:
+            # A larger attempt supersedes an older one. Equal attempts are
+            # idempotent only for the same immutable job id; a different job
+            # at the same attempt is ambiguous and therefore rejected.
+            query["$or"] = [
+                {"index.attempt": None},
+                {"index.attempt": {"$lt": attempt}},
+                {
+                    "$and": [
+                        {"index.attempt": attempt},
+                        {"index.jobId": job_id},
+                    ]
+                },
+            ]
+
+        try:
+            result = self.documents.update_one(
+                query,
+                {"$set": set_updates, "$setOnInsert": set_on_insert},
+                upsert=upsert,
+                session=session,
+            )
+        except DuplicateKeyError as exc:
+            # A concurrent canonical insert/update changed index.jobId between
+            # admission and this write. The unique identity index turns the
+            # failed CAS upsert into DuplicateKeyError rather than matched=0.
+            current = self.get_document(company_id, document_id) or {}
+            current_index = current.get("index") if isinstance(current.get("index"), dict) else {}
+            raise IndexJobConflictError(
+                document_id,
+                current_index.get("jobId"),
+                current_index.get("attempt"),
+            ) from exc
+
+        if not result.matched_count and result.upserted_id is None:
+            current = self.get_document(company_id, document_id) or {}
+            current_index = current.get("index") if isinstance(current.get("index"), dict) else {}
+            raise IndexJobConflictError(
+                document_id,
+                current_index.get("jobId"),
+                current_index.get("attempt"),
+            )
         doc = self.get_document(company_id, document_id)
         if not doc:
             raise RuntimeError("Failed to upsert content document.")
@@ -510,19 +662,75 @@ class ContentDocumentStore:
         details: Optional[Dict[str, Any]] = None,
         session=None,
     ) -> None:
-        entry: Dict[str, Any] = {
-            "companyId": company_id,
-            "documentId": document_id,
-            "jobId": job_id,
-            "level": level,
-            "message": message,
-            "state": state,
-            "trigger": trigger,
-            "userId": user_id,
-            "details": details or {},
-            "createdAt": datetime.now(timezone.utc),
-        }
-        self.logs.insert_one(entry, session=session)
+        now = datetime.now(timezone.utc)
+        content_document = self.get_document(company_id, document_id) or {}
+        document_oid = (
+            content_document.get("_id")
+            if isinstance(content_document.get("_id"), ObjectId)
+            else _safe_object_id(document_id)
+        )
+        company_oid = _safe_object_id(
+            content_document.get("companyid")
+            or content_document.get("companyId")
+            or company_id
+        )
+        index = content_document.get("index") if isinstance(content_document.get("index"), dict) else {}
+        user_oid = _safe_object_id(
+            content_document.get("userid")
+            or content_document.get("userId")
+            or user_id
+            or index.get("userId")
+        )
+        space_oid = _safe_object_id(
+            content_document.get("spaceId")
+            or (details or {}).get("spaceId")
+        )
+
+        if document_oid is not None and user_oid is not None:
+            # Match the canonical Node/Mongoose model exactly. Raw Python
+            # strings and missing `event` made rows invisible to ObjectId
+            # queries and invalid under the owning schema.
+            canonical_entry: Dict[str, Any] = {
+                "documentId": document_oid,
+                "companyid": company_oid,
+                "spaceId": space_oid,
+                "userid": user_oid,
+                "event": f"index.{str(state or level or 'event').lower()}"[:64],
+                "message": str(message or "")[:500],
+                "meta": {
+                    "jobId": job_id,
+                    "level": level,
+                    "state": state,
+                    "trigger": trigger,
+                    "details": details or {},
+                },
+                "createdAt": now,
+                "updatedAt": now,
+            }
+            self.logs.insert_one(canonical_entry, session=session)
+            return
+
+        # Non-ObjectId legacy/crawler documents cannot satisfy the Node audit
+        # schema. Keep their diagnostics in an explicitly separate collection
+        # instead of polluting `contentdocumentlogs` with a second schema.
+        fallback_logs = getattr(self, "embedding_logs", None)
+        if fallback_logs is None:
+            fallback_logs = self.db[EMBEDDING_DOCUMENT_LOGS_COLL]
+        fallback_logs.insert_one(
+            {
+                "companyId": company_id,
+                "documentId": document_id,
+                "jobId": job_id,
+                "level": level,
+                "message": message,
+                "state": state,
+                "trigger": trigger,
+                "userId": user_id,
+                "details": details or {},
+                "createdAt": now,
+            },
+            session=session,
+        )
 
     def bulk_append_logs(
         self,
@@ -536,4 +744,7 @@ class ContentDocumentStore:
         now = datetime.now(timezone.utc)
         for doc in docs:
             doc.setdefault("createdAt", now)
-        self.logs.insert_many(docs, ordered=False, session=session)
+        fallback_logs = getattr(self, "embedding_logs", None)
+        if fallback_logs is None:
+            fallback_logs = self.db[EMBEDDING_DOCUMENT_LOGS_COLL]
+        fallback_logs.insert_many(docs, ordered=False, session=session)

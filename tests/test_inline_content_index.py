@@ -60,6 +60,140 @@ def test_url_only_payload_does_not_become_text_source(client, mocker):
     assert upsert.call_args.kwargs["source"]["type"] in {"url", "import_url", "web"}
 
 
+def test_monotonic_attempt_is_persisted_and_published(client, mocker):
+    import app
+
+    upsert = mocker.patch.object(
+        app.content_store,
+        "upsert_document_with_source",
+        return_value={"index": {"state": "queued", "attempt": 12}},
+    )
+    mocker.patch.object(app.content_store, "append_log_entry", return_value=None)
+    publish = mocker.patch("app._publish_content_index_message", return_value=None)
+
+    response = client.post(
+        "/api/v10/content/index",
+        json={
+            "companyId": "C1",
+            "documentId": "D1",
+            "jobId": "job-12",
+            "attemptVersion": 12,
+            "text": "indexlenebilir içerik",
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.get_json()["attempt"] == 12
+    assert upsert.call_args.kwargs["attempt"] == 12
+    assert publish.call_args.kwargs["attempt"] == 12
+
+
+def test_invalid_attempt_is_rejected_before_enqueue(client, mocker):
+    import app
+
+    publish = mocker.patch("app._publish_content_index_message")
+    response = client.post(
+        "/api/v10/content/index",
+        json={"companyId": "C1", "text": "hello", "attempt": 0},
+    )
+
+    assert response.status_code == 400
+    publish.assert_not_called()
+
+
+def test_attempt_conflict_is_not_published(client, mocker):
+    import app
+    from services.content_store import IndexJobConflictError
+
+    mocker.patch.object(
+        app.content_store,
+        "get_document",
+        return_value={"index": {"jobId": "job-13", "attempt": 13}},
+    )
+    mocker.patch.object(
+        app.content_store,
+        "upsert_document_with_source",
+        side_effect=IndexJobConflictError("D1", "job-13", 13),
+    )
+    publish = mocker.patch("app._publish_content_index_message")
+
+    response = client.post(
+        "/api/v10/content/index",
+        json={
+            "companyId": "C1",
+            "documentId": "D1",
+            "jobId": "job-12",
+            "attempt": 12,
+            "text": "indexlenebilir içerik",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.get_json()["currentAttempt"] == 13
+    publish.assert_not_called()
+
+
+def test_upload_publish_failure_marks_upload_index_failed(client, mocker):
+    import app
+
+    mocker.patch.object(
+        app.content_store,
+        "upsert_document_with_source",
+        return_value={"index": {"state": "queued"}},
+    )
+    mocker.patch.object(app.content_store, "append_log_entry", return_value=None)
+    mocker.patch(
+        "app._publish_content_index_message",
+        return_value="failed to enqueue indexing job: broker down",
+    )
+    update_upload = mocker.patch.object(app.upload_store, "update_upload_status")
+
+    response = client.post(
+        "/api/v10/content/index",
+        json={
+            "companyId": "C1",
+            "uploadId": "UP1",
+            "trigger": "upload_scan_clean",
+        },
+    )
+
+    assert response.status_code == 503
+    update_upload.assert_called_once_with(
+        "UP1",
+        index_status="failed",
+        is_file_opened=False,
+        file_open_error="failed to enqueue indexing job: broker down",
+    )
+
+
+def test_manual_upload_publish_failure_does_not_overwrite_upload_state(client, mocker):
+    import app
+
+    mocker.patch.object(
+        app.content_store,
+        "upsert_document_with_source",
+        return_value={"index": {"state": "queued"}},
+    )
+    mocker.patch.object(app.content_store, "append_log_entry", return_value=None)
+    mocker.patch(
+        "app._publish_content_index_message",
+        return_value="failed to enqueue indexing job: broker down",
+    )
+    update_upload = mocker.patch.object(app.upload_store, "update_upload_status")
+
+    response = client.post(
+        "/api/v10/content/index",
+        json={
+            "companyId": "C1",
+            "uploadId": "UP1",
+            "trigger": "manual_update",
+        },
+    )
+
+    assert response.status_code == 503
+    update_upload.assert_not_called()
+
+
 def test_disabled_fetcher_page_is_not_silently_reindexed(client, mocker):
     """Per-page deindex survives later crawler content changes."""
     import app

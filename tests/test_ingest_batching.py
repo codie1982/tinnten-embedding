@@ -277,6 +277,79 @@ def test_non_content_messages_bypass_batching(mocker):
     assert events == ["processed", "ack:7"]
 
 
+def test_single_lock_busy_message_is_requeued_without_failure_reporting(mocker):
+    from workers.ingest_worker import RetryableIngestLockError
+
+    worker = _make_worker(mocker)
+    worker.batch_enabled = False
+    worker.ingest_requeue_delay_seconds = 0
+    report = mocker.patch.object(worker, "_report_message_failure")
+    mocker.patch.object(
+        worker,
+        "_process_payload",
+        side_effect=RetryableIngestLockError("busy"),
+    )
+    method = MagicMock(delivery_tag=17)
+
+    worker._handle_message(
+        worker.channel,
+        method,
+        MagicMock(),
+        b'{"companyId":"A","documentIds":["d1"]}',
+    )
+
+    worker.channel.basic_ack.assert_not_called()
+    worker.channel.basic_nack.assert_called_once_with(delivery_tag=17, requeue=True)
+    report.assert_not_called()
+
+
+def test_batch_lock_busy_message_is_requeued_and_siblings_are_acked(mocker):
+    from workers.ingest_worker import RetryableIngestLockError
+
+    worker = _make_worker(mocker)
+    worker.ingest_requeue_delay_seconds = 0
+    events = []
+
+    @contextmanager
+    def fake_batch():
+        events.append("batch:enter")
+        yield
+        events.append("batch:exit")
+
+    engine = MagicMock()
+    engine.batch_writes.side_effect = fake_batch
+    mocker.patch.object(worker, "_engine_for_company", return_value=engine)
+
+    def process(payload):
+        if payload["documentIds"] == ["busy"]:
+            raise RetryableIngestLockError("busy")
+        events.append("process:ok")
+
+    mocker.patch.object(worker, "_process_payload", side_effect=process)
+    report = mocker.patch.object(worker, "_report_message_failure")
+    worker.channel.basic_ack.side_effect = lambda delivery_tag: events.append(f"ack:{delivery_tag}")
+    worker.channel.basic_nack.side_effect = lambda delivery_tag, requeue: events.append(
+        f"nack:{delivery_tag}:requeue={requeue}"
+    )
+
+    worker._flush_company_group(
+        "A",
+        [
+            (1, {"companyId": "A", "documentIds": ["ok"]}),
+            (2, {"companyId": "A", "documentIds": ["busy"]}),
+        ],
+    )
+
+    assert events == [
+        "batch:enter",
+        "process:ok",
+        "batch:exit",
+        "ack:1",
+        "nack:2:requeue=True",
+    ]
+    report.assert_not_called()
+
+
 def test_verbose_doc_logs_are_skipped_by_default(mocker):
     """Ara adım logları varsayılan yazılmaz (Mongo yükü); hata/nihai olay yazılır."""
     worker = _make_worker(mocker)

@@ -67,8 +67,9 @@ class UploadStore:
             update["is_file_opened"] = is_file_opened
         if file_open_error is not _UNSET:
             update["file_open_error"] = file_open_error
-        if embedding_doc_id is not None:
-            update["embedding_doc_id"] = embedding_doc_id
+        # Keep accepting the legacy argument while rolling deployments still
+        # pass it, but do not persist an undeclared field into the Node Upload
+        # schema. The embedding parent is addressed by document_id directly.
 
         result = self.uploads.find_one_and_update(
             {"uploadid": upload_id},

@@ -7,14 +7,17 @@ Per-company FAISS artık KOD SABİTİ (services/company_index.py) — bu script'
 global'e düşer. Yani migration deploy'dan SONRA da koşulabilir; koşana kadar
 firmalar global'den okumaya devam eder, retrieval kesilmez.
 
-Global index'teki her chunk'ın
+Global index'teki her GEÇERLİ chunk'ın
 vektörünü `index.reconstruct(faiss_id)` ile OKUR (re-embed YOK → deterministik + hızlı;
 model sabit) ve chunk'ın firmasına (`metadata.companyId`, yoksa top-level `company_id`)
 göre `company/<companyId>.index`'e AYNI faiss_id ile yazar. faiss_id global benzersiz
 olduğu için çakışma yok; MongoDB chunk kayıtlarına DOKUNMAZ; global index'i SİLMEZ
 (rollback güvenli — bayrağı geri kapatınca okuma/yazım global'e döner).
 
-Firma-sız (personal) chunk'lar global'de KALIR (taşınmaz).
+Taşıma öncesinde chunk'ın canlı `embedding_documents` üst kaydı, şirket eşleşmesi ve
+aktif ingest sürümü doğrulanır. Üst kaydı bulunmayan, şirketi yalnız chunk'a sonradan
+yazılmış, kaldırılmış/devre dışı veya eski sürüm chunk'lar şirket indeksine TAŞINMAZ.
+Firma-sız (personal) chunk'lar da global'de KALIR.
 
 Kullanım:
     python scripts/migrate_global_to_per_company_faiss.py            # DRY-RUN (rapor)
@@ -82,6 +85,57 @@ def group_faiss_ids_by_company(chunks: Iterable[Dict[str, Any]]) -> Tuple[Dict[s
     return dict(groups), company_less, no_faiss
 
 
+def filter_migratable_chunks(
+    chunks: Iterable[Dict[str, Any]],
+    documents: Iterable[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Yalnız canlı üst kaydı ve aktif sürümü doğrulanan chunk'ları döndürür.
+
+    Chunk üzerindeki ``company_id`` tek başına sahiplik kanıtı değildir. Eski/global
+    verilerde bu alan toplu işlemlerle sonradan yazılmış olabilir. Bu yüzden migration
+    ancak üst doküman da aynı şirketi gösteriyorsa chunk'ı şirket FAISS'ine taşır.
+    """
+    documents_by_id: Dict[str, Dict[str, Any]] = {}
+    for document in documents:
+        doc_id = str(document.get("doc_id") or "").strip()
+        if doc_id:
+            documents_by_id[doc_id] = document
+
+    eligible: List[Dict[str, Any]] = []
+    stats = {
+        "parentless": 0,
+        "inactive_parent": 0,
+        "parent_company_missing": 0,
+        "company_mismatch": 0,
+        "stale_version": 0,
+    }
+    for chunk in chunks:
+        doc_id = str(chunk.get("doc_id") or "").strip()
+        document = documents_by_id.get(doc_id)
+        if not document:
+            stats["parentless"] += 1
+            continue
+        if document.get("status") in {"removed", "disabled"}:
+            stats["inactive_parent"] += 1
+            continue
+
+        chunk_company_id = resolve_company_id(chunk)
+        document_company_id = resolve_company_id(document)
+        if not document_company_id:
+            stats["parent_company_missing"] += 1
+            continue
+        if chunk_company_id != document_company_id:
+            stats["company_mismatch"] += 1
+            continue
+
+        active_version = document.get("active_ingest_version")
+        if active_version and chunk.get("ingest_version") != active_version:
+            stats["stale_version"] += 1
+            continue
+        eligible.append(chunk)
+    return eligible, stats
+
+
 def company_index_path(global_index_path: str, company_id: str) -> str | None:
     """
     Firma index yolu — servis koduyla AYNI fonksiyondan üretilir.
@@ -100,16 +154,51 @@ def company_index_path(global_index_path: str, company_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 # faiss/mongo bağımlı (yalnız çalışma zamanı)
 # ---------------------------------------------------------------------------
-def _load_chunks(mongo_uri: str, db_name: str, company: str | None):
+def _load_chunks(
+    mongo_uri: str,
+    chunk_db_name: str,
+    document_db_name: str,
+    company: str | None,
+):
     from pymongo import MongoClient
 
     client = MongoClient(mongo_uri, serverSelectionTimeoutMS=30000)
-    coll = client[db_name]["embedding_chunks"]
+    chunk_coll = client[chunk_db_name]["embedding_chunks"]
+    document_coll = client[document_db_name]["embedding_documents"]
     query: Dict[str, Any] = {}
     if company:
         query = {"$or": [{"metadata.companyId": company}, {"company_id": company}]}
-    proj = {"_id": 0, "faiss_id": 1, "company_id": 1, "metadata.companyId": 1, "metadata.company_id": 1}
-    return list(coll.find(query, proj))
+    chunk_projection = {
+        "_id": 0,
+        "doc_id": 1,
+        "faiss_id": 1,
+        "ingest_version": 1,
+        "company_id": 1,
+        "metadata.companyId": 1,
+        "metadata.company_id": 1,
+    }
+    chunks = list(chunk_coll.find(query, chunk_projection))
+    doc_ids = sorted({str(chunk.get("doc_id")) for chunk in chunks if chunk.get("doc_id")})
+    documents: List[Dict[str, Any]] = []
+    document_projection = {
+        "_id": 0,
+        "doc_id": 1,
+        "status": 1,
+        "active_ingest_version": 1,
+        "company_id": 1,
+        "metadata.companyId": 1,
+        "metadata.company_id": 1,
+    }
+    # Tek bir dev `$in` sorgusunun MongoDB BSON sınırına takılmasını önle.
+    for offset in range(0, len(doc_ids), 5000):
+        documents.extend(
+            document_coll.find(
+                {"doc_id": {"$in": doc_ids[offset : offset + 5000]}},
+                document_projection,
+            )
+        )
+    eligible, stats = filter_migratable_chunks(chunks, documents)
+    return eligible, {"candidates": len(chunks), **stats}
 
 
 class MigrationAbort(RuntimeError):
@@ -267,6 +356,11 @@ def main() -> int:
     ap.add_argument("--global-index", default=resolve_chunk_index_path())
     ap.add_argument("--mongo-uri", default=os.getenv("MONGO_URI") or os.getenv("FETCHER_MONGO_URI"))
     ap.add_argument("--db", default=os.getenv("EMBED_DB_NAME") or "tinnten-embedding")
+    ap.add_argument(
+        "--document-db",
+        default=os.getenv("EMBED_DOCUMENT_DB_NAME") or os.getenv("DB_TINNTEN") or "tinnten",
+        help="embedding_documents koleksiyonunun bulunduğu ana veritabanı",
+    )
     args = ap.parse_args()
 
     if not args.mongo_uri:
@@ -283,11 +377,19 @@ def main() -> int:
     dim = int(global_index.d)
     print(f"  d={dim} ntotal={global_index.ntotal} type={type(global_index).__name__}")
 
-    chunks = _load_chunks(args.mongo_uri, args.db, args.company)
+    chunks, filtered = _load_chunks(args.mongo_uri, args.db, args.document_db, args.company)
     groups, company_less, no_faiss = group_faiss_ids_by_company(chunks)
     print(
-        f"Chunk: toplam={len(chunks)} firma={len(groups)} "
+        f"Chunk: aday={filtered['candidates']} geçerli={len(chunks)} firma={len(groups)} "
         f"firma_sız(personal→global kalır)={company_less} faiss_id_yok={no_faiss}"
+    )
+    print(
+        "  elenen: "
+        f"üst_kayıtsız={filtered['parentless']} "
+        f"pasif_üst_kayıt={filtered['inactive_parent']} "
+        f"üst_kayıt_firmasız={filtered['parent_company_missing']} "
+        f"firma_uyuşmazlığı={filtered['company_mismatch']} "
+        f"eski_sürüm={filtered['stale_version']}"
     )
     if not groups:
         print("Taşınacak firma-chunk'ı yok.")

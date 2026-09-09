@@ -66,6 +66,7 @@ class TinntenServerClient:
         source: str | None = None,
         domain_chunks: int | None = None,
         job_id: str | None = None,
+        attempt: int | None = None,
     ) -> bool:
         """Notify tinnten-server of a document index state change.
 
@@ -83,6 +84,7 @@ class TinntenServerClient:
             "completed": "indexed",
             "failed": "error",
             "indexing": "indexing",
+            "processing": "indexing",
             "queued": "queued",
         }
         mapped_state = state_map.get(state, state)
@@ -90,13 +92,45 @@ class TinntenServerClient:
         body = {"state": mapped_state}
         if job_id:
             body["jobId"] = str(job_id)
+        if attempt is not None:
+            body["attempt"] = int(attempt)
         if error_msg:
             body["errorMsg"] = error_msg
         if stats and isinstance(stats, dict):
+            # Keep the server's historical aliases while carrying the richer
+            # worker measurements. The server merges this object into
+            # index.stats; dropping extraction/chunking fields here made the
+            # API database disagree with the worker database.
+            allowed_stat_keys = (
+                "chunkCount",
+                "tokenCount",
+                "charCount",
+                "chunkSize",
+                "chunkOverlap",
+                "minChars",
+                "effectiveMinChars",
+                "chunkMode",
+                "chunkPolicy",
+                "chunkCharacterCount",
+                "extractedCharCount",
+                "meaningfulCharCount",
+                "failureReason",
+                "cleanup",
+                "ocr",
+                "langDetect",
+                "scope",
+            )
             body["stats"] = {
-                "chunks": int(stats.get("chunkCount") or stats.get("chunks") or 0),
-                "tokens": int(stats.get("tokenCount") or stats.get("tokens") or 0),
+                key: stats[key]
+                for key in allowed_stat_keys
+                if key in stats and stats[key] is not None
             }
+            body["stats"].update(
+                {
+                    "chunks": int(stats.get("chunkCount") or stats.get("chunks") or 0),
+                    "tokens": int(stats.get("tokenCount") or stats.get("tokens") or 0),
+                }
+            )
         if company_id:
             body["companyid"] = company_id
         # Per-sayfa (fetcher_page/initial) doc'ları için: server, website entry'sini

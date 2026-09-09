@@ -56,6 +56,44 @@ def test_callback_carries_the_ingest_job_id_for_precise_operation_matching():
     assert body["jobId"] == "space-index:op-42"
 
 
+def test_callback_carries_monotonic_attempt():
+    body = _capture_patch_body(_client(), company_id="C1", job_id="job-7", attempt=7)
+    assert body["attempt"] == 7
+
+
+def test_callback_preserves_rich_worker_stats_and_legacy_aliases():
+    body = _capture_patch_body(
+        _client(),
+        company_id="C1",
+        stats={
+            "chunkCount": 3,
+            "tokenCount": 44,
+            "charCount": 321,
+            "meaningfulCharCount": 300,
+            "chunkMode": "automatic",
+        },
+    )
+
+    assert body["stats"] == {
+        "chunkCount": 3,
+        "tokenCount": 44,
+        "charCount": 321,
+        "meaningfulCharCount": 300,
+        "chunkMode": "automatic",
+        "chunks": 3,
+        "tokens": 44,
+    }
+
+
+def test_processing_callback_is_mapped_to_canonical_indexing():
+    client = _client()
+    with patch("services.tinnten_server_client.requests.patch") as request_patch:
+        request_patch.return_value = MagicMock(status_code=200)
+        assert client.update_document_index_state("D1", "processing") is True
+
+    assert request_patch.call_args.kwargs["json"]["state"] == "indexing"
+
+
 def test_domain_without_fetcher_source_is_ignored():
     # domain var ama source fetcher_page değil → metadata eklenmez (güvenli)
     body = _capture_patch_body(
@@ -134,3 +172,108 @@ def test_chunk_fallback_still_resolves_domain_without_hint():
     kwargs = _run_safe_update(w)
     assert kwargs["domain"] == "x.com"
     assert kwargs["source"] == "fetcher_page"
+
+
+def test_rejected_job_cas_does_not_enqueue_terminal_callback():
+    from workers import ingest_worker as iw
+
+    w = _worker_for_state_callback(chunk_docs=[])
+    w.content_store.update_index_fields.return_value = None
+    ctx = iw.DocumentJobContext(
+        company_id="C1",
+        document_id="D1",
+        job_id="job-stale",
+        user_id=None,
+        trigger="manual",
+        options={},
+    )
+
+    with patch.object(iw, "get_tinnten_server_client") as get_cli:
+        w._safe_update_index_state(
+            ctx, state="completed", stats={"chunkCount": 1}, error=None
+        )
+
+    assert w._callback_queue.empty()
+    get_cli.assert_not_called()
+
+
+def test_index_state_backend_failure_returns_false_and_does_not_callback():
+    from workers import ingest_worker as iw
+
+    w = _worker_for_state_callback(chunk_docs=[])
+    w.content_store.update_index_fields.side_effect = RuntimeError("mongo down")
+    ctx = iw.DocumentJobContext(
+        company_id="C1",
+        document_id="D1",
+        job_id="job-current",
+        user_id=None,
+        trigger="manual",
+        options={},
+    )
+
+    with patch.object(iw, "get_tinnten_server_client") as get_cli:
+        applied = w._safe_update_index_state(
+            ctx, state="completed", stats={"chunkCount": 1}, error=None
+        )
+
+    assert applied is False
+    assert w._callback_queue.empty()
+    get_cli.assert_not_called()
+
+
+def test_queued_callback_is_discarded_when_a_newer_job_is_current():
+    from workers import ingest_worker as iw
+
+    w = _worker_for_state_callback(chunk_docs=[])
+    w.content_store.get_document.return_value = {"index": {"jobId": "job-new"}}
+    ctx = iw.DocumentJobContext(
+        company_id="C1",
+        document_id="D1",
+        job_id="job-old",
+        user_id=None,
+        trigger="manual",
+        options={},
+    )
+
+    with patch.object(iw, "get_tinnten_server_client") as get_cli:
+        w._deliver_index_state_callback(
+            context=ctx,
+            state="completed",
+            stats={"chunkCount": 1},
+            error_msg=None,
+            callback_domain=None,
+            callback_source=None,
+        )
+
+    get_cli.assert_not_called()
+
+
+def test_callback_soft_failure_is_retried(mocker):
+    from workers import ingest_worker as iw
+
+    w = _worker_for_state_callback(chunk_docs=[])
+    w.content_store.get_document.return_value = {"index": {"jobId": "J1"}}
+    ctx = iw.DocumentJobContext(
+        company_id="C1",
+        document_id="D1",
+        job_id="J1",
+        user_id=None,
+        trigger="manual",
+        options={},
+    )
+
+    with patch.object(iw, "get_tinnten_server_client") as get_cli, patch.dict(
+        "os.environ",
+        {"INDEX_STATE_CALLBACK_ATTEMPTS": "3", "INDEX_STATE_CALLBACK_RETRY_SECONDS": "0"},
+    ):
+        get_cli.return_value.update_document_index_state.side_effect = [False, False, True]
+        w._deliver_index_state_callback(
+            context=ctx,
+            state="completed",
+            stats={"chunkCount": 1},
+            error_msg=None,
+            callback_domain=None,
+            callback_source=None,
+        )
+
+    assert get_cli.return_value.update_document_index_state.call_count == 3

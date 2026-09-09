@@ -18,7 +18,7 @@ from urllib.parse import unquote, urlparse
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pika
 import requests
@@ -51,6 +51,12 @@ from services.dynamic_chunking import resolve_dynamic_chunking
 from services.upload_store import UploadStore, UploadNotFoundError
 from services.fetcher_store import FetcherStore
 from services.document_loader import DocumentDownloadError, DocumentParseError
+from services.content_validation import (
+    NonIndexableFileContentError,
+    is_file_backed_source,
+    validate_file_chunk_result,
+    validate_file_extraction,
+)
 from services.email_queue_events import EmbeddingEmailEvents
 from services.error_logger import EmbeddingErrorLogger
 from services.tinnten_server_client import get_tinnten_server_client
@@ -63,6 +69,7 @@ DEFAULT_CHUNK_SIZE = 1200
 DEFAULT_CHUNK_OVERLAP = 200
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_INGEST_LEASE_SECONDS = 900
+DEFAULT_INGEST_REQUEUE_DELAY_SECONDS = 0.25
 # Toplu tüketim: kaç content-index mesajı biriktirilip tek seferde işlenecek ve
 # yarım grup en fazla ne kadar bekletilecek. Grup büyüdükçe FAISS yazımı daha
 # çok dokümana bölünür; fazla büyütmek tek mesajın gecikmesini artırır ve
@@ -84,6 +91,7 @@ DEFAULT_FETCHER_PAGE_LIMIT = 50
 DEFAULT_FETCHER_MAX_TEXT_CHARS = 1_500_000
 DEFAULT_FETCHER_MEDIA_PER_PAGE = 20
 DEFAULT_FETCHER_MEDIA_TEXT_CHARS = 2_000
+INITIAL_UPLOAD_INDEX_TRIGGER = "upload_scan_clean"
 # Tek dokümanın chunk'lanabilecek en uzun metni. `DEFAULT_FETCHER_MAX_TEXT_CHARS`
 # domain-crawl yoluna aittir ve TEKİL dokümanı kapsamaz — bu yüzden 2026-07-30'da
 # 9.999.918 karakterlik tek bir elle.com.tr sayfası buraya kadar geldi, 19 dakika
@@ -146,6 +154,21 @@ def _resolve_user_id(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
     return value or None
 
 
+def _owns_upload_lifecycle(trigger: Any, *, legacy_initial: bool = False) -> bool:
+    """Whether this job may mirror state to the shared Upload record.
+
+    Upload rows describe the initial virus-scan -> parse -> index pipeline and
+    are not versioned by ContentDocument job/attempt.  A later manual reindex
+    therefore must never write `in_progress`, `failed`, or `completed` back to
+    that row: a delayed old job could otherwise overwrite the real upload
+    outcome.  The server gives the one initial owner an explicit trigger.
+    """
+    normalized = str(trigger or "").strip().lower()
+    return normalized == INITIAL_UPLOAD_INDEX_TRIGGER or (
+        legacy_initial and not normalized
+    )
+
+
 def log(msg: str, *args: object) -> None:
     if args:
         try:
@@ -163,6 +186,11 @@ class DocumentJobContext:
     user_id: Optional[str]
     trigger: Optional[str]
     options: Dict[str, Any]
+    attempt: Optional[int] = None
+
+
+class RetryableIngestLockError(RuntimeError):
+    """Transient lock contention/ownership loss; the broker must redeliver."""
 
 
 UPDATE_UNSET = object()
@@ -202,6 +230,23 @@ class IngestWorker:
         # devralınabilir → kalıcı kilit oluşmaz. Uzun dokümanların embed süresinden
         # belirgin uzun olmalı (aksi halde iş bitmeden kilit çalınır).
         self.ingest_lease_seconds = int(os.getenv("INGEST_LEASE_SECONDS") or DEFAULT_INGEST_LEASE_SECONDS)
+        configured_heartbeat = os.getenv("INGEST_LEASE_HEARTBEAT_SECONDS")
+        requested_heartbeat = (
+            float(configured_heartbeat)
+            if configured_heartbeat is not None
+            else max(0.1, self.ingest_lease_seconds / 3.0)
+        )
+        self.ingest_heartbeat_seconds = max(
+            0.1,
+            min(requested_heartbeat, max(0.1, self.ingest_lease_seconds / 2.0)),
+        )
+        self.ingest_requeue_delay_seconds = max(
+            0.0,
+            float(
+                os.getenv("INGEST_LOCK_REQUEUE_DELAY_SECONDS")
+                or DEFAULT_INGEST_REQUEUE_DELAY_SECONDS
+            ),
+        )
         # Faithful schema reindex (Faz 6): fetcher DB-read yolunda schema-derived
         # metni markdown'dan önce kullan. Varsayılan KAPALI → mevcut davranış
         # korunur. Fetcher `Config.INDEX_SCHEMA_MIN_CHARS` ile aynı eşik (80).
@@ -494,6 +539,15 @@ class IngestWorker:
         try:
             self._process_payload(payload)
             self._safe_settle(delivery_tag, ack=True)
+        except RetryableIngestLockError as exc:
+            # A live lease is normal contention, not a terminal document
+            # failure. Preserve the message so it can run after the owner
+            # commits/releases; never poison status or emit failure mail here.
+            log(f"Requeueing transient ingest lock contention: {exc}")
+            delay = float(getattr(self, "ingest_requeue_delay_seconds", 0.0) or 0.0)
+            if delay > 0:
+                time.sleep(delay)
+            self._safe_settle(delivery_tag, ack=False, requeue=True)
         except Exception as exc:  # noqa: BLE001
             self._report_message_failure(payload, exc)
             self._safe_settle(delivery_tag, ack=False, requeue=False)
@@ -571,12 +625,16 @@ class IngestWorker:
         """
         engine = self._engine_for_company(company_id or None)
         acks: List[int] = []
+        requeues: List[int] = []
         try:
             with engine.batch_writes():
                 for delivery_tag, payload in items:
                     try:
                         self._process_payload(payload)
                         acks.append(delivery_tag)
+                    except RetryableIngestLockError as exc:
+                        log(f"Deferring busy ingest message delivery_tag={delivery_tag}: {exc}")
+                        requeues.append(delivery_tag)
                     except Exception as exc:  # noqa: BLE001
                         # Tek mesajın hatası grubu düşürmez: kendi defterini
                         # tutup düşer, kardeşleri işlenmeye devam eder.
@@ -594,10 +652,18 @@ class IngestWorker:
             )
             for delivery_tag in acks:
                 self._safe_settle(delivery_tag, ack=False, requeue=True)
+            for delivery_tag in requeues:
+                self._safe_settle(delivery_tag, ack=False, requeue=True)
             return
 
         for delivery_tag in acks:
             self._safe_settle(delivery_tag, ack=True)
+        if requeues:
+            delay = float(getattr(self, "ingest_requeue_delay_seconds", 0.0) or 0.0)
+            if delay > 0:
+                time.sleep(delay)
+            for delivery_tag in requeues:
+                self._safe_settle(delivery_tag, ack=False, requeue=True)
 
     def _report_message_failure(self, payload: Dict[str, Any], exc: Exception) -> None:
         """Hata kaydını yazar ve doküman(lar)ı 'failed' işaretler (settle ETMEZ)."""
@@ -612,7 +678,38 @@ class IngestWorker:
             if isinstance(payload, dict):
                 doc_id = payload.get("doc_id")
                 if doc_id:
-                    self._get_store().update_document_status(doc_id, status="failed", error=str(exc))
+                    payload_job_id = str(
+                        payload.get("jobId") or payload.get("job_id") or ""
+                    ).strip()
+                    status_applied = self._get_store().update_document_status(
+                        doc_id,
+                        status="failed",
+                        error=str(exc),
+                        expected_job_id=payload_job_id or None,
+                    )
+                    metadata = payload.get("metadata")
+                    metadata = metadata if isinstance(metadata, dict) else {}
+                    upload_id = (
+                        metadata.get("uploadId")
+                        or metadata.get("upload_id")
+                        or payload.get("uploadId")
+                        or payload.get("upload_id")
+                    )
+                    if (
+                        status_applied is not False
+                        and upload_id
+                        and is_file_backed_source(payload.get("source"))
+                        and _owns_upload_lifecycle(
+                            payload.get("trigger"),
+                            legacy_initial=self._is_embedded_chunks_message(payload),
+                        )
+                    ):
+                        self._get_upload_store().update_upload_status(
+                            str(upload_id),
+                            index_status="failed",
+                            is_file_opened=True,
+                            file_open_error=str(exc),
+                        )
                     company_id = self._coalesce(payload, "companyId", "company_id", "companyid")
                     if company_id:
                         self.email_events.send_index_failed(
@@ -641,6 +738,9 @@ class IngestWorker:
                                     user_id=self._coalesce(payload, "userId", "userid", "user_id"),
                                     trigger=self._coalesce(payload, "trigger"),
                                     options={},
+                                    attempt=self._coalesce(
+                                        payload, "attempt", "attemptVersion", "attempt_version"
+                                    ),
                                 ),
                                 state="failed",
                                 error=str(exc),
@@ -685,7 +785,9 @@ class IngestWorker:
         ready_docs: Dict[str, Dict[str, Any]] = {}
         for doc_id, doc in docs.items():
             status = str(doc.get("status") or "").lower()
-            if status in {"ready", "processing"}:
+            # ``processing`` is not terminal. A worker may have died after
+            # setting it and RabbitMQ redelivery must resume the same payload.
+            if status == "ready":
                 ready_docs[doc_id] = doc
         return ready_docs
 
@@ -706,6 +808,16 @@ class IngestWorker:
 
         user_id = self._coalesce(payload, "userId", "user_id", "userid")
         job_id = self._coalesce(payload, "jobId", "job_id")
+        message_job_id = str(job_id).strip() if job_id is not None else ""
+        raw_message_attempt = self._coalesce(
+            payload, "attempt", "attemptVersion", "attempt_version"
+        )
+        message_attempt = None
+        if raw_message_attempt is not None:
+            try:
+                message_attempt = int(raw_message_attempt)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("content-index message attempt must be an integer") from exc
         trigger = self._coalesce(payload, "trigger") or "manual"
         options_override = payload.get("options") or {}
 
@@ -738,6 +850,7 @@ class IngestWorker:
                     user_id=user_id,
                     trigger=trigger,
                     options={},
+                    attempt=message_attempt,
                 )
                 msg = f"Document {doc_id} not found in contentdocuments collection."
                 log(msg)
@@ -754,11 +867,37 @@ class IngestWorker:
 
         for doc_id, document in documents.items():
             doc_index = document.get("index") if isinstance(document, dict) else None
-            doc_job_id = (
-                self._coalesce(doc_index or {}, "jobId", "job_id")
-                or job_id
-                or str(uuid.uuid4())
+            current_job_value = self._coalesce(doc_index or {}, "jobId", "job_id")
+            current_job_id = (
+                str(current_job_value).strip() if current_job_value is not None else ""
             )
+            current_attempt_value = self._coalesce(doc_index or {}, "attempt", "attemptVersion")
+            try:
+                current_attempt = (
+                    int(current_attempt_value) if current_attempt_value is not None else None
+                )
+            except (TypeError, ValueError):
+                current_attempt = None
+
+            # The message identifies the immutable execution attempt.  Never
+            # replace it with the mutable jobId currently stored on the
+            # document: a delayed RabbitMQ delivery for job A may arrive after
+            # job B has already been queued.  Processing A as B would acquire
+            # B's lock and could publish A's result under B's identity.
+            if message_job_id and current_job_id and message_job_id != current_job_id:
+                log(
+                    f"Skipping stale content-index message doc_id={doc_id}: "
+                    f"message_job_id={message_job_id} current_job_id={current_job_id}"
+                )
+                continue
+            if current_attempt is not None and message_attempt != current_attempt:
+                log(
+                    f"Skipping stale/unversioned content-index message doc_id={doc_id}: "
+                    f"message_attempt={message_attempt} current_attempt={current_attempt}"
+                )
+                continue
+
+            doc_job_id = message_job_id or current_job_id or str(uuid.uuid4())
             combined_options = {}
             if isinstance(doc_index, dict) and isinstance(doc_index.get("options"), dict):
                 combined_options.update(doc_index["options"])
@@ -775,9 +914,15 @@ class IngestWorker:
                 user_id=user_id,
                 trigger=trigger,
                 options=normalised_options,
+                attempt=current_attempt,
             )
             try:
                 self._process_single_document(document, context)
+            except RetryableIngestLockError:
+                # Bubble to the delivery handler so the entire RabbitMQ
+                # message is nacked with requeue=True. Swallowing this here
+                # would ACK a job which never ran.
+                raise
             except Exception as exc:  # noqa: BLE001
                 log(f"Failed to process document {doc_id}: {exc}")
                 self._log_worker_error(
@@ -810,6 +955,8 @@ class IngestWorker:
         doc_type = (payload.get("doc_type") or "web").lower()
         source = payload.get("source") or "web"
         metadata = payload.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            raise TypeError("payload 'metadata' must be an object")
         options = normalize_index_options(
             payload.get("options") or {},
             default_chunk_size=self.chunk_size,
@@ -822,8 +969,66 @@ class IngestWorker:
 
         # Idempotency handled later via replace_embeddings
 
-        store.create_document(doc_id=doc_id, doc_type=doc_type, source=source, metadata=metadata)
+        store.create_document(
+            doc_id=doc_id,
+            doc_type=doc_type,
+            source=source,
+            metadata=metadata,
+            company_id=_resolve_company_id(metadata),
+            user_id=_resolve_user_id(metadata),
+            title=str(metadata.get("title") or metadata.get("filename") or "") or None,
+            job_id=str(payload.get("jobId") or payload.get("job_id") or "") or None,
+            status="processing",
+        )
         store.update_document_status(doc_id, status="processing", error=None)
+
+        if any(not isinstance(chunk, dict) for chunk in chunks):
+            raise TypeError("each payload chunk must be an object")
+        preembedded_text = "\n".join(str(chunk.get("text") or "") for chunk in chunks)
+        upload_id = (
+            metadata.get("uploadId")
+            or metadata.get("upload_id")
+            or payload.get("upload_id")
+        )
+        owns_upload_lifecycle = _owns_upload_lifecycle(
+            payload.get("trigger"), legacy_initial=True
+        )
+        try:
+            extraction_metrics = validate_file_extraction(
+                source=source,
+                text=preembedded_text,
+                metadata=metadata,
+                min_chars=int(options.get("minChars") or 80),
+                ocr_enabled=bool(options.get("ocr")),
+            )
+        except NonIndexableFileContentError as exc:
+            store.update_document_status(
+                doc_id,
+                status="failed",
+                chunk_count=0,
+                error=exc.reason,
+            )
+            if upload_id and owns_upload_lifecycle:
+                try:
+                    self._get_upload_store().update_upload_status(
+                        str(upload_id),
+                        index_status="failed",
+                        is_file_opened=True,
+                        file_open_error=exc.reason,
+                        embedding_doc_id=doc_id,
+                    )
+                except Exception as update_exc:  # noqa: BLE001
+                    log(
+                        "WARNING: embedded-chunks upload failure state "
+                        f"could not be persisted uploadId={upload_id}: {update_exc}"
+                    )
+            raise
+
+        if chunks and extraction_metrics.meaningful_chars == 0:
+            store.update_document_status(
+                doc_id, status="failed", chunk_count=0, error="no_extractable_text"
+            )
+            raise ValueError("payload chunks contain no text")
 
         if not chunks:
             store.update_document_status(doc_id, status="ready", chunk_count=0)
@@ -897,6 +1102,14 @@ class IngestWorker:
             chunk_count=len(chunks),
         )
         store.update_document_status(doc_id, status="ready", chunk_count=len(chunks))
+        if upload_id and owns_upload_lifecycle:
+            self._get_upload_store().update_upload_status(
+                str(upload_id),
+                index_status="completed",
+                is_file_opened=True,
+                file_open_error=None,
+                embedding_doc_id=doc_id,
+            )
         log(f"Processed embedded chunks doc_id={doc_id} chunks={len(chunks)}")
 
     # ------------------------------------------------------------------
@@ -907,37 +1120,94 @@ class IngestWorker:
         yarıda kesebilir — biri swap ederken diğerinin "eskiyi temizle" adımı
         yeni sürümü silebilir. Lease'li CAS kilit bunları serialize eder; worker
         ölürse lease dolar ve iş devralınır. RabbitMQ redelivery'si aynı job_id
-        ile geldiğinden kendi kilidini yeniden alır (idempotent).
+        ile gelse bile canlı sahibin yanında paralel çalışmaz; mesaj yeniden
+        kuyruğa bırakılır.
 
         Kilit alma/bırakma bu sarmalayıcıda: asıl gövdenin birden çok `return`
         yolu var, `finally` hepsini kapsar.
         """
+        content_store = self._get_content_store()
         try:
-            acquired = self._get_content_store().try_acquire_ingest_lock(
+            acquired = content_store.try_acquire_ingest_lock(
                 company_id=context.company_id,
                 document_id=context.document_id,
                 job_id=context.job_id,
                 lease_seconds=self.ingest_lease_seconds,
             )
         except Exception as exc:  # noqa: BLE001
-            # Kilit altyapısı patlarsa ingest'i durdurmuyoruz — eski (kilitsiz)
-            # davranışa düşer; swap zaten tek başına idempotent.
-            log(f"WARNING: ingest lock alinamadi doc_id={context.document_id}: {exc}")
-            self._process_single_document_locked(document, context)
-            return
+            # Fail closed. Running without the lock can activate a stale
+            # version and delete a concurrent worker's chunks.
+            raise RetryableIngestLockError(
+                f"ingest lock backend unavailable doc_id={context.document_id}: {exc}"
+            ) from exc
 
         if acquired is None:
-            log(
-                f"Skipping doc_id={context.document_id}: baska bir job kilidi tutuyor "
-                f"(job_id={context.job_id})"
+            raise RetryableIngestLockError(
+                f"ingest lock busy doc_id={context.document_id} job_id={context.job_id}"
             )
-            return
+
+        stop_heartbeat = threading.Event()
+        lost_ownership = threading.Event()
+        heartbeat_interval = float(
+            getattr(
+                self,
+                "ingest_heartbeat_seconds",
+                max(0.1, float(self.ingest_lease_seconds) / 3.0),
+            )
+        )
+
+        def renew_lease() -> None:
+            while not stop_heartbeat.wait(heartbeat_interval):
+                try:
+                    renewed = content_store.renew_ingest_lock(
+                        company_id=context.company_id,
+                        document_id=context.document_id,
+                        job_id=context.job_id,
+                        lease_seconds=self.ingest_lease_seconds,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # The final ownership check remains authoritative. Do not
+                    # publish on a blind heartbeat failure.
+                    log(
+                        f"WARNING: ingest lease renewal failed doc_id={context.document_id}: {exc}"
+                    )
+                    continue
+                if not renewed:
+                    lost_ownership.set()
+                    return
+
+        heartbeat = threading.Thread(
+            target=renew_lease,
+            name=f"IngestLease-{context.document_id}",
+            daemon=True,
+        )
+        heartbeat.start()
+
+        def ownership_guard() -> bool:
+            if lost_ownership.is_set():
+                return False
+            try:
+                return bool(
+                    content_store.owns_ingest_lock(
+                        company_id=context.company_id,
+                        document_id=context.document_id,
+                        job_id=context.job_id,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise RetryableIngestLockError(
+                    f"ingest lock ownership check failed doc_id={context.document_id}: {exc}"
+                ) from exc
 
         try:
-            self._process_single_document_locked(document, context)
+            self._process_single_document_locked(
+                document, context, ownership_guard=ownership_guard
+            )
         finally:
+            stop_heartbeat.set()
+            heartbeat.join(timeout=min(2.0, heartbeat_interval + 0.1))
             try:
-                self._get_content_store().release_ingest_lock(
+                content_store.release_ingest_lock(
                     company_id=context.company_id,
                     document_id=context.document_id,
                     job_id=context.job_id,
@@ -947,7 +1217,11 @@ class IngestWorker:
                 log(f"WARNING: ingest lock birakilamadi doc_id={context.document_id}: {exc}")
 
     def _process_single_document_locked(
-        self, document: Dict[str, Any], context: DocumentJobContext
+        self,
+        document: Dict[str, Any],
+        context: DocumentJobContext,
+        *,
+        ownership_guard: Optional[Callable[[], bool]] = None,
     ) -> None:
         started_at = datetime.now(timezone.utc)
         log(f"Begin document doc_id={context.document_id} company_id={context.company_id} job_id={context.job_id}")
@@ -955,18 +1229,53 @@ class IngestWorker:
         resolved_source = self._resolve_document_source(document, options)
         source_name = str(resolved_source.get("source") or "-")
         base_stats = self._initial_stats(options)
-        self._safe_update_index_state(
+        initial_metadata = dict(resolved_source.get("metadata") or {})
+        initial_metadata.setdefault("companyId", context.company_id)
+        initial_metadata.setdefault("documentId", context.document_id)
+        initial_metadata.setdefault("jobId", context.job_id)
+        if context.user_id:
+            initial_metadata.setdefault("userId", context.user_id)
+        if context.attempt is not None:
+            initial_metadata.setdefault("indexAttempt", context.attempt)
+        try:
+            self._get_store().create_document(
+                doc_id=context.document_id,
+                doc_type=resolved_source.get("doc_type"),
+                source=resolved_source.get("source"),
+                metadata=initial_metadata,
+                company_id=context.company_id,
+                user_id=context.user_id,
+                title=str(
+                    initial_metadata.get("title")
+                    or initial_metadata.get("filename")
+                    or document.get("title")
+                    or document.get("name")
+                    or ""
+                )
+                or None,
+                job_id=context.job_id,
+                status="processing",
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RetryableIngestLockError(
+                f"embedding parent unavailable doc_id={context.document_id}: {exc}"
+            ) from exc
+        started_applied = self._safe_update_index_state(
             context,
-            state="processing",
+            state="indexing",
             stats=base_stats,
             error=None,
             extra={"index.startedAt": started_at},
         )
+        if not started_applied:
+            raise RetryableIngestLockError(
+                f"indexing state ownership lost doc_id={context.document_id}"
+            )
         self._log_document_event(
             context,
             level="info",
             message="Indexing job started.",
-            state="processing",
+            state="indexing",
             details={"options": options},
             verbose=True,
         )
@@ -983,12 +1292,41 @@ class IngestWorker:
         except Exception as exc:  # noqa: BLE001
             finished_at = datetime.now(timezone.utc)
             error_msg = f"Failed to load document content: {exc}"
-            self._safe_update_index_state(
+            update_applied = self._safe_update_index_state(
                 context,
                 state="failed",
                 stats=base_stats,
                 error=error_msg,
                 extra={"index.finishedAt": finished_at},
+            )
+            if not update_applied:
+                raise RetryableIngestLockError(
+                    f"content-load failure state was not persisted "
+                    f"doc_id={context.document_id}"
+                ) from exc
+            try:
+                embedding_failed = self._get_store().update_document_status(
+                    context.document_id,
+                    status="failed",
+                    chunk_count=0,
+                    error=error_msg,
+                    expected_job_id=context.job_id,
+                )
+            except Exception as status_exc:  # noqa: BLE001
+                raise RetryableIngestLockError(
+                    f"embedding content-load failure state was not persisted "
+                    f"doc_id={context.document_id}: {status_exc}"
+                ) from status_exc
+            if embedding_failed is False:
+                raise RetryableIngestLockError(
+                    f"embedding content-load failure ownership lost "
+                    f"doc_id={context.document_id}"
+                ) from exc
+            self._mark_file_source_index_failed(
+                resolved_source=resolved_source,
+                reason=error_msg,
+                document_id=context.document_id,
+                context=context,
             )
             self._log_document_event(context, level="error", message=error_msg, state="failed")
             self._notify_index_failure(
@@ -1013,10 +1351,35 @@ class IngestWorker:
             context,
             level="info",
             message="Document content loaded.",
-            state="processing",
+            state="indexing",
             details={"source": resolved_source.get("source"), "metadataKeys": list(metadata.keys())},
             verbose=True,
         )
+
+        # Persist the authoritative filename/content type returned by the
+        # loader before chunks are exposed through detail endpoints.
+        if ownership_guard is not None and not ownership_guard():
+            raise RetryableIngestLockError(
+                f"ingest lock ownership lost before metadata persist "
+                f"doc_id={context.document_id}"
+            )
+        try:
+            self._get_store().create_document(
+                doc_id=context.document_id,
+                doc_type=resolved_source.get("doc_type"),
+                source=resolved_source.get("source"),
+                metadata=metadata,
+                company_id=context.company_id,
+                user_id=context.user_id,
+                title=str(metadata.get("title") or metadata.get("filename") or "") or None,
+                job_id=context.job_id,
+                status="processing",
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RetryableIngestLockError(
+                f"embedding parent metadata persist failed "
+                f"doc_id={context.document_id}: {exc}"
+            ) from exc
 
         if options.get("cleanup"):
             text = self._cleanup_text(text)
@@ -1029,6 +1392,13 @@ class IngestWorker:
                 log(f"Detected language for doc_id={context.document_id}: {detected_lang}")
 
         try:
+            extraction_metrics = validate_file_extraction(
+                source=resolved_source["source"],
+                text=text,
+                metadata=metadata,
+                min_chars=int(options.get("minChars") or 80),
+                ocr_enabled=bool(options.get("ocr")),
+            )
             stats = self._chunk_and_embed(
                 doc_id=context.document_id,
                 company_id=context.company_id,
@@ -1037,16 +1407,137 @@ class IngestWorker:
                 metadata=metadata,
                 text=text,
                 options=options,
+                ownership_guard=ownership_guard,
+                expected_job_id=context.job_id,
             )
+            validate_file_chunk_result(
+                source=resolved_source["source"],
+                chunk_count=stats.get("chunkCount"),
+                metrics=extraction_metrics,
+                metadata=metadata,
+            )
+        except RetryableIngestLockError:
+            # Ownership loss is not a terminal content failure. The new owner
+            # (or this message after redelivery) must decide final state.
+            raise
+        except NonIndexableFileContentError as exc:
+            finished_at = datetime.now(timezone.utc)
+            failure_stats = dict(base_stats)
+            failure_stats.update(
+                {
+                    "extractedCharCount": exc.metrics.extracted_chars,
+                    "meaningfulCharCount": exc.metrics.meaningful_chars,
+                    "failureReason": exc.reason,
+                }
+            )
+            update_applied = self._safe_update_index_state(
+                context,
+                state="failed",
+                stats=failure_stats,
+                error=exc.reason,
+                extra={"index.finishedAt": finished_at},
+            )
+            if not update_applied:
+                raise RetryableIngestLockError(
+                    f"validation failure state was not persisted "
+                    f"doc_id={context.document_id}"
+                ) from exc
+            try:
+                embedding_failed = self._get_store().update_document_status(
+                    context.document_id,
+                    status="failed",
+                    chunk_count=0,
+                    error=exc.reason,
+                    expected_job_id=context.job_id,
+                )
+            except Exception as status_exc:  # noqa: BLE001
+                raise RetryableIngestLockError(
+                    f"embedding validation failure state was not persisted "
+                    f"doc_id={context.document_id}: {status_exc}"
+                ) from status_exc
+            if embedding_failed is False:
+                raise RetryableIngestLockError(
+                    f"embedding validation failure ownership lost "
+                    f"doc_id={context.document_id}"
+                ) from exc
+            self._mark_file_source_index_failed(
+                resolved_source=resolved_source,
+                reason=exc.reason,
+                document_id=context.document_id,
+                context=context,
+            )
+            self._log_document_event(
+                context,
+                level="error",
+                message=f"File content is not indexable: {exc.reason}",
+                state="failed",
+                details={
+                    "reason": exc.reason,
+                    "source": resolved_source["source"],
+                    "filename": exc.filename,
+                    "contentType": exc.content_type,
+                    "extractedChars": exc.metrics.extracted_chars,
+                    "meaningfulChars": exc.metrics.meaningful_chars,
+                    "minChars": exc.metrics.min_chars,
+                },
+            )
+            self._notify_index_failure(
+                context=context,
+                source=source_name,
+                stage="content_validation",
+                exc=exc,
+            )
+            self._log_worker_error(
+                "file_content_not_indexable",
+                exc=exc,
+                context={
+                    "companyId": context.company_id,
+                    "documentId": context.document_id,
+                    "jobId": context.job_id,
+                    "source": source_name,
+                    "reason": exc.reason,
+                    "extractedChars": exc.metrics.extracted_chars,
+                    "meaningfulChars": exc.metrics.meaningful_chars,
+                },
+            )
+            raise
         except Exception as exc:  # noqa: BLE001
             finished_at = datetime.now(timezone.utc)
             error_msg = f"Embedding failed: {exc}"
-            self._safe_update_index_state(
+            update_applied = self._safe_update_index_state(
                 context,
                 state="failed",
                 stats=base_stats,
                 error=error_msg,
                 extra={"index.finishedAt": finished_at},
+            )
+            if not update_applied:
+                raise RetryableIngestLockError(
+                    f"embedding failure state was not persisted "
+                    f"doc_id={context.document_id}"
+                ) from exc
+            try:
+                embedding_failed = self._get_store().update_document_status(
+                    context.document_id,
+                    status="failed",
+                    chunk_count=0,
+                    error=error_msg,
+                    expected_job_id=context.job_id,
+                )
+            except Exception as status_exc:  # noqa: BLE001
+                raise RetryableIngestLockError(
+                    f"embedding failure state was not persisted "
+                    f"doc_id={context.document_id}: {status_exc}"
+                ) from status_exc
+            if embedding_failed is False:
+                raise RetryableIngestLockError(
+                    f"embedding failure ownership lost doc_id={context.document_id}"
+                ) from exc
+            self._mark_file_source_index_failed(
+                resolved_source=resolved_source,
+                reason=error_msg,
+                document_id=context.document_id,
+                context=context,
             )
             self._log_document_event(context, level="error", message=error_msg, state="failed")
             self._notify_index_failure(
@@ -1072,7 +1563,7 @@ class IngestWorker:
             context,
             level="info",
             message=f"Embedding completed with {stats['chunkCount']} chunks.",
-            state="processing",
+            state="indexing",
             details={"chunks": stats["chunkCount"], "tokenCount": stats["tokenCount"], "charCount": stats["charCount"]},
             verbose=True,
         )
@@ -1090,7 +1581,24 @@ class IngestWorker:
                 "minChars": options.get("minChars"),
             }
         )
-        self._safe_update_index_state(
+        try:
+            embedding_ready = self._get_store().update_document_status(
+                context.document_id,
+                status="ready",
+                chunk_count=int(stats.get("chunkCount") or 0),
+                error=None,
+                expected_job_id=context.job_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RetryableIngestLockError(
+                f"embedding ready state persist failed doc_id={context.document_id}: {exc}"
+            ) from exc
+        if embedding_ready is False:
+            raise RetryableIngestLockError(
+                f"embedding ready ownership lost doc_id={context.document_id}"
+            )
+
+        update_applied = self._safe_update_index_state(
             context,
             state="completed",
             stats=stats_with_flags,
@@ -1101,6 +1609,16 @@ class IngestWorker:
             # payload'ı metadata.domain taşır).
             callback_domain=metadata.get("domain") or metadata.get("fetcherDomain"),
             callback_source=str(metadata.get("source") or context.trigger or "") or None,
+        )
+        if not update_applied:
+            raise RetryableIngestLockError(
+                f"completion ownership lost doc_id={context.document_id} "
+                f"job_id={context.job_id}"
+            )
+        self._mark_file_source_index_completed(
+            resolved_source=resolved_source,
+            document_id=context.document_id,
+            context=context,
         )
         self._log_document_event(
             context,
@@ -1117,6 +1635,67 @@ class IngestWorker:
             stats=stats_with_flags,
             finished_at=finished_at,
         )
+
+    def _mark_file_source_index_failed(
+        self,
+        *,
+        resolved_source: Dict[str, Any],
+        reason: str,
+        document_id: str,
+        context: DocumentJobContext,
+    ) -> None:
+        """Mirror terminal extraction failures to the upload record when present."""
+        if (
+            not is_file_backed_source(resolved_source.get("source"))
+            or not _owns_upload_lifecycle(context.trigger)
+        ):
+            return
+        upload_id = resolved_source.get("upload_id")
+        if not upload_id:
+            return
+        try:
+            self._get_upload_store().update_upload_status(
+                str(upload_id),
+                index_status="failed",
+                is_file_opened=True,
+                file_open_error=reason,
+                embedding_doc_id=document_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log(
+                "WARNING: upload failure state could not be persisted "
+                f"uploadId={upload_id}: {exc}"
+            )
+
+    def _mark_file_source_index_completed(
+        self,
+        *,
+        resolved_source: Dict[str, Any],
+        document_id: str,
+        context: DocumentJobContext,
+    ) -> None:
+        """Mirror success only after chunk activation and terminal CAS succeed."""
+        if (
+            not is_file_backed_source(resolved_source.get("source"))
+            or not _owns_upload_lifecycle(context.trigger)
+        ):
+            return
+        upload_id = resolved_source.get("upload_id")
+        if not upload_id:
+            return
+        try:
+            self._get_upload_store().update_upload_status(
+                str(upload_id),
+                index_status="completed",
+                is_file_opened=True,
+                file_open_error=None,
+                embedding_doc_id=document_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log(
+                "WARNING: upload completion state could not be persisted "
+                f"uploadId={upload_id}: {exc}"
+            )
 
     # ------------------------------------------------------------------
     def _load_document_content(
@@ -1213,13 +1792,15 @@ class IngestWorker:
         file_doc = self._get_upload_store().get_file_by_upload_id(upload_id)
         bucket, key, filename = self._resolve_s3_location(upload_doc, file_doc)
 
-        self._get_upload_store().update_upload_status(
-            upload_id,
-            index_status="in_progress",
-            is_file_opened=False,
-            file_open_error=None,
-            embedding_doc_id=context.document_id,
-        )
+        owns_upload_lifecycle = _owns_upload_lifecycle(context.trigger)
+        if owns_upload_lifecycle:
+            self._get_upload_store().update_upload_status(
+                upload_id,
+                index_status="in_progress",
+                is_file_opened=False,
+                file_open_error=None,
+                embedding_doc_id=context.document_id,
+            )
 
         download_retries = int(os.getenv("UPLOAD_DOWNLOAD_RETRIES") or DEFAULT_UPLOAD_DOWNLOAD_RETRIES)
         download_delay = float(
@@ -1241,7 +1822,9 @@ class IngestWorker:
                 )
                 time.sleep(download_delay)
             try:
-                document = self._get_loader().fetch_text(key, bucket=bucket)
+                document = self._get_loader().fetch_text(
+                    key, bucket=bucket, filename_hint=filename
+                )
                 last_exc = None
                 break
             except DocumentParseError as exc:
@@ -1256,30 +1839,48 @@ class IngestWorker:
 
         if document is None:
             error_text = str(last_exc) if last_exc is not None else "unknown download error"
-            self._get_upload_store().update_upload_status(
-                upload_id,
-                index_status="failed",
-                is_file_opened=False,
-                file_open_error=error_text,
-            )
+            if owns_upload_lifecycle:
+                self._get_upload_store().update_upload_status(
+                    upload_id,
+                    index_status="failed",
+                    is_file_opened=False,
+                    file_open_error=error_text,
+                )
             if last_exc is not None:
                 raise last_exc
             raise DocumentDownloadError(error_text)
 
         combined_metadata = dict(metadata)
-        combined_metadata.setdefault("uploadId", upload_id)
-        combined_metadata.setdefault("bucket", document.bucket)
-        combined_metadata.setdefault("key", document.key)
-        combined_metadata.setdefault("filename", document.filename or filename)
+        combined_metadata["uploadId"] = upload_id
+        combined_metadata["bucket"] = document.bucket
+        combined_metadata["key"] = document.key
+        combined_metadata["storageKey"] = document.key
+        # Prefer the original upload filename (when available) over an opaque
+        # S3 key, but never retain an unrelated API URL/path supplied by an old
+        # ContentDocument metadata object.
+        authoritative_filename = str(filename or document.filename or "").strip()
+        if authoritative_filename:
+            combined_metadata["filename"] = authoritative_filename
+            suffix = os.path.splitext(authoritative_filename)[1].lstrip(".").lower()
+            if suffix and not (
+                combined_metadata.get("detectedExt")
+                or combined_metadata.get("detected_ext")
+            ):
+                combined_metadata["extension"] = suffix
         if document.content_type:
-            combined_metadata.setdefault("contentType", document.content_type)
+            combined_metadata["contentType"] = document.content_type
 
-        self._get_upload_store().update_upload_status(
-            upload_id,
-            index_status="completed",
-            is_file_opened=True,
-            file_open_error=None,
-        )
+        # Parsing succeeded, but embedding/swap has not. Keep the upload in a
+        # non-terminal state until `_process_single_document_locked` commits
+        # the active chunk version and its current-job CAS.
+        if owns_upload_lifecycle:
+            self._get_upload_store().update_upload_status(
+                upload_id,
+                index_status="in_progress",
+                is_file_opened=True,
+                file_open_error=None,
+                embedding_doc_id=context.document_id,
+            )
         return document.text, combined_metadata
 
     def _load_fetcher_crawl_text(
@@ -1763,6 +2364,8 @@ class IngestWorker:
         embeddings: "np.ndarray",
         build_chunk_docs,
         chunk_count: int,
+        ownership_guard: Optional[Callable[[], bool]] = None,
+        expected_job_id: Optional[str] = None,
     ) -> str:
         """Yeni chunk sürümünü ATOMİK-BENZERİ biçimde devreye alır.
 
@@ -1791,8 +2394,21 @@ class IngestWorker:
             # 2) Yeni chunk'lar Mongo'ya, yeni sürüm etiketiyle.
             chunk_docs = build_chunk_docs(faiss_ids, version)
             store.insert_chunks(chunk_docs)
+            # The lease can be lost while parsing/encoding. Check immediately
+            # before the only visibility-changing write; never let a stale
+            # worker activate its version and clean a newer owner's chunks.
+            if ownership_guard is not None and not ownership_guard():
+                raise RetryableIngestLockError(
+                    f"ingest lock ownership lost before activation doc_id={doc_id}"
+                )
             # 3) Görünürlüğü çevir: arama artık yalnız bu sürümü görür.
-            store.set_active_ingest_version(doc_id, version)
+            activated = store.set_active_ingest_version(
+                doc_id, version, expected_job_id=expected_job_id
+            )
+            if activated is False:
+                raise RetryableIngestLockError(
+                    f"embedding document ownership lost before activation doc_id={doc_id}"
+                )
         except Exception:
             # Telafi: yeni sürüm asla aktif olmadı → eski sürüm sağlam. Yeni
             # yazdıklarımızı geri alıp hatayı yukarı bırakıyoruz.
@@ -1842,6 +2458,8 @@ class IngestWorker:
         metadata: Dict[str, Any],
         text: str,
         options: Dict[str, Any],
+        ownership_guard: Optional[Callable[[], bool]] = None,
+        expected_job_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         options = resolve_dynamic_chunking(options, len(text or ""))
         chunk_size = int(options.get("chunkSize") or self.chunk_size)
@@ -1874,6 +2492,28 @@ class IngestWorker:
                 overlap=chunk_overlap,
                 min_chars=min_chars,
             )
+        effective_min_chars = min_chars
+        # `minChars` artıklarının elenmesi içindir; asgari belge boyutu değildir.
+        # Gerçek fakat kısa bir yükleme de tek chunk olarak aranabilir olmalı.
+        # Web/fetcher kaynaklarının mevcut 0-chunk davranışı aynen korunur.
+        if not chunks and is_file_backed_source(source) and str(text or "").strip():
+            effective_min_chars = 1
+            if strategy == "structure":
+                chunks = chunk_markdown_structure(
+                    text,
+                    chunk_size=chunk_size,
+                    overlap=chunk_overlap,
+                    min_chars=effective_min_chars,
+                    title=md.get("title"),
+                    url=md.get("url"),
+                )
+            else:
+                chunks = chunk_text(
+                    text,
+                    chunk_size=chunk_size,
+                    overlap=chunk_overlap,
+                    min_chars=effective_min_chars,
+                )
         if not chunks:
             return {
                 "chunkCount": 0,
@@ -1882,6 +2522,7 @@ class IngestWorker:
                 "chunkSize": chunk_size,
                 "chunkOverlap": chunk_overlap,
                 "minChars": min_chars,
+                "effectiveMinChars": effective_min_chars,
             }
 
         engine = self._engine_for_company(company_id)
@@ -1930,6 +2571,8 @@ class IngestWorker:
             embeddings=embeddings,
             build_chunk_docs=build_chunk_docs,
             chunk_count=len(chunks),
+            ownership_guard=ownership_guard,
+            expected_job_id=expected_job_id,
         )
         return {
             "chunkCount": len(chunks),
@@ -1938,6 +2581,7 @@ class IngestWorker:
             "chunkSize": chunk_size,
             "chunkOverlap": chunk_overlap,
             "minChars": min_chars,
+            "effectiveMinChars": effective_min_chars,
             "chunkMode": options.get("chunkMode") or "manual",
             "chunkPolicy": options.get("chunkPolicy"),
             "chunkCharacterCount": options.get("chunkCharacterCount") or len(text or ""),
@@ -2005,6 +2649,13 @@ class IngestWorker:
             overlap=chunk_overlap,
             min_chars=min_chars,
         )
+        if not chunks and is_file_backed_source(source) and str(text or "").strip():
+            chunks = chunk_text(
+                text,
+                chunk_size=chunk_size,
+                overlap=chunk_overlap,
+                min_chars=1,
+            )
         if not chunks:
             self._get_store().update_document_status(doc_id, status="ready", chunk_count=0)
             return
@@ -2077,7 +2728,9 @@ class IngestWorker:
         )
 
         try:
-            document = self._get_loader().fetch_text(key, bucket=bucket)
+            document = self._get_loader().fetch_text(
+                key, bucket=bucket, filename_hint=filename
+            )
         except (DocumentDownloadError, DocumentParseError) as exc:
             self._get_store().update_document_status(doc_id, status="failed", error=str(exc))
             self._get_upload_store().update_upload_status(
@@ -2097,6 +2750,13 @@ class IngestWorker:
             combined_metadata.setdefault("content_type", document.content_type)
 
         try:
+            validate_file_extraction(
+                source="upload",
+                text=document.text,
+                metadata=combined_metadata,
+                min_chars=min_chars,
+                ocr_enabled=False,
+            )
             self._ingest_text_legacy(
                 doc_id=doc_id,
                 doc_type="document",
@@ -2107,6 +2767,20 @@ class IngestWorker:
                 chunk_overlap=chunk_overlap,
                 min_chars=min_chars,
             )
+        except NonIndexableFileContentError as exc:
+            self._get_store().update_document_status(
+                doc_id,
+                status="failed",
+                chunk_count=0,
+                error=exc.reason,
+            )
+            self._get_upload_store().update_upload_status(
+                upload_id,
+                index_status="failed",
+                is_file_opened=True,
+                file_open_error=exc.reason,
+            )
+            raise
         except Exception as exc:  # noqa: BLE001
             self._get_upload_store().update_upload_status(
                 upload_id,
@@ -2387,7 +3061,8 @@ class IngestWorker:
         extra: Optional[Dict[str, Any]] = None,
         callback_domain: Optional[str] = None,
         callback_source: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
+        update_applied = False
         try:
             update_kwargs: Dict[str, Any] = {
                 "company_id": context.company_id,
@@ -2404,7 +3079,14 @@ class IngestWorker:
                 update_kwargs["stats"] = stats
             if error is not UPDATE_UNSET:
                 update_kwargs["error"] = error
-            self._get_content_store().update_index_fields(**update_kwargs)
+            updated = self._get_content_store().update_index_fields(**update_kwargs)
+            if updated is None:
+                log(
+                    f"Skipping stale index state update for {context.document_id}: "
+                    f"job_id={context.job_id} state={state}"
+                )
+            else:
+                update_applied = True
         except Exception as exc:  # noqa: BLE001
             log(f"Failed to update index state for {context.document_id}: {exc}")
 
@@ -2413,7 +3095,7 @@ class IngestWorker:
         # çıkarıldı. Bu bildirim best-effort (hatası zaten yutuluyordu), o yüzden
         # turu bekletmesi gereksizdi; senkronken doküman başına ölçülebilir
         # gecikme ekliyordu. Sıra korunur: tek tüketici thread, FIFO kuyruk.
-        if state in ("completed", "failed", "indexing"):
+        if update_applied and state in ("completed", "failed", "indexing"):
             self._submit_index_state_callback(
                 context=context,
                 state=state,
@@ -2422,6 +3104,7 @@ class IngestWorker:
                 callback_domain=callback_domain,
                 callback_source=callback_source,
             )
+        return update_applied
 
     # ------------------------------------------------------------------
     def _ensure_callback_worker(self) -> None:
@@ -2474,6 +3157,35 @@ class IngestWorker:
         callback_source: Optional[str],
     ) -> None:
         try:
+            # A callback may wait in the async queue while a newer ingest is
+            # enqueued.  Re-check the document before notifying the server so
+            # a terminal callback from the old job cannot overwrite the new
+            # job's visible state.  Missing jobId is retained for legacy rows;
+            # lookup failures keep the existing best-effort callback behavior.
+            try:
+                current_document = self._get_content_store().get_document(
+                    context.company_id, context.document_id
+                )
+                if isinstance(current_document, dict):
+                    current_index = current_document.get("index") or {}
+                    current_job_value = self._coalesce(current_index, "jobId", "job_id")
+                    current_job_id = (
+                        str(current_job_value).strip()
+                        if current_job_value is not None
+                        else ""
+                    )
+                    if current_job_id and current_job_id != str(context.job_id):
+                        log(
+                            f"[callback] Skipping stale state for {context.document_id}: "
+                            f"callback_job_id={context.job_id} current_job_id={current_job_id}"
+                        )
+                        return
+            except Exception as freshness_exc:  # noqa: BLE001
+                log(
+                    f"WARNING: [callback] could not verify current job for "
+                    f"{context.document_id}: {freshness_exc}"
+                )
+
             server_client = get_tinnten_server_client()
 
             # Per-sayfa (fetcher_page/initial) doc'ları website ENTRY'sine
@@ -2515,16 +3227,30 @@ class IngestWorker:
                 except Exception:  # noqa: BLE001
                     pass
 
-            server_client.update_document_index_state(
-                document_id=context.document_id,
-                state=state,
-                error_msg=error_msg,
-                stats=stats if isinstance(stats, dict) else None,
-                company_id=context.company_id,
-                domain=page_domain,
-                source=page_source,
-                domain_chunks=domain_chunks,
-                job_id=context.job_id,
+            attempts = max(1, int(os.getenv("INDEX_STATE_CALLBACK_ATTEMPTS") or 3))
+            retry_delay = max(
+                0.0, float(os.getenv("INDEX_STATE_CALLBACK_RETRY_SECONDS") or 0.25)
+            )
+            for attempt in range(1, attempts + 1):
+                delivered = server_client.update_document_index_state(
+                    document_id=context.document_id,
+                    state=state,
+                    error_msg=error_msg,
+                    stats=stats if isinstance(stats, dict) else None,
+                    company_id=context.company_id,
+                    domain=page_domain,
+                    source=page_source,
+                    domain_chunks=domain_chunks,
+                    job_id=context.job_id,
+                    attempt=context.attempt,
+                )
+                if delivered:
+                    return
+                if attempt < attempts and retry_delay:
+                    time.sleep(retry_delay)
+            log(
+                f"[callback] Tinnten-server rejected/unavailable after {attempts} "
+                f"attempt(s) for {context.document_id} job_id={context.job_id}"
             )
         except Exception as cb_exc:  # noqa: BLE001
             log(f"[callback] Failed to notify tinnten-server for {context.document_id}: {cb_exc}")
@@ -2655,13 +3381,43 @@ class IngestWorker:
         if isinstance(file_doc, dict):
             candidates.append(file_doc)
 
+        # Filename and object key need not live in the same subdocument. Node
+        # commonly stores an opaque key below upload.file but the original
+        # name (and therefore the real extension) in the files row.
+        name_sources: List[Dict[str, Any]] = []
+        if isinstance(file_doc, dict):
+            name_sources.append(file_doc)
+        if isinstance(upload_doc, dict):
+            name_sources.append(upload_doc)
+            name_sources.extend(
+                blob
+                for blob in (upload_doc.get("file"), upload_doc.get("data"))
+                if isinstance(blob, dict)
+            )
+        filename_candidates: List[str] = []
+        for blob in name_sources:
+            for field in (
+                "originalname",
+                "originalName",
+                "fileName",
+                "filename",
+                "name",
+            ):
+                value = str(blob.get(field) or "").strip()
+                if value and value not in filename_candidates:
+                    filename_candidates.append(value)
+        preferred_filename = next(
+            (value for value in filename_candidates if os.path.splitext(value)[1]),
+            filename_candidates[0] if filename_candidates else "",
+        )
+
         for blob in candidates:
             if not isinstance(blob, dict):
                 continue
             bucket = self._extract_bucket(blob, bucket_default)
             key = self._extract_s3_key(blob, bucket)
             if key:
-                filename = blob.get("filename") or blob.get("originalname") or os.path.basename(key)
+                filename = preferred_filename or os.path.basename(key)
                 return bucket, key, filename
 
         if not bucket_default:

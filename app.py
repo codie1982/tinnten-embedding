@@ -25,6 +25,7 @@ from services import (
     UploadStore,
     UploadNotFoundError,
     ContentDocumentStore,
+    IndexJobConflictError,
     normalize_index_options,
 )
 from services.company_index import (
@@ -1333,6 +1334,27 @@ def _resolve_upload_s3_location(upload_doc, file_doc):
     if isinstance(file_doc, dict):
         candidates.append(file_doc)
 
+    name_sources = []
+    if isinstance(file_doc, dict):
+        name_sources.append(file_doc)
+    if isinstance(upload_doc, dict):
+        name_sources.append(upload_doc)
+        name_sources.extend(
+            blob
+            for blob in (upload_doc.get("file"), upload_doc.get("data"))
+            if isinstance(blob, dict)
+        )
+    filename_candidates = []
+    for blob in name_sources:
+        for field in ("originalname", "originalName", "fileName", "filename", "name"):
+            value = str(blob.get(field) or "").strip()
+            if value and value not in filename_candidates:
+                filename_candidates.append(value)
+    preferred_filename = next(
+        (value for value in filename_candidates if os.path.splitext(value)[1]),
+        filename_candidates[0] if filename_candidates else "",
+    )
+
     for blob in candidates:
         if not isinstance(blob, dict):
             continue
@@ -1344,7 +1366,7 @@ def _resolve_upload_s3_location(upload_doc, file_doc):
         )
         key = blob.get("key") or blob.get("Key") or blob.get("path") or blob.get("s3Key")
         if key:
-            filename = blob.get("filename") or blob.get("originalname") or os.path.basename(key)
+            filename = preferred_filename or os.path.basename(key)
             return bucket, key, filename
 
     if not bucket_default:
@@ -3135,8 +3157,36 @@ def get_vector_document_legacy(doc_id: str):
     response = _serialize_chunk_document(doc)
     include_chunks = (request.args.get("include_chunks") or "").strip().lower() in {"1", "true", "yes"}
     if include_chunks:
-        chunks = chunk_store.get_chunks_by_doc(doc_id)
-        response["chunks"] = [_serialize_chunk_entry(chunk) for chunk in chunks]
+        raw_page = request.args.get("page")
+        raw_limit = request.args.get("limit")
+        if raw_page is not None or raw_limit is not None:
+            try:
+                page = max(1, int(raw_page or 1))
+                limit = min(100, max(1, int(raw_limit or 20)))
+            except (TypeError, ValueError):
+                return jsonify({"error": "page and limit must be integers"}), 400
+            chunk_page = chunk_store.get_chunks_page_by_doc(
+                doc_id,
+                page=page,
+                limit=limit,
+                query=request.args.get("q") or "",
+            )
+            response["chunks"] = [_serialize_chunk_entry(chunk) for chunk in chunk_page["chunks"]]
+            response["previous_chunk"] = (
+                _serialize_chunk_entry(chunk_page["previous_chunk"])
+                if chunk_page["previous_chunk"]
+                else None
+            )
+            response["total"] = chunk_page["total"]
+            response["document_total"] = chunk_page["document_total"]
+            response["page"] = chunk_page["page"]
+            response["limit"] = chunk_page["limit"]
+            response["total_pages"] = chunk_page["total_pages"]
+        else:
+            # Legacy callers keep receiving the complete list when no paging
+            # parameters are supplied.
+            chunks = chunk_store.get_chunks_by_doc(doc_id)
+            response["chunks"] = [_serialize_chunk_entry(chunk) for chunk in chunks]
     return jsonify(response)
 
 
@@ -3427,6 +3477,7 @@ def _publish_content_index_message(
     trigger: str,
     job_id: str,
     user_id: str | None,
+    attempt: int | None = None,
 ) -> str | None:
     message = {
         "companyId": company_id,
@@ -3437,6 +3488,8 @@ def _publish_content_index_message(
     }
     if user_id:
         message["userId"] = user_id
+    if attempt is not None:
+        message["attempt"] = int(attempt)
 
     app.logger.info(
         "Publishing content index job (queue=%s companyId=%s documentId=%s jobId=%s)",
@@ -3505,6 +3558,18 @@ def _queue_content_index_payload(payload: dict, *, default_trigger: str) -> tupl
     else:
         job_id = str(uuid.uuid4())
 
+    raw_attempt = _get_payload_value(
+        payload, "attempt", "attemptVersion", "attempt_version"
+    )
+    attempt = None
+    if raw_attempt is not None:
+        try:
+            attempt = int(raw_attempt)
+        except (TypeError, ValueError):
+            return jsonify({"error": "attempt must be a positive integer"}), 400
+        if attempt < 1:
+            return jsonify({"error": "attempt must be a positive integer"}), 400
+
     raw_options = payload.get("indexOptions") or payload.get("options") or {}
     try:
         options = normalize_index_options(
@@ -3541,15 +3606,70 @@ def _queue_content_index_payload(payload: dict, *, default_trigger: str) -> tupl
     if isinstance(existing_doc, dict) and isinstance(existing_doc.get("metadata"), dict):
         metadata.update(existing_doc["metadata"])
     metadata.update(metadata_payload)
-    metadata.setdefault("companyId", company_id)
-    metadata.setdefault("documentId", document_id)
 
-    upload_id = _get_payload_value(payload, "uploadId", "upload_id", "uploadid")
-    if not upload_id and isinstance(existing_doc, dict):
-        upload_id = _get_payload_value(existing_doc, "uploadId", "upload_id", "uploadid")
+    # Identity and tenancy fields are not caller-defined metadata.  Search has
+    # to read legacy chunks through ``metadata.companyId`` as well as the
+    # canonical top-level field, so retaining a stale/injected value here can
+    # make one company's chunk visible to another company's query.  Stamp the
+    # request/document identity authoritatively and remove aliases which could
+    # otherwise disagree with it.
+    for alias in (
+        "companyId", "company_id", "companyid",
+        "documentId", "document_id", "documentid",
+        "userId", "user_id", "userid",
+        "jobId", "job_id",
+        "indexAttempt", "attempt", "attemptVersion", "attempt_version",
+    ):
+        metadata.pop(alias, None)
+    if company_id:
+        metadata["companyId"] = company_id
+    metadata["documentId"] = document_id
+    metadata["jobId"] = job_id
+    if attempt is not None:
+        metadata["indexAttempt"] = attempt
+
+    authoritative_user_id = None
+    if isinstance(existing_doc, dict):
+        authoritative_user_id = _get_payload_value(
+            existing_doc, "userId", "user_id", "userid"
+        )
+    authoritative_user_id = authoritative_user_id or user_id
+    if authoritative_user_id:
+        authoritative_user_id = str(authoritative_user_id)
+        metadata["userId"] = authoritative_user_id
+        user_id = authoritative_user_id
+
+    # Existing ContentDocument scope is server-owned.  For a new direct
+    # document the supplied metadata remains the only available scope hint;
+    # once a row exists its top-level value wins over stale legacy metadata.
+    for canonical, aliases in (
+        ("spaceId", ("spaceId", "space_id", "spaceid")),
+        ("collectionId", ("collectionId", "collection_id", "collectionid")),
+        ("fileId", ("fileId", "file_id", "fileid")),
+    ):
+        supplied = next((metadata_payload.get(key) for key in aliases if metadata_payload.get(key)), None)
+        stored = (
+            _get_payload_value(existing_doc, *aliases)
+            if isinstance(existing_doc, dict)
+            else None
+        )
+        for alias in aliases:
+            metadata.pop(alias, None)
+        resolved = stored or supplied
+        if resolved:
+            metadata[canonical] = str(resolved)
+
+    requested_upload_id = _get_payload_value(payload, "uploadId", "upload_id", "uploadid")
+    stored_upload_id = (
+        _get_payload_value(existing_doc, "uploadId", "upload_id", "uploadid")
+        if isinstance(existing_doc, dict)
+        else None
+    )
+    if stored_upload_id and requested_upload_id and str(stored_upload_id) != str(requested_upload_id):
+        return jsonify({"error": "uploadId does not match the existing document"}), 409
+    upload_id = stored_upload_id or requested_upload_id
     if upload_id:
         upload_id = str(upload_id)
-        metadata.setdefault("uploadId", upload_id)
 
     text = payload.get("text")
     if text is not None and not isinstance(text, str):
@@ -3584,6 +3704,14 @@ def _queue_content_index_payload(payload: dict, *, default_trigger: str) -> tupl
             return jsonify({"error": "url cannot be empty"}), 400
         source = {"type": "import_url", "url": trimmed_url}
         metadata.setdefault("url", trimmed_url)
+    elif (
+        isinstance(existing_index, dict)
+        and isinstance(existing_index.get("source"), dict)
+    ):
+        # The Node model owns top-level `source` as a string enum. Embedding
+        # request details live below index.source, so a later reindex without
+        # an explicit source must read the canonical nested value.
+        source = dict(existing_index["source"])
     elif isinstance(existing_doc, dict) and isinstance(existing_doc.get("source"), dict):
         source = dict(existing_doc["source"])
     else:
@@ -3616,8 +3744,13 @@ def _queue_content_index_payload(payload: dict, *, default_trigger: str) -> tupl
         source_upload_id = str(source_upload_id or "").strip()
         if not source_upload_id:
             return jsonify({"error": "upload source requires uploadId"}), 400
+        if upload_id and source_upload_id != upload_id:
+            return jsonify({"error": "upload source does not match document uploadId"}), 409
+        upload_id = upload_id or source_upload_id
         source["uploadId"] = source_upload_id
-        metadata.setdefault("uploadId", source_upload_id)
+        for alias in ("uploadId", "upload_id", "uploadid"):
+            metadata.pop(alias, None)
+        metadata["uploadId"] = source_upload_id
 
     if source_type == "text":
         source_text = source.get("text")
@@ -3714,7 +3847,23 @@ def _queue_content_index_payload(payload: dict, *, default_trigger: str) -> tupl
             trigger=trigger,
             title=title,
             doc_type=doc_type,
+            attempt=attempt,
+            expected_job_id=(
+                existing_index.get("jobId")
+                if isinstance(existing_index, dict)
+                else None
+            ),
         )
+    except IndexJobConflictError as exc:
+        return jsonify({
+            "error": "a newer index request already owns this document",
+            "queued": False,
+            "documentId": document_id,
+            "jobId": job_id,
+            "currentJobId": exc.current_job_id,
+            "currentAttempt": exc.current_attempt,
+            "state": "superseded",
+        }), 409
     except Exception as exc:  # noqa: BLE001
         _log_api_error(
             "content_index_prepare_failed",
@@ -3727,6 +3876,16 @@ def _queue_content_index_payload(payload: dict, *, default_trigger: str) -> tupl
                 "source": source.get("type"),
             },
         )
+        if source_type == "upload" and str(trigger).strip().lower() == "upload_scan_clean":
+            try:
+                upload_store.update_upload_status(
+                    str(source.get("uploadId") or upload_id),
+                    index_status="failed",
+                    is_file_opened=False,
+                    file_open_error=f"failed to prepare document: {exc}",
+                )
+            except Exception:
+                pass
         return jsonify({"error": f"failed to prepare document: {exc}"}), 500
 
     try:
@@ -3751,28 +3910,49 @@ def _queue_content_index_payload(payload: dict, *, default_trigger: str) -> tupl
         trigger=trigger,
         job_id=job_id,
         user_id=user_id,
+        attempt=attempt,
     )
     if publish_error is not None:
-        content_store.update_index_fields(
-            company_id=company_id,
-            document_id=document_id,
-            state="failed",
-            error=publish_error,
-            job_id=job_id,
-            trigger=trigger,
-            options=options,
-            user_id=user_id,
-        )
-        content_store.append_log_entry(
-            company_id=company_id,
-            document_id=document_id,
-            job_id=job_id,
-            level="error",
-            message=publish_error,
-            state="failed",
-            user_id=user_id,
-            trigger=trigger,
-        )
+        try:
+            content_store.update_index_fields(
+                company_id=company_id,
+                document_id=document_id,
+                state="failed",
+                error=publish_error,
+                job_id=job_id,
+                trigger=trigger,
+                options=options,
+                user_id=user_id,
+            )
+        except Exception as state_exc:  # noqa: BLE001
+            app.logger.warning(
+                "Failed to persist publish failure state for %s: %s",
+                document_id,
+                state_exc,
+            )
+        try:
+            content_store.append_log_entry(
+                company_id=company_id,
+                document_id=document_id,
+                job_id=job_id,
+                level="error",
+                message=publish_error,
+                state="failed",
+                user_id=user_id,
+                trigger=trigger,
+            )
+        except Exception:
+            pass
+        if source_type == "upload" and str(trigger).strip().lower() == "upload_scan_clean":
+            try:
+                upload_store.update_upload_status(
+                    str(source.get("uploadId") or upload_id),
+                    index_status="failed",
+                    is_file_opened=False,
+                    file_open_error=publish_error,
+                )
+            except Exception:
+                pass
         return jsonify({"error": publish_error}), 503
 
     index_state = doc.get("index", {}) if isinstance(doc, dict) else {}
@@ -3780,6 +3960,7 @@ def _queue_content_index_payload(payload: dict, *, default_trigger: str) -> tupl
         "queued": True,
         "documentId": document_id,
         "jobId": job_id,
+        "attempt": attempt,
         "state": index_state.get("state", "queued"),
         "source": source_type,
         "options": options,
@@ -4297,7 +4478,9 @@ def get_upload_text(upload_id):
         return jsonify({"error": str(exc)}), 400
 
     try:
-        document = document_loader.fetch_text(key, bucket=bucket)
+        document = document_loader.fetch_text(
+            key, bucket=bucket, filename_hint=filename
+        )
     except DocumentDownloadError as exc:
         _log_api_error(
             "upload_text_download_failed",

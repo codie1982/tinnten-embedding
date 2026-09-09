@@ -4,6 +4,7 @@ MongoDB persistence helpers for embedding metadata and FAISS bookkeeping.
 from __future__ import annotations
 
 import hashlib
+import re
 import os
 import uuid
 from datetime import datetime, timezone
@@ -107,10 +108,20 @@ class MongoStore:
         doc_type: Optional[str] = None,
         source: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        company_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        title: Optional[str] = None,
+        job_id: Optional[str] = None,
+        status: str = "pending",
         session=None,
     ) -> str:
         """
-        Insert a new document record with `pending` status.
+        Insert or initialise a document record for an ingest attempt.
+
+        Modern ``content/index`` jobs historically wrote chunks without ever
+        creating this parent row. Detail endpoints then returned 404 and active
+        chunk queries hid otherwise valid chunks. Optional ownership fields are
+        kept top-level as well as in metadata for canonical/legacy readers.
         """
         now = datetime.now(timezone.utc)
         doc_id = doc_id or str(uuid.uuid4())
@@ -122,11 +133,19 @@ class MongoStore:
             "doc_type": doc_type,
             "source": source,
             "metadata": metadata or {},
-            "status": "pending",
+            "status": status,
             "chunk_count": 0,
             "updated_at": now,
             "error": None,
         }
+        if company_id is not None:
+            update_fields["company_id"] = str(company_id)
+        if user_id is not None:
+            update_fields["user_id"] = str(user_id)
+        if title is not None:
+            update_fields["title"] = str(title)
+        if job_id is not None:
+            update_fields["job_id"] = str(job_id)
         self.documents.update_one(
             {"doc_id": doc_id},
             {"$setOnInsert": on_insert, "$set": update_fields},
@@ -142,8 +161,9 @@ class MongoStore:
         status: str,
         chunk_count: Optional[int] = None,
         error: Optional[str] = None,
+        expected_job_id: Optional[str] = None,
         session=None,
-    ) -> None:
+    ) -> bool:
         now = datetime.now(timezone.utc)
         update: Dict[str, Any] = {
             "status": status,
@@ -152,7 +172,11 @@ class MongoStore:
         }
         if chunk_count is not None:
             update["chunk_count"] = int(chunk_count)
-        self.documents.update_one({"doc_id": doc_id}, {"$set": update}, upsert=False, session=session)
+        query: Dict[str, Any] = {"doc_id": doc_id}
+        if expected_job_id is not None:
+            query["job_id"] = str(expected_job_id)
+        result = self.documents.update_one(query, {"$set": update}, upsert=False, session=session)
+        return int(result.matched_count or 0) > 0
 
     def get_document(self, doc_id: str) -> Optional[Dict[str, Any]]:
         return self.documents.find_one({"doc_id": doc_id})
@@ -187,6 +211,53 @@ class MongoStore:
     def get_chunks_by_doc(self, doc_id: str) -> List[Dict[str, Any]]:
         cursor = self.chunks.find({"doc_id": doc_id}).sort("chunk_index", ASCENDING)
         return list(cursor)
+
+    def get_chunks_page_by_doc(
+        self,
+        doc_id: str,
+        *,
+        page: int = 1,
+        limit: int = 20,
+        query: str = "",
+    ) -> Dict[str, Any]:
+        """Return one bounded audit page without loading all chunk bodies."""
+        safe_page = max(1, int(page or 1))
+        safe_limit = min(100, max(1, int(limit or 20)))
+        chunk_filter: Dict[str, Any] = {"doc_id": doc_id}
+        normalized_query = str(query or "").strip()
+        if normalized_query:
+            chunk_filter["text"] = {"$regex": re.escape(normalized_query), "$options": "i"}
+
+        total = int(self.chunks.count_documents(chunk_filter))
+        document_total = int(self.chunks.count_documents({"doc_id": doc_id}))
+        total_pages = max(1, (total + safe_limit - 1) // safe_limit)
+        bounded_page = min(safe_page, total_pages)
+        skip = (bounded_page - 1) * safe_limit
+        chunks = list(
+            self.chunks.find(chunk_filter)
+            .sort("chunk_index", ASCENDING)
+            .skip(skip)
+            .limit(safe_limit)
+        )
+
+        previous_chunk = None
+        if chunks and not normalized_query:
+            first_index = chunks[0].get("chunk_index")
+            if first_index is not None:
+                previous_chunk = self.chunks.find_one(
+                    {"doc_id": doc_id, "chunk_index": {"$lt": first_index}},
+                    sort=[("chunk_index", -1)],
+                )
+
+        return {
+            "chunks": chunks,
+            "previous_chunk": previous_chunk,
+            "total": total,
+            "document_total": document_total,
+            "page": bounded_page,
+            "limit": safe_limit,
+            "total_pages": total_pages,
+        }
 
     def delete_chunks_by_doc(self, doc_id: str, *, session=None) -> int:
         """Bir dokümanın TÜM chunk'larını siler — sürümden bağımsız.
@@ -244,14 +315,25 @@ class MongoStore:
                 out.append(int(fid))
         return out
 
-    def set_active_ingest_version(self, doc_id: str, version: str, *, session=None) -> None:
+    def set_active_ingest_version(
+        self,
+        doc_id: str,
+        version: str,
+        *,
+        expected_job_id: Optional[str] = None,
+        session=None,
+    ) -> bool:
         """Dokümanın aktif sürümünü işaretler — arama yalnız bunu görür."""
-        self.documents.update_one(
-            {"doc_id": doc_id},
+        query: Dict[str, Any] = {"doc_id": doc_id}
+        if expected_job_id is not None:
+            query["job_id"] = str(expected_job_id)
+        result = self.documents.update_one(
+            query,
             {"$set": {"active_ingest_version": version, "updated_at": datetime.now(timezone.utc)}},
             upsert=False,
             session=session,
         )
+        return int(result.matched_count or 0) > 0
 
     @staticmethod
     def _company_domain_query(company_id: str, domain: str) -> Dict[str, Any]:
