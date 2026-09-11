@@ -3194,6 +3194,7 @@ class IngestWorker:
             # bulur, chunkCount'u SET eder (badge "İndeksleniyor"→"Tamamlandı").
             page_domain = None
             page_source = None
+            page_url = None
             domain_chunks = None
             if str(context.trigger or "") in ("fetcher_page", "fetcher_initial"):
                 # Domain önce çağıran taraftan gelen hint'ten (content-load
@@ -3214,6 +3215,11 @@ class IngestWorker:
                                 break
                     if not page_source:
                         page_source = str(context.trigger)
+                    for c in self._get_store().get_chunks_by_doc(context.document_id):
+                        md = c.get("metadata") or {}
+                        if md.get("url"):
+                            page_url = md.get("url")
+                            break
                     if page_domain:
                         domain_chunks = self._get_store().chunks.count_documents(
                             {
@@ -3240,6 +3246,7 @@ class IngestWorker:
                     company_id=context.company_id,
                     domain=page_domain,
                     source=page_source,
+                    page_url=page_url,
                     domain_chunks=domain_chunks,
                     job_id=context.job_id,
                     attempt=context.attempt,
