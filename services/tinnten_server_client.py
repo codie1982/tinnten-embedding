@@ -65,6 +65,8 @@ class TinntenServerClient:
         domain: str | None = None,
         source: str | None = None,
         page_url: str | None = None,
+        page_title: str | None = None,
+        page_source_subscription_id: str | None = None,
         domain_chunks: int | None = None,
         job_id: str | None = None,
         attempt: int | None = None,
@@ -137,9 +139,17 @@ class TinntenServerClient:
         # Per-sayfa (fetcher_page/initial) doc'ları için: server, website entry'sini
         # tek faissIndexId yerine DOMAIN ile bulur; domainChunks agrega chunk sayısı.
         if domain and source in ("fetcher_page", "fetcher_initial"):
-            body["metadata"] = {"domain": str(domain), "source": str(source)}
+            body["metadata"] = {
+                "domain": str(domain),
+                "source": str(source),
+                "documentId": str(document_id),
+            }
             if page_url:
                 body["metadata"]["url"] = str(page_url)
+            if page_title:
+                body["metadata"]["title"] = str(page_title)
+            if page_source_subscription_id:
+                body["metadata"]["sourceSubscriptionId"] = str(page_source_subscription_id)
             if isinstance(domain_chunks, int):
                 body.setdefault("stats", {})
                 body["stats"]["domainChunks"] = int(domain_chunks)

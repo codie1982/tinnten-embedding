@@ -32,10 +32,20 @@ def test_fetcher_page_callback_carries_domain_and_domain_chunks():
         company_id="C1",
         domain="example.com",
         source="fetcher_page",
+        page_url="https://example.com/pricing",
+        page_title="Pricing",
+        page_source_subscription_id="sub-1",
         domain_chunks=42,
     )
     assert body["state"] == "indexed"  # completed → indexed
-    assert body["metadata"] == {"domain": "example.com", "source": "fetcher_page"}
+    assert body["metadata"] == {
+        "domain": "example.com",
+        "source": "fetcher_page",
+        "documentId": "b55eaea10f281ccd07647aa5",
+        "url": "https://example.com/pricing",
+        "title": "Pricing",
+        "sourceSubscriptionId": "sub-1",
+    }
     assert body["stats"]["domainChunks"] == 42
     assert body["companyid"] == "C1"
 
@@ -172,6 +182,23 @@ def test_chunk_fallback_still_resolves_domain_without_hint():
     kwargs = _run_safe_update(w)
     assert kwargs["domain"] == "x.com"
     assert kwargs["source"] == "fetcher_page"
+
+
+def test_callback_prefers_persisted_page_url_and_title_metadata():
+    w = _worker_for_state_callback(chunk_docs=[])
+    w.content_store.get_document.return_value = {
+        "index": {"jobId": "J1"},
+        "title": "Stored title",
+        "metadata": {
+            "domain": "x.com",
+            "source": "fetcher_page",
+            "url": "https://x.com/article",
+            "title": "Exact article title",
+        },
+    }
+    kwargs = _run_safe_update(w)
+    assert kwargs["page_url"] == "https://x.com/article"
+    assert kwargs["page_title"] == "Exact article title"
 
 
 def test_rejected_job_cas_does_not_enqueue_terminal_callback():

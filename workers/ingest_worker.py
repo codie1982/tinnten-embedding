@@ -3162,6 +3162,7 @@ class IngestWorker:
             # a terminal callback from the old job cannot overwrite the new
             # job's visible state.  Missing jobId is retained for legacy rows;
             # lookup failures keep the existing best-effort callback behavior.
+            current_document = None
             try:
                 current_document = self._get_content_store().get_document(
                     context.company_id, context.document_id
@@ -3195,6 +3196,8 @@ class IngestWorker:
             page_domain = None
             page_source = None
             page_url = None
+            page_title = None
+            page_source_subscription_id = None
             domain_chunks = None
             if str(context.trigger or "") in ("fetcher_page", "fetcher_initial"):
                 # Domain önce çağıran taraftan gelen hint'ten (content-load
@@ -3206,8 +3209,29 @@ class IngestWorker:
                     page_domain = str(callback_domain)
                     page_source = str(callback_source or context.trigger)
                 try:
+                    stored_metadata = (
+                        current_document.get("metadata")
+                        if isinstance(current_document, dict)
+                        and isinstance(current_document.get("metadata"), dict)
+                        else {}
+                    )
+                    page_url = stored_metadata.get("url")
+                    page_title = (
+                        stored_metadata.get("title")
+                        or (
+                            current_document.get("title")
+                            if isinstance(current_document, dict)
+                            else None
+                        )
+                    )
+                    page_source_subscription_id = stored_metadata.get("sourceSubscriptionId")
                     if not page_domain:
-                        for c in self._get_store().get_chunks_by_doc(context.document_id):
+                        page_domain = stored_metadata.get("domain") or stored_metadata.get("fetcherDomain")
+                        if page_domain:
+                            page_source = str(stored_metadata.get("source") or context.trigger)
+                    chunks = self._get_store().get_chunks_by_doc(context.document_id)
+                    if not page_domain:
+                        for c in chunks:
                             md = c.get("metadata") or {}
                             if md.get("domain"):
                                 page_domain = md.get("domain")
@@ -3215,10 +3239,13 @@ class IngestWorker:
                                 break
                     if not page_source:
                         page_source = str(context.trigger)
-                    for c in self._get_store().get_chunks_by_doc(context.document_id):
+                    for c in chunks:
                         md = c.get("metadata") or {}
-                        if md.get("url"):
+                        if not page_url and md.get("url"):
                             page_url = md.get("url")
+                        if not page_title and md.get("title"):
+                            page_title = md.get("title")
+                        if page_url and page_title:
                             break
                     if page_domain:
                         domain_chunks = self._get_store().chunks.count_documents(
@@ -3247,6 +3274,8 @@ class IngestWorker:
                     domain=page_domain,
                     source=page_source,
                     page_url=page_url,
+                    page_title=page_title,
+                    page_source_subscription_id=page_source_subscription_id,
                     domain_chunks=domain_chunks,
                     job_id=context.job_id,
                     attempt=context.attempt,
