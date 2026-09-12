@@ -3229,7 +3229,11 @@ class IngestWorker:
                         page_domain = stored_metadata.get("domain") or stored_metadata.get("fetcherDomain")
                         if page_domain:
                             page_source = str(stored_metadata.get("source") or context.trigger)
-                    chunks = self._get_store().get_chunks_by_doc(context.document_id)
+                    embedding_document = self._get_store().get_document(context.document_id) or {}
+                    chunks = self._get_store().get_chunks_by_doc(
+                        context.document_id,
+                        ingest_version=embedding_document.get("active_ingest_version"),
+                    )
                     if not page_domain:
                         for c in chunks:
                             md = c.get("metadata") or {}
@@ -3248,14 +3252,9 @@ class IngestWorker:
                         if page_url and page_title:
                             break
                     if page_domain:
-                        domain_chunks = self._get_store().chunks.count_documents(
-                            {
-                                "metadata.domain": page_domain,
-                                "$or": [
-                                    {"company_id": context.company_id},
-                                    {"metadata.companyId": context.company_id},
-                                ],
-                            }
+                        domain_chunks = self._get_store().count_active_chunks_by_company_domain(
+                            context.company_id,
+                            page_domain,
                         )
                 except Exception:  # noqa: BLE001
                     pass

@@ -3145,12 +3145,58 @@ def ingest_upload_legacy():
     return jsonify({"doc_id": doc_id, "status": "queued"})
 
 
+@app.route("/api/v10/vector/chunk-documents/search", methods=["POST"])
+def search_chunk_documents():
+    """List crawl-page documents derived directly from persisted chunks."""
+    payload = request.get_json(silent=True) or {}
+    company_id = _get_payload_value(payload, "companyId", "company_id", "companyid")
+    if not company_id:
+        return jsonify({"error": "companyId is required"}), 400
+    try:
+        page = max(1, int(payload.get("page") or 1))
+        limit = min(5000, max(1, int(payload.get("limit") or 20)))
+    except (TypeError, ValueError):
+        return jsonify({"error": "page and limit must be integers"}), 400
+    scopes = payload.get("scopes") or []
+    domains = payload.get("domains") or []
+    if not isinstance(scopes, list) or not isinstance(domains, list):
+        return jsonify({"error": "scopes and domains must be arrays"}), 400
+    result = chunk_store.list_chunk_documents(
+        company_id=str(company_id),
+        scopes=[scope for scope in scopes if isinstance(scope, dict)],
+        domains=[str(domain) for domain in domains],
+        page=page,
+        limit=limit,
+        query=str(payload.get("q") or ""),
+        state=str(payload.get("state") or ""),
+    )
+    return jsonify(result)
+
+
 @app.route("/api/v10/vector/document/<doc_id>", methods=["GET"])
 def get_vector_document_legacy(doc_id: str):
     """
     Backward-compatible document status endpoint used by the previous embedding.py service.
     """
+    company_id = (
+        request.args.get("companyId")
+        or request.args.get("company_id")
+        or request.args.get("companyid")
+    )
     doc = chunk_store.get_document(doc_id)
+    if doc and company_id:
+        doc_company_id = str(
+            doc.get("company_id")
+            or (doc.get("metadata") or {}).get("companyId")
+            or ""
+        )
+        if doc_company_id and doc_company_id != str(company_id):
+            return jsonify({"error": "not_found"}), 404
+    if not doc and company_id:
+        # Legacy direct-fetcher ingestion wrote valid chunks without a parent
+        # embedding_documents row. The audit API treats the chunk group as a
+        # virtual parent instead of requiring a ContentDocument.
+        doc = chunk_store.get_chunk_document(doc_id, company_id=str(company_id))
     if not doc:
         return jsonify({"error": "not_found"}), 404
 
@@ -3170,6 +3216,7 @@ def get_vector_document_legacy(doc_id: str):
                 page=page,
                 limit=limit,
                 query=request.args.get("q") or "",
+                ingest_version=doc.get("active_ingest_version"),
             )
             response["chunks"] = [_serialize_chunk_entry(chunk) for chunk in chunk_page["chunks"]]
             response["previous_chunk"] = (
@@ -3185,7 +3232,10 @@ def get_vector_document_legacy(doc_id: str):
         else:
             # Legacy callers keep receiving the complete list when no paging
             # parameters are supplied.
-            chunks = chunk_store.get_chunks_by_doc(doc_id)
+            chunks = chunk_store.get_chunks_by_doc(
+                doc_id,
+                ingest_version=doc.get("active_ingest_version"),
+            )
             response["chunks"] = [_serialize_chunk_entry(chunk) for chunk in chunks]
     return jsonify(response)
 
@@ -3207,7 +3257,23 @@ def deactivate_document():
 
     # Mark embedding_documents as disabled
     try:
-        chunk_store.update_document_status(str(document_id), status="disabled")
+        updated = chunk_store.update_document_status(str(document_id), status="disabled")
+        if not updated:
+            virtual_document = chunk_store.get_chunk_document(
+                str(document_id),
+                company_id=str(company_id) if company_id else None,
+            )
+            if not virtual_document:
+                return jsonify({"error": "not_found"}), 404
+            chunk_store.create_document(
+                doc_id=str(document_id),
+                source=virtual_document.get("source") or "fetcher_page",
+                metadata=virtual_document.get("metadata") or {},
+                company_id=str(company_id or virtual_document.get("company_id") or "") or None,
+                user_id=virtual_document.get("user_id"),
+                title=virtual_document.get("title"),
+                status="disabled",
+            )
     except Exception as exc:  # noqa: BLE001
         _log_api_error(
             "deactivate_document_failed",

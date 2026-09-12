@@ -124,7 +124,8 @@ def _worker_for_state_callback(chunk_docs):
     w = IngestWorker.__new__(IngestWorker)
     store = MagicMock()
     store.get_chunks_by_doc.return_value = list(chunk_docs)
-    store.chunks.count_documents.return_value = len(chunk_docs)
+    store.get_document.return_value = None
+    store.count_active_chunks_by_company_domain.return_value = len(chunk_docs)
     w.store = store
     w.content_store = MagicMock()
     # Bildirim artık arka plan thread'inden gidiyor (doküman yolunu bekletmemek

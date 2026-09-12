@@ -208,8 +208,13 @@ class MongoStore:
         cursor = self.chunks.find({"faiss_id": {"$in": list(faiss_ids)}})
         return {int(doc["faiss_id"]): doc for doc in cursor}
 
-    def get_chunks_by_doc(self, doc_id: str) -> List[Dict[str, Any]]:
-        cursor = self.chunks.find({"doc_id": doc_id}).sort("chunk_index", ASCENDING)
+    def get_chunks_by_doc(
+        self, doc_id: str, *, ingest_version: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        query: Dict[str, Any] = {"doc_id": doc_id}
+        if ingest_version:
+            query["ingest_version"] = str(ingest_version)
+        cursor = self.chunks.find(query).sort("chunk_index", ASCENDING)
         return list(cursor)
 
     def get_chunks_page_by_doc(
@@ -219,17 +224,23 @@ class MongoStore:
         page: int = 1,
         limit: int = 20,
         query: str = "",
+        ingest_version: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Return one bounded audit page without loading all chunk bodies."""
         safe_page = max(1, int(page or 1))
         safe_limit = min(100, max(1, int(limit or 20)))
         chunk_filter: Dict[str, Any] = {"doc_id": doc_id}
+        if ingest_version:
+            chunk_filter["ingest_version"] = str(ingest_version)
         normalized_query = str(query or "").strip()
         if normalized_query:
             chunk_filter["text"] = {"$regex": re.escape(normalized_query), "$options": "i"}
 
         total = int(self.chunks.count_documents(chunk_filter))
-        document_total = int(self.chunks.count_documents({"doc_id": doc_id}))
+        document_total = int(self.chunks.count_documents({
+            "doc_id": doc_id,
+            **({"ingest_version": str(ingest_version)} if ingest_version else {}),
+        }))
         total_pages = max(1, (total + safe_limit - 1) // safe_limit)
         bounded_page = min(safe_page, total_pages)
         skip = (bounded_page - 1) * safe_limit
@@ -245,7 +256,11 @@ class MongoStore:
             first_index = chunks[0].get("chunk_index")
             if first_index is not None:
                 previous_chunk = self.chunks.find_one(
-                    {"doc_id": doc_id, "chunk_index": {"$lt": first_index}},
+                    {
+                        "doc_id": doc_id,
+                        **({"ingest_version": str(ingest_version)} if ingest_version else {}),
+                        "chunk_index": {"$lt": first_index},
+                    },
                     sort=[("chunk_index", -1)],
                 )
 
@@ -258,6 +273,261 @@ class MongoStore:
             "limit": safe_limit,
             "total_pages": total_pages,
         }
+
+    @staticmethod
+    def _glob_url_regex(pattern: str) -> Optional[re.Pattern]:
+        """Compile dashboard URL globs for stored absolute crawl URLs."""
+        value = str(pattern or "").strip()
+        if not value or len(value) > 500:
+            return None
+        pieces: List[str] = []
+        index = 0
+        while index < len(value):
+            char = value[index]
+            if char == "*":
+                if index + 1 < len(value) and value[index + 1] == "*":
+                    index += 1
+                pieces.append(".*")
+            elif char == "?":
+                pieces.append(".")
+            else:
+                pieces.append(re.escape(char))
+            index += 1
+        prefix = r"(?:https?://[^/?#]+)?" if value.startswith("/") else ""
+        try:
+            return re.compile(rf"^{prefix}{''.join(pieces)}$", re.IGNORECASE)
+        except re.error:
+            return None
+
+    @classmethod
+    def _chunk_scope_query(cls, scope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        domains = [str(value).strip().lower() for value in scope.get("domains") or [] if str(value).strip()]
+        if not domains:
+            domain = str(scope.get("domain") or "").strip().lower()
+            if domain:
+                domains = [domain, f"www.{domain.removeprefix('www.')}"]
+        if not domains:
+            return None
+
+        clauses: List[Dict[str, Any]] = [{"metadata.domain": {"$in": list(dict.fromkeys(domains))}}]
+        include_regexes = [
+            regex for regex in (
+                cls._glob_url_regex(value) for value in (scope.get("includePatterns") or [])[:100]
+            ) if regex is not None
+        ]
+        exclude_regexes = [
+            regex for regex in (
+                cls._glob_url_regex(value) for value in (scope.get("excludePatterns") or [])[:100]
+            ) if regex is not None
+        ]
+        if include_regexes:
+            clauses.append({"$or": [{"metadata.url": regex} for regex in include_regexes]})
+        if exclude_regexes:
+            clauses.append({"$nor": [{"metadata.url": regex} for regex in exclude_regexes]})
+        return {"$and": clauses}
+
+    def list_chunk_documents(
+        self,
+        *,
+        company_id: str,
+        scopes: Optional[Sequence[Dict[str, Any]]] = None,
+        domains: Optional[Sequence[str]] = None,
+        page: int = 1,
+        limit: int = 20,
+        query: str = "",
+        state: str = "",
+    ) -> Dict[str, Any]:
+        """Group crawl chunks into virtual documents for the Space inventory."""
+        safe_page = max(1, int(page or 1))
+        safe_limit = min(5000, max(1, int(limit or 20)))
+        clauses: List[Dict[str, Any]] = [
+            self._company_query(company_id),
+            {"metadata.source": {"$in": ["fetcher_page", "fetcher_initial"]}},
+        ]
+
+        scope_queries = [
+            item for item in (self._chunk_scope_query(scope) for scope in (scopes or [])) if item
+        ]
+        if scope_queries:
+            clauses.append({"$or": scope_queries})
+        elif domains:
+            normalized_domains = [str(value).strip().lower() for value in domains if str(value).strip()]
+            if normalized_domains:
+                clauses.append({"metadata.domain": {"$in": list(dict.fromkeys(normalized_domains))}})
+
+        normalized_query = str(query or "").strip()[:200]
+        if normalized_query:
+            pattern = re.compile(re.escape(normalized_query), re.IGNORECASE)
+            clauses.append({"$or": [{"metadata.url": pattern}, {"metadata.title": pattern}]})
+
+        # Atomik replace eski chunk sürümlerini denetim/geri dönüş için saklar.
+        # Envanter ise aramada kullanılan AKTİF sürümü göstermelidir; aksi halde
+        # her re-index aynı sayfanın chunk sayısını katlayarak UI'ı şişirir.
+        candidate_doc_ids = [
+            str(value)
+            for value in self.chunks.distinct("doc_id", {"$and": clauses})
+            if value is not None
+        ]
+        if not candidate_doc_ids:
+            return {
+                "documents": [], "total": 0, "page": safe_page, "limit": safe_limit,
+                "total_pages": 1, "domains": [],
+            }
+        stored_documents = {
+            str(row.get("doc_id")): row
+            for row in self.documents.find(
+                {"doc_id": {"$in": candidate_doc_ids}},
+                {"doc_id": 1, "active_ingest_version": 1, "status": 1,
+                 "job_id": 1, "updated_at": 1},
+            )
+        }
+        active_version_clauses: List[Dict[str, Any]] = []
+        for doc_id in candidate_doc_ids:
+            stored = stored_documents.get(doc_id)
+            version = stored.get("active_ingest_version") if stored else None
+            clause: Dict[str, Any] = {"doc_id": doc_id}
+            if version:
+                clause["ingest_version"] = version
+            active_version_clauses.append(clause)
+        clauses.append({"$or": active_version_clauses})
+
+        requested_state = str(state or "").strip().lower()
+        document_company_query = {
+            "$or": [
+                {"company_id": str(company_id)},
+                {"metadata.companyId": str(company_id)},
+            ]
+        }
+        status_query: Dict[str, Any] = {
+            "$and": [{"doc_id": {"$exists": True}}, document_company_query]
+        }
+        state_aliases = {
+            "disabled": ["disabled", "removed"],
+            "error": ["error", "failed"],
+            "indexing": ["indexing", "processing"],
+            "queued": ["queued", "pending"],
+            "validating": ["validating"],
+            "not_indexed": ["not_indexed"],
+        }
+        if requested_state in state_aliases:
+            status_query["$and"].append({"status": {"$in": state_aliases[requested_state]}})
+            allowed_doc_ids = [str(row.get("doc_id")) for row in self.documents.find(status_query, {"doc_id": 1})]
+            if not allowed_doc_ids:
+                return {"documents": [], "total": 0, "page": safe_page, "limit": safe_limit, "total_pages": 1, "domains": []}
+            clauses.append({"doc_id": {"$in": allowed_doc_ids}})
+        elif requested_state and requested_state not in {"all", "indexed", "ready", "completed"}:
+            return {"documents": [], "total": 0, "page": safe_page, "limit": safe_limit, "total_pages": 1, "domains": []}
+        elif requested_state in {"indexed", "ready", "completed"}:
+            disabled_doc_ids = [
+                str(row.get("doc_id"))
+                for row in self.documents.find(
+                    {"$and": [
+                        document_company_query,
+                        {"status": {"$nin": ["ready", "indexed", "completed"]}},
+                    ]},
+                    {"doc_id": 1},
+                )
+            ]
+            if disabled_doc_ids:
+                clauses.append({"doc_id": {"$nin": disabled_doc_ids}})
+
+        match = {"$and": clauses}
+        group_stage = {
+            "$group": {
+                "_id": "$doc_id",
+                "chunkCount": {"$sum": 1},
+                "tokenCount": {"$sum": {"$ifNull": ["$token_count", {"$ifNull": ["$tokens", 0]}]}},
+                "lastRunAt": {"$max": {"$ifNull": ["$updated_at", "$created_at"]}},
+                "createdAt": {"$min": "$created_at"},
+                "url": {"$first": "$metadata.url"},
+                "title": {"$first": "$metadata.title"},
+                "domain": {"$first": "$metadata.domain"},
+                "source": {"$first": "$metadata.source"},
+                "sourceSubscriptionId": {"$first": "$metadata.sourceSubscriptionId"},
+                "contentHash": {"$first": {"$ifNull": ["$metadata.contentHash", "$metadata.content_hash"]}},
+                "jobId": {"$first": {"$ifNull": ["$job_id", "$metadata.jobId"]}},
+                "chunkSize": {"$first": "$metadata.chunkSize"},
+                "chunkOverlap": {"$first": "$metadata.chunkOverlap"},
+                "chunkMode": {"$first": "$metadata.chunkMode"},
+                "chunkPolicy": {"$first": "$metadata.chunkPolicy"},
+            }
+        }
+        skip = (safe_page - 1) * safe_limit
+        pipeline = [
+            {"$match": match},
+            group_stage,
+            {"$sort": {"lastRunAt": -1, "_id": 1}},
+            {"$facet": {
+                "documents": [{"$skip": skip}, {"$limit": safe_limit}],
+                "total": [{"$count": "value"}],
+                "domains": [{"$group": {"_id": "$domain"}}, {"$sort": {"_id": 1}}],
+            }},
+        ]
+        result = next(iter(self.chunks.aggregate(pipeline, allowDiskUse=True)), {})
+        rows = result.get("documents") or []
+        doc_ids = [str(row.get("_id")) for row in rows]
+        states = {
+            doc_id: stored_documents[doc_id]
+            for doc_id in doc_ids
+            if doc_id in stored_documents
+        }
+        documents = []
+        for row in rows:
+            doc_id = str(row.pop("_id"))
+            state_doc = states.get(doc_id) or {}
+            row["documentId"] = doc_id
+            row["state"] = str(state_doc.get("status") or "indexed")
+            row["jobId"] = state_doc.get("job_id") or row.get("jobId")
+            row["lastRunAt"] = state_doc.get("updated_at") or row.get("lastRunAt")
+            documents.append(row)
+        total = int(((result.get("total") or [{}])[0]).get("value") or 0)
+        return {
+            "documents": documents,
+            "total": total,
+            "page": safe_page,
+            "limit": safe_limit,
+            "total_pages": max(1, (total + safe_limit - 1) // safe_limit),
+            "domains": [str(item.get("_id")) for item in (result.get("domains") or []) if item.get("_id")],
+        }
+
+    def get_chunk_document(self, doc_id: str, *, company_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Return a parent-like summary even for legacy chunk-only documents."""
+        clauses: List[Dict[str, Any]] = [{"doc_id": str(doc_id)}]
+        if company_id:
+            clauses.append(self._company_query(str(company_id)))
+        pipeline = [
+            {"$match": {"$and": clauses}},
+            {"$group": {
+                "_id": "$doc_id",
+                "chunk_count": {"$sum": 1},
+                "created_at": {"$min": "$created_at"},
+                "updated_at": {"$max": {"$ifNull": ["$updated_at", "$created_at"]}},
+                "metadata": {"$first": "$metadata"},
+                "source": {"$first": "$metadata.source"},
+                "company_id": {"$first": {"$ifNull": ["$company_id", "$metadata.companyId"]}},
+                "user_id": {"$first": {"$ifNull": ["$user_id", "$metadata.userId"]}},
+                "title": {"$first": "$metadata.title"},
+            }},
+        ]
+        rows = list(self.chunks.aggregate(pipeline))
+        if not rows:
+            return None
+        summary = rows[0]
+        summary["doc_id"] = str(summary.pop("_id"))
+        summary["status"] = "indexed"
+        stored = self.get_document(str(doc_id))
+        if stored:
+            active_version = stored.get("active_ingest_version")
+            summary.update({key: value for key, value in stored.items() if key != "_id"})
+            if active_version:
+                active_count = self.chunks.count_documents({
+                    "doc_id": str(doc_id),
+                    "ingest_version": active_version,
+                })
+                summary["chunk_count"] = int(active_count)
+            else:
+                summary["chunk_count"] = int(rows[0].get("chunk_count") or 0)
+        return summary
 
     def delete_chunks_by_doc(self, doc_id: str, *, session=None) -> int:
         """Bir dokümanın TÜM chunk'larını siler — sürümden bağımsız.
@@ -364,6 +634,27 @@ class MongoStore:
             return 0
         return int(self.chunks.count_documents(self._company_query(company_id)))
 
+    def _active_versions_for_doc_ids(
+        self, doc_ids: Sequence[Any]
+    ) -> Dict[str, Optional[str]]:
+        """Map searchable doc ids to their active version; keep parentless legacy ids."""
+        normalized_ids = [str(doc_id) for doc_id in doc_ids if doc_id is not None]
+        active_versions: Dict[str, Optional[str]] = {
+            doc_id: None for doc_id in normalized_ids
+        }
+        if not normalized_ids:
+            return active_versions
+        for document in self.documents.find(
+            {"doc_id": {"$in": normalized_ids}},
+            {"doc_id": 1, "active_ingest_version": 1, "status": 1},
+        ):
+            doc_id = str(document.get("doc_id") or "")
+            if document.get("status") in {"removed", "disabled"}:
+                active_versions.pop(doc_id, None)
+            else:
+                active_versions[doc_id] = document.get("active_ingest_version")
+        return active_versions
+
     def count_active_chunks_by_company(self, company_id: str) -> int:
         """
         Yalnızca AKTİF sürüme ait chunk sayısı.
@@ -377,24 +668,45 @@ class MongoStore:
         if not cid:
             return 0
 
-        # Sürüm bilgisi taşımayan chunk'lar (legacy) sürüm eşleşmesine tabi değildir.
-        active_versions: Dict[str, Optional[str]] = {}
         doc_ids = self.chunks.distinct("doc_id", self._company_query(cid))
         if not doc_ids:
             return 0
-        for doc in self.documents.find(
-            {"doc_id": {"$in": [str(d) for d in doc_ids]}},
-            {"doc_id": 1, "active_ingest_version": 1, "status": 1},
-        ):
-            if doc.get("status") in {"removed", "disabled"}:
-                continue
-            active_versions[str(doc["doc_id"])] = doc.get("active_ingest_version")
+        active_versions = self._active_versions_for_doc_ids(doc_ids)
 
         total = 0
         for doc_id, version in active_versions.items():
-            query: Dict[str, Any] = {"doc_id": doc_id}
+            query: Dict[str, Any] = {
+                "$and": [self._company_query(cid), {"doc_id": doc_id}],
+            }
             if version:
                 query["ingest_version"] = version
+            total += int(self.chunks.count_documents(query))
+        return total
+
+    def count_active_chunks_by_company_domain(self, company_id: str, domain: str) -> int:
+        """Count only the current searchable chunk versions for one domain."""
+        cid = str(company_id or "").strip()
+        normalized_domain = str(domain or "").strip()
+        if not cid or not normalized_domain:
+            return 0
+
+        base_query = self._company_domain_query(cid, normalized_domain)
+        doc_ids = [
+            str(value)
+            for value in self.chunks.distinct("doc_id", base_query)
+            if value is not None
+        ]
+        if not doc_ids:
+            return 0
+        active_versions = self._active_versions_for_doc_ids(doc_ids)
+
+        total = 0
+        for doc_id, active_version in active_versions.items():
+            query: Dict[str, Any] = {
+                "$and": [base_query, {"doc_id": doc_id}],
+            }
+            if active_version:
+                query["ingest_version"] = active_version
             total += int(self.chunks.count_documents(query))
         return total
 
@@ -413,17 +725,13 @@ class MongoStore:
         doc_ids = self.chunks.distinct("doc_id", self._company_query(cid))
         if not doc_ids:
             return []
-        documents = list(self.documents.find(
-            {"doc_id": {"$in": [str(doc_id) for doc_id in doc_ids]}, "status": {"$nin": ["removed", "disabled"]}},
-            {"doc_id": 1, "active_ingest_version": 1},
-        ))
+        active_versions = self._active_versions_for_doc_ids(doc_ids)
         samples: List[Dict[str, Any]] = []
-        for document in documents:
+        for doc_id, version in active_versions.items():
             query: Dict[str, Any] = {
-                "$and": [self._company_query(cid), {"doc_id": str(document["doc_id"])}],
+                "$and": [self._company_query(cid), {"doc_id": doc_id}],
                 "text": {"$type": "string", "$ne": ""},
             }
-            version = document.get("active_ingest_version")
             if version:
                 query["ingest_version"] = version
             chunk = self.chunks.find_one(query, sort=[("chunk_index", ASCENDING)])
@@ -452,12 +760,7 @@ class MongoStore:
         doc_ids = self.chunks.distinct("doc_id", self._company_query(cid))
         if not doc_ids:
             return empty
-        active_versions: Dict[str, Optional[str]] = {}
-        for document in self.documents.find(
-            {"doc_id": {"$in": [str(doc_id) for doc_id in doc_ids]}, "status": {"$nin": ["removed", "disabled"]}},
-            {"doc_id": 1, "active_ingest_version": 1},
-        ):
-            active_versions[str(document["doc_id"])] = document.get("active_ingest_version")
+        active_versions = self._active_versions_for_doc_ids(doc_ids)
 
         fingerprints: set[str] = set()
         scanned = 0
@@ -520,12 +823,7 @@ class MongoStore:
         doc_ids = self.chunks.distinct("doc_id", self._company_query(cid))
         if not doc_ids:
             return empty
-        active_versions: Dict[str, Optional[str]] = {}
-        for document in self.documents.find(
-            {"doc_id": {"$in": [str(doc_id) for doc_id in doc_ids]}, "status": {"$nin": ["removed", "disabled"]}},
-            {"doc_id": 1, "active_ingest_version": 1},
-        ):
-            active_versions[str(document["doc_id"])] = document.get("active_ingest_version")
+        active_versions = self._active_versions_for_doc_ids(doc_ids)
 
         models: Dict[str, int] = {}
         dimensions: Dict[int, int] = {}
@@ -588,14 +886,11 @@ class MongoStore:
         if not doc_ids:
             return
 
-        for doc in self.documents.find(
-            {"doc_id": {"$in": [str(d) for d in doc_ids]}},
-            {"doc_id": 1, "active_ingest_version": 1, "status": 1},
-        ):
-            if doc.get("status") in {"removed", "disabled"}:
-                continue
-            query: Dict[str, Any] = {"doc_id": str(doc["doc_id"])}
-            version = doc.get("active_ingest_version")
+        active_versions = self._active_versions_for_doc_ids(doc_ids)
+        for doc_id, version in active_versions.items():
+            query: Dict[str, Any] = {
+                "$and": [self._company_query(cid), {"doc_id": doc_id}],
+            }
             if version:
                 query["ingest_version"] = version
             cursor = self.chunks.find(query, {"faiss_id": 1}).batch_size(batch_size)
