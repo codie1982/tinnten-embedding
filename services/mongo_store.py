@@ -299,6 +299,11 @@ class MongoStore:
         except re.error:
             return None
 
+    @staticmethod
+    def _glob_specificity(pattern: str) -> int:
+        """Literal glob length; used to resolve include/exclude tree precedence."""
+        return len(re.sub(r"[?*]", "", str(pattern or "")))
+
     @classmethod
     def _chunk_scope_query(cls, scope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         domains = [str(value).strip().lower() for value in scope.get("domains") or [] if str(value).strip()]
@@ -310,20 +315,39 @@ class MongoStore:
             return None
 
         clauses: List[Dict[str, Any]] = [{"metadata.domain": {"$in": list(dict.fromkeys(domains))}}]
-        include_regexes = [
-            regex for regex in (
-                cls._glob_url_regex(value) for value in (scope.get("includePatterns") or [])[:100]
-            ) if regex is not None
+        include_entries = [
+            (str(value), regex)
+            for value in (scope.get("includePatterns") or [])[:100]
+            if (regex := cls._glob_url_regex(value)) is not None
         ]
-        exclude_regexes = [
-            regex for regex in (
-                cls._glob_url_regex(value) for value in (scope.get("excludePatterns") or [])[:100]
-            ) if regex is not None
+        exclude_entries = [
+            (str(value), regex)
+            for value in (scope.get("excludePatterns") or [])[:100]
+            if (regex := cls._glob_url_regex(value)) is not None
         ]
-        if include_regexes:
-            clauses.append({"$or": [{"metadata.url": regex} for regex in include_regexes]})
-        if exclude_regexes:
-            clauses.append({"$nor": [{"metadata.url": regex} for regex in exclude_regexes]})
+        if include_entries:
+            include_branches: List[Dict[str, Any]] = []
+            for include_pattern, include_regex in include_entries:
+                blocking_excludes = [
+                    regex
+                    for exclude_pattern, regex in exclude_entries
+                    if cls._glob_specificity(exclude_pattern)
+                    >= cls._glob_specificity(include_pattern)
+                ]
+                include_clause: Dict[str, Any] = {"metadata.url": include_regex}
+                include_branches.append(
+                    {"$and": [
+                        include_clause,
+                        {"$nor": [{"metadata.url": regex} for regex in blocking_excludes]},
+                    ]}
+                    if blocking_excludes
+                    else include_clause
+                )
+            clauses.append({"$or": include_branches})
+        elif exclude_entries:
+            clauses.append({
+                "$nor": [{"metadata.url": regex} for _, regex in exclude_entries]
+            })
         return {"$and": clauses}
 
     def list_chunk_documents(

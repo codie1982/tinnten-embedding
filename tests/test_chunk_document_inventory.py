@@ -53,7 +53,7 @@ def test_chunk_inventory_groups_crawl_pages_without_parent_documents():
         scopes=[{
             "domains": ["tinten.ai", "www.tinten.ai"],
             "includePatterns": ["/tr/document/*"],
-            "excludePatterns": [],
+            "excludePatterns": ["/*"],
         }],
     )
 
