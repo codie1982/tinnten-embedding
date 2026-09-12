@@ -34,6 +34,10 @@ _BLOCK_TAGS = {
 _NON_CONTENT_TAGS = {"script", "style", "noscript", "iframe", "template", "svg"}
 _ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_PARAGRAPH_BOUNDARY_RE = re.compile(r"\n[ \t]*\n+")
+_SENTENCE_BOUNDARY_RE = re.compile(r"[.!?…]+(?:[\"'”’»\)\]]*)[ \t]*(?:\n+|[ \t]+)")
+_LINE_BOUNDARY_RE = re.compile(r"\n+")
+_WORD_BOUNDARY_RE = re.compile(r"\s+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +167,120 @@ def chunk_text(
     return chunks
 
 
+def _last_boundary_before(text: str, pattern: re.Pattern[str], start: int, end: int) -> Optional[int]:
+    """Return the final boundary end in ``[start, end]`` for one separator level."""
+    candidate: Optional[int] = None
+    for match in pattern.finditer(text, start, end):
+        if match.end() <= end:
+            candidate = match.end()
+    return candidate
+
+
+def _recursive_chunk_end(text: str, start: int, hard_end: int, chunk_size: int) -> int:
+    """Choose a semantic boundary without exceeding the configured hard limit."""
+    if hard_end >= len(text):
+        return len(text)
+
+    # Avoid producing pathologically small chunks merely because a paragraph
+    # separator occurs near the beginning of the window. This is the same
+    # separator hierarchy commonly used by recursive text splitters, extended
+    # with an explicit sentence boundary before the word fallback.
+    preferred_floor = start + max(1, int(chunk_size * 0.40))
+    for pattern in (
+        _PARAGRAPH_BOUNDARY_RE,
+        _SENTENCE_BOUNDARY_RE,
+        _LINE_BOUNDARY_RE,
+        _WORD_BOUNDARY_RE,
+    ):
+        candidate = _last_boundary_before(text, pattern, preferred_floor, hard_end)
+        if candidate is not None and candidate > start:
+            return candidate
+
+    # If the preferred-fill window has no separator, preserve a word whenever
+    # possible. A single token longer than chunk_size is the only case where a
+    # hard character split is unavoidable.
+    candidate = _last_boundary_before(text, _WORD_BOUNDARY_RE, start, hard_end)
+    return candidate if candidate is not None and candidate > start else hard_end
+
+
+def _recursive_overlap_start(text: str, chunk_start: int, chunk_end: int, overlap: int) -> int:
+    """Start the next window at the nearest sentence (or word) boundary."""
+    if overlap <= 0:
+        return chunk_end
+    desired = max(chunk_start + 1, chunk_end - overlap)
+
+    sentence_boundaries = list(_SENTENCE_BOUNDARY_RE.finditer(text, chunk_start, chunk_end))
+    sentence_candidates = [
+        match.end()
+        for match in sentence_boundaries
+        if chunk_start < match.end() < chunk_end
+    ]
+    if sentence_candidates:
+        return min(sentence_candidates, key=lambda value: abs(value - desired))
+
+    # A single complete sentence cannot be overlapped without either repeating
+    # the whole window or starting mid-sentence. Prefer semantic integrity and
+    # omit overlap for that edge case.
+    if sentence_boundaries:
+        return chunk_end
+
+    word_match = _WORD_BOUNDARY_RE.search(text, desired, chunk_end)
+    if word_match is not None and word_match.end() < chunk_end:
+        return word_match.end()
+    return chunk_end
+
+
+def chunk_text_recursive(
+    text: str,
+    *,
+    chunk_size: int = 1200,
+    overlap: int = 200,
+    min_chars: int = 40,
+) -> List[Chunk]:
+    """Split text at paragraph, sentence, line and word boundaries.
+
+    The configured ``chunk_size`` remains a hard character limit. Paragraphs
+    and sentences are preferred; words are preserved when a sentence itself is
+    too long. Only a single token longer than the limit is split by character.
+    Overlap also starts on a sentence boundary when one is available.
+    """
+    clean = normalize_text(text)
+    if not clean:
+        return []
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if overlap < 0:
+        raise ValueError("overlap cannot be negative")
+    if overlap >= chunk_size:
+        raise ValueError("overlap must be smaller than chunk_size")
+
+    chunks: List[Chunk] = []
+    start = 0
+    while start < len(clean):
+        hard_end = min(len(clean), start + chunk_size)
+        end = _recursive_chunk_end(clean, start, hard_end, chunk_size)
+        raw = clean[start:end]
+        left_trimmed = raw.lstrip()
+        leading = len(raw) - len(left_trimmed)
+        body = left_trimmed.rstrip()
+        body_start = start + leading
+        body_end = body_start + len(body)
+        if len(body) >= min_chars:
+            chunks.append(Chunk(
+                text=body,
+                index=len(chunks),
+                char_start=body_start,
+                char_end=body_end,
+            ))
+        if end >= len(clean):
+            break
+        next_start = _recursive_overlap_start(clean, start, end, overlap)
+        if next_start <= start:
+            next_start = end
+        start = next_start
+    return chunks
+
+
 def _iter_markdown_sections(clean: str) -> List[Tuple[List[str], int, int]]:
     """
     Markdown'ı ATX heading'lerine göre bölümlere ayırır. Her bölüm heading
@@ -264,14 +382,17 @@ def chunk_markdown_structure(
             ))
             idx += 1
             return
-        # Oversize bölüm → karakter penceresi (offset kaydırmalı), her pencereye header.
-        for sub in chunk_text(body, chunk_size=chunk_size, overlap=overlap, min_chars=min_chars):
+        # Oversize bölüm → cümle/kelime sınırı duyarlı recursive pencereler.
+        raw = clean[s:e]
+        leading = len(raw) - len(raw.lstrip())
+        body_start = s + leading
+        for sub in chunk_text_recursive(body, chunk_size=chunk_size, overlap=overlap, min_chars=min_chars):
             chunks.append(
                 Chunk(
                     text=head + sub.text,
                     index=idx,
-                    char_start=s + sub.char_start,
-                    char_end=s + sub.char_end,
+                    char_start=body_start + sub.char_start,
+                    char_end=body_start + sub.char_end,
                     heading_path=tuple(path),
                     context_header=head,
                 )

@@ -28,6 +28,10 @@ def test_explicit_structure_passthrough():
     assert R("structure", "başlıksız düz metin") == "structure"
 
 
+def test_explicit_recursive_passthrough():
+    assert R("recursive", "başlıksız düz metin") == "recursive"
+
+
 def test_unknown_strategy_passthrough():
     assert R("whatever", "# Başlık") == "whatever"
 
@@ -44,27 +48,27 @@ def test_auto_with_deep_heading_picks_structure():
     assert R("auto", "sunum\n\n### Alt Başlık\niçerik") == "structure"
 
 
-def test_auto_without_heading_picks_char():
+def test_auto_without_heading_picks_recursive():
     # Schema-derived tipik metin: düz \n-join, başlık yok.
     text = "İş Laptopu\nHafif ve güçlü\n1.499 TL\n14 gün iade"
-    assert R("auto", text) == "char"
+    assert R("auto", text) == "recursive"
 
 
 def test_auto_hash_in_prose_is_not_heading():
-    # Satır ortasındaki '#' heading değildir → char.
-    assert R("auto", "fiyat #1 tercih, C# ile yazıldı") == "char"
+    # Satır ortasındaki '#' heading değildir → recursive.
+    assert R("auto", "fiyat #1 tercih, C# ile yazıldı") == "recursive"
 
 
 def test_auto_hash_without_space_is_not_heading():
     # '#' + boşluksuz (ör. '#etiket') heading değildir.
-    assert R("auto", "#etiket #kampanya") == "char"
+    assert R("auto", "#etiket #kampanya") == "recursive"
 
 
-def test_auto_empty_text_picks_char():
-    assert R("auto", "") == "char"
-    assert R("auto", None) == "char"
+def test_auto_empty_text_picks_recursive():
+    assert R("auto", "") == "recursive"
+    assert R("auto", None) == "recursive"
 
 
 def test_auto_heading_must_be_line_start():
     # Girintili '#' (kod bloğu vb.) satır başı sayılmaz → char.
-    assert R("auto", "    # girintili") == "char"
+    assert R("auto", "    # girintili") == "recursive"

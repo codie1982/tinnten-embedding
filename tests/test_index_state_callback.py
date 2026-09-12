@@ -81,6 +81,8 @@ def test_callback_preserves_rich_worker_stats_and_legacy_aliases():
             "charCount": 321,
             "meaningfulCharCount": 300,
             "chunkMode": "automatic",
+            "chunkStrategy": "auto",
+            "resolvedChunkStrategy": "recursive",
         },
     )
 
@@ -90,6 +92,8 @@ def test_callback_preserves_rich_worker_stats_and_legacy_aliases():
         "charCount": 321,
         "meaningfulCharCount": 300,
         "chunkMode": "automatic",
+        "chunkStrategy": "auto",
+        "resolvedChunkStrategy": "recursive",
         "chunks": 3,
         "tokens": 44,
     }

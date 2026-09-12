@@ -470,10 +470,12 @@ class MongoStore:
                 "sourceSubscriptionId": {"$first": "$metadata.sourceSubscriptionId"},
                 "contentHash": {"$first": {"$ifNull": ["$metadata.contentHash", "$metadata.content_hash"]}},
                 "jobId": {"$first": {"$ifNull": ["$job_id", "$metadata.jobId"]}},
-                "chunkSize": {"$first": "$metadata.chunkSize"},
-                "chunkOverlap": {"$first": "$metadata.chunkOverlap"},
-                "chunkMode": {"$first": "$metadata.chunkMode"},
-                "chunkPolicy": {"$first": "$metadata.chunkPolicy"},
+                "chunkSize": {"$first": {"$ifNull": ["$options.chunkSize", "$metadata.chunkSize"]}},
+                "chunkOverlap": {"$first": {"$ifNull": ["$options.chunkOverlap", "$metadata.chunkOverlap"]}},
+                "chunkMode": {"$first": {"$ifNull": ["$options.chunkMode", "$metadata.chunkMode"]}},
+                "chunkPolicy": {"$first": {"$ifNull": ["$options.chunkPolicy", "$metadata.chunkPolicy"]}},
+                "chunkStrategy": {"$first": {"$ifNull": ["$chunk_strategy", "$options.chunkStrategy"]}},
+                "resolvedChunkStrategy": {"$first": "$resolved_chunk_strategy"},
             }
         }
         skip = (safe_page - 1) * safe_limit

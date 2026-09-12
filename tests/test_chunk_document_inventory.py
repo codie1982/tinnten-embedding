@@ -28,7 +28,7 @@ def test_chunk_inventory_groups_crawl_pages_without_parent_documents():
         },
     }
     store.chunks.insert_many([
-        {**base, "doc_id": "crawl-doc-1", "chunk_index": 0, "token_count": 12, "text": "ilk"},
+        {**base, "doc_id": "crawl-doc-1", "chunk_index": 0, "token_count": 12, "text": "ilk", "options": {"chunkStrategy": "auto"}, "resolved_chunk_strategy": "recursive"},
         {**base, "doc_id": "crawl-doc-1", "chunk_index": 1, "token_count": 9, "text": "ikinci"},
         {
             **base,
@@ -63,6 +63,8 @@ def test_chunk_inventory_groups_crawl_pages_without_parent_documents():
     assert result["documents"][0]["chunkCount"] == 2
     assert result["documents"][0]["tokenCount"] == 21
     assert result["documents"][0]["state"] == "indexed"
+    assert result["documents"][0]["chunkStrategy"] == "auto"
+    assert result["documents"][0]["resolvedChunkStrategy"] == "recursive"
 
 
 def test_chunk_document_detail_falls_back_to_chunk_metadata_and_is_company_scoped():

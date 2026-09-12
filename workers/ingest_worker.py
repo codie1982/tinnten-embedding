@@ -39,7 +39,12 @@ if load_dotenv is not None:
     load_dotenv()
 
 from init.rabbit_connection import connect_rabbit_with_retry
-from services.chunker import chunk_text, chunk_markdown_structure, normalize_text
+from services.chunker import (
+    chunk_markdown_structure,
+    chunk_text,
+    chunk_text_recursive,
+    normalize_text,
+)
 from services.company_index import (
     PER_COMPANY_FAISS_ENABLED,
     company_index_path,
@@ -2440,13 +2445,12 @@ class IngestWorker:
         """'auto' stratejisini içeriğe göre çözer (Faz 7 / KN3).
 
         'auto' → metinde ATX markdown başlığı varsa 'structure' (heading-path
-        context header fayda verir), yoksa 'char' (schema-derived düz metin
-        başlıksızdır → structure'ın heading avantajı yok, sentetik header'ı
-        yanıltıcı olur). 'char'/'structure' açık override'lar dokunulmadan geçer.
+        context header fayda verir), yoksa paragraf/cümle/kelime sınırlarını
+        koruyan 'recursive' kullanır. Açık override'lar dokunulmadan geçer.
         """
         if strategy != "auto":
             return strategy
-        return "structure" if _HAS_ATX_HEADING.search(text or "") else "char"
+        return "structure" if _HAS_ATX_HEADING.search(text or "") else "recursive"
 
     def _chunk_and_embed(
         self,
@@ -2471,15 +2475,15 @@ class IngestWorker:
         chunk_size = int(options.get("chunkSize") or self.chunk_size)
         chunk_overlap = int(options.get("chunkOverlap") or self.chunk_overlap)
         min_chars = int(options.get("minChars") or 80)
-        # Chunking stratejisi: "structure" (heading-aware + context header),
-        # "char" (klasik karakter penceresi) veya "auto". options > env >
-        # default("char"). "auto" (Faz 7 / KN3): markdown başlığı olan içerikte
-        # structure, olmayan (ör. schema-derived düz metin) içerikte char seçer —
-        # global structure schema sayfalarında faydasızdır çünkü heading yoktur.
-        strategy = str(
+        # Chunking stratejisi options > env > legacy default("char") sırasıyla
+        # çözülür. Yeni işler API'den açık bir strateji taşır; seçimsiz eski
+        # üreticilerin davranışı böylece değişmez.
+        requested_strategy = str(
             options.get("chunkStrategy") or os.getenv("CHUNK_STRATEGY") or "char"
         ).strip().lower()
-        strategy = self._resolve_chunk_strategy(strategy, text)
+        if requested_strategy not in {"auto", "recursive", "structure", "char"}:
+            raise ValueError(f"unsupported chunkStrategy: {requested_strategy}")
+        strategy = self._resolve_chunk_strategy(requested_strategy, text)
 
         md = metadata if isinstance(metadata, dict) else {}
         if strategy == "structure":
@@ -2490,6 +2494,13 @@ class IngestWorker:
                 min_chars=min_chars,
                 title=md.get("title"),
                 url=md.get("url"),
+            )
+        elif strategy == "recursive":
+            chunks = chunk_text_recursive(
+                text,
+                chunk_size=chunk_size,
+                overlap=chunk_overlap,
+                min_chars=min_chars,
             )
         else:
             chunks = chunk_text(
@@ -2513,6 +2524,13 @@ class IngestWorker:
                     title=md.get("title"),
                     url=md.get("url"),
                 )
+            elif strategy == "recursive":
+                chunks = chunk_text_recursive(
+                    text,
+                    chunk_size=chunk_size,
+                    overlap=chunk_overlap,
+                    min_chars=effective_min_chars,
+                )
             else:
                 chunks = chunk_text(
                     text,
@@ -2529,6 +2547,8 @@ class IngestWorker:
                 "chunkOverlap": chunk_overlap,
                 "minChars": min_chars,
                 "effectiveMinChars": effective_min_chars,
+                "chunkStrategy": requested_strategy,
+                "resolvedChunkStrategy": strategy,
             }
 
         engine = self._engine_for_company(company_id)
@@ -2557,6 +2577,8 @@ class IngestWorker:
                     "context_prefix_chars": len(chunk.context_header),
                     "embedding_model": str(getattr(engine, "model_name", "") or ""),
                     "embedding_dimension": int(embeddings.shape[1]),
+                    "chunk_strategy": requested_strategy,
+                    "resolved_chunk_strategy": strategy,
                     "char_start": chunk.char_start,
                     "char_end": chunk.char_end,
                     "doc_type": doc_type,
@@ -2591,6 +2613,8 @@ class IngestWorker:
             "chunkMode": options.get("chunkMode") or "manual",
             "chunkPolicy": options.get("chunkPolicy"),
             "chunkCharacterCount": options.get("chunkCharacterCount") or len(text or ""),
+            "chunkStrategy": requested_strategy,
+            "resolvedChunkStrategy": strategy,
         }
 
     # ------------------------------------------------------------------

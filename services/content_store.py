@@ -111,6 +111,15 @@ def normalize_index_options(
         min_chars_value = default_min_chars
     opts["minChars"] = int(min_chars_value)
 
+    chunk_strategy_value = opts.pop("chunk_strategy", None) or opts.get("chunkStrategy")
+    if chunk_strategy_value is not None:
+        chunk_strategy = str(chunk_strategy_value).strip().lower()
+        if chunk_strategy not in {"auto", "recursive", "structure", "char"}:
+            raise ValueError(
+                "chunkStrategy must be one of: auto, recursive, structure, char"
+            )
+        opts["chunkStrategy"] = chunk_strategy
+
     opts["cleanup"] = _coerce_bool(opts.get("cleanup"))
     opts["ocr"] = _coerce_bool(opts.get("ocr"))
     opts["langDetect"] = _coerce_bool(opts.get("langDetect") or opts.get("lang_detect"))
@@ -545,6 +554,7 @@ class ContentDocumentStore:
             "chunkSize": int(options.get("chunkSize") or 0),
             "chunkOverlap": int(options.get("chunkOverlap") or 0),
             "minChars": int(options.get("minChars") or 0),
+            "chunkStrategy": options.get("chunkStrategy"),
         }
 
         canonical_state = _canonical_index_state(state)

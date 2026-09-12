@@ -114,6 +114,8 @@ class TinntenServerClient:
                 "effectiveMinChars",
                 "chunkMode",
                 "chunkPolicy",
+                "chunkStrategy",
+                "resolvedChunkStrategy",
                 "chunkCharacterCount",
                 "extractedCharCount",
                 "meaningfulCharCount",
