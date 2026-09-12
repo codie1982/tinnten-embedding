@@ -39,7 +39,7 @@ if load_dotenv is not None:
     load_dotenv()
 
 from init.rabbit_connection import connect_rabbit_with_retry
-from services.chunker import chunk_text, chunk_markdown_structure
+from services.chunker import chunk_text, chunk_markdown_structure, normalize_text
 from services.company_index import (
     PER_COMPANY_FAISS_ENABLED,
     company_index_path,
@@ -2461,6 +2461,12 @@ class IngestWorker:
         ownership_guard: Optional[Callable[[], bool]] = None,
         expected_job_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        # Son savunma hattı: kaynağın HTML/markdown/text olmasından bağımsız
+        # olarak tag ve entity kalıntılarını chunk sınırları hesaplanmadan önce
+        # temizle. chunker fonksiyonları da aynı normalizasyonu uygular; burada
+        # ayrıca yapmak dinamik chunk boyutunun temiz metin uzunluğuna göre
+        # belirlenmesini sağlar.
+        text = normalize_text(text)
         options = resolve_dynamic_chunking(options, len(text or ""))
         chunk_size = int(options.get("chunkSize") or self.chunk_size)
         chunk_overlap = int(options.get("chunkOverlap") or self.chunk_overlap)

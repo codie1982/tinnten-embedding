@@ -3,12 +3,37 @@ Utility helpers for chunking plain text into overlapping windows prior to embedd
 """
 from __future__ import annotations
 
+import html
 import re
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
+from bs4 import BeautifulSoup, Comment
+
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_HTML_TAG_RE = re.compile(
+    r"</?(?:html|head|body|main|article|section|aside|div|p|br|hr|h[1-6]|"
+    r"span|a|ul|ol|li|dl|dt|dd|table|thead|tbody|tfoot|tr|td|th|caption|"
+    r"strong|em|b|i|u|small|mark|code|pre|blockquote|figure|figcaption|"
+    r"script|style|noscript|nav|footer|header|iframe|template|svg)\b[^>]*>",
+    re.IGNORECASE,
+)
+_PAIRED_HTML_TAG_RE = re.compile(
+    r"<([A-Za-z][A-Za-z0-9:_-]*)\b[^>]*>.*?</\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_BLOCK_TAGS = {
+    "address", "article", "aside", "blockquote", "caption", "dd", "div",
+    "dl", "dt", "figcaption", "figure", "footer", "form", "h1", "h2",
+    "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav",
+    "ol", "p", "pre", "section", "table", "tbody", "td", "tfoot", "th",
+    "thead", "tr", "ul",
+}
+_NON_CONTENT_TAGS = {"script", "style", "noscript", "iframe", "template", "svg"}
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,12 +52,60 @@ class Chunk:
 
 def normalize_text(text: str) -> str:
     """
-    Lightweight normalisation applied before chunking.
-    Currently only strips leading/trailing whitespace and collapses CRLF.
+    Normalise and sanitise text immediately before chunking.
+
+    In addition to newline/whitespace normalisation, remove residual HTML tags,
+    comments and non-content elements. This is intentionally done at the shared
+    chunker boundary so inline text, fetcher records, uploads and legacy callers
+    receive the same protection. Plain text comparisons such as ``5 < 10`` are
+    left untouched because parsing is only enabled when a known HTML tag exists.
     """
     if not isinstance(text, str):
         raise TypeError("text must be a string")
-    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    clean = text.replace("\r\n", "\n").replace("\r", "\n")
+    clean = _ZERO_WIDTH_RE.sub("", clean)
+    clean = _CONTROL_RE.sub("", clean)
+
+    # Decode entities first so escaped fragments such as ``&lt;div&gt;`` are
+    # detected and removed as well. Two passes cover commonly double-escaped
+    # crawler output without looping indefinitely on malformed input.
+    for _ in range(2):
+        decoded = html.unescape(clean)
+        if decoded == clean:
+            break
+        clean = decoded
+
+    clean = _HTML_COMMENT_RE.sub("", clean)
+    if _HTML_TAG_RE.search(clean) or _PAIRED_HTML_TAG_RE.search(clean):
+        soup = BeautifulSoup(clean, "html.parser")
+        for node in soup.find_all(string=lambda value: isinstance(value, Comment)):
+            node.extract()
+        for tag in soup.find_all(_NON_CONTENT_TAGS):
+            tag.decompose()
+
+        # Preserve meaningful layout while dropping markup. Markdown headings
+        # already present outside HTML fragments remain unchanged.
+        for heading in soup.find_all(re.compile(r"^h[1-6]$", re.IGNORECASE)):
+            level = int(str(heading.name)[1])
+            title = heading.get_text(" ", strip=True)
+            heading.replace_with(f"\n{'#' * level} {title}\n" if title else "\n")
+        for br in soup.find_all("br"):
+            br.replace_with("\n")
+        for tag in soup.find_all(_BLOCK_TAGS):
+            tag.insert_before("\n")
+            tag.insert_after("\n")
+        clean = soup.get_text(separator="", strip=False)
+
+    # Best-effort removal for malformed known tags BeautifulSoup could not
+    # consume. Unknown angle-bracket text is retained to avoid damaging prose.
+    clean = _HTML_TAG_RE.sub("", clean)
+    clean = clean.replace("\xa0", " ")
+    clean = re.sub(r"[ \t]+\n", "\n", clean)
+    clean = re.sub(r"\n[ \t]+", "\n", clean)
+    clean = re.sub(r"[ \t]{2,}", " ", clean)
+    clean = re.sub(r"\n{3,}", "\n\n", clean)
+    return clean.strip()
 
 
 def chunk_text(
