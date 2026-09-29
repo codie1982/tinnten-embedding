@@ -6,7 +6,10 @@ badge'i güncellesin. Diğer source'larda bu alanlar OLMAMALI.
 """
 import queue
 import threading
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+
+import mongomock
 
 from services.tinnten_server_client import TinntenServerClient
 
@@ -309,3 +312,148 @@ def test_callback_soft_failure_is_retried(mocker):
         )
 
     assert get_cli.return_value.update_document_index_state.call_count == 3
+
+
+def _durable_content_store():
+    from services.content_store import ContentDocumentStore
+
+    store = ContentDocumentStore.__new__(ContentDocumentStore)
+    store.db = mongomock.MongoClient()["tinnten"]
+    store.documents = store.db["contentdocuments"]
+    store.logs = store.db["contentdocumentlogs"]
+    return store
+
+
+def _pending_record(event_id="event-1"):
+    now = datetime.now(timezone.utc)
+    return {
+        "eventId": event_id,
+        "companyId": "C1",
+        "documentId": "D1",
+        "jobId": "J1",
+        "userId": None,
+        "trigger": "manual",
+        "options": {},
+        "attempt": 1,
+        "state": "completed",
+        "stats": {"chunkCount": 1},
+        "errorMsg": None,
+        "callbackDomain": None,
+        "callbackSource": None,
+        "createdAt": now,
+        "nextAttemptAt": now,
+        "attempts": 0,
+        "leaseOwner": None,
+        "leaseUntil": None,
+    }
+
+
+def test_terminal_state_and_callback_intent_are_written_atomically():
+    from workers import ingest_worker as iw
+
+    worker = _worker_for_state_callback(chunk_docs=[])
+    worker.callback_outbox_enabled = True
+    worker._submit_index_state_callback = MagicMock()
+    context = iw.DocumentJobContext(
+        company_id="C1",
+        document_id="D1",
+        job_id="J1",
+        user_id=None,
+        trigger="manual",
+        options={},
+        attempt=4,
+    )
+
+    assert worker._safe_update_index_state(
+        context,
+        state="quota_blocked",
+        stats={"chunkCount": 0},
+        error="index quota exceeded",
+    ) is True
+
+    update = worker.content_store.update_index_fields.call_args.kwargs
+    pending = update["extra_updates"]["index.callbackPending"]
+    assert pending["state"] == "quota_blocked"
+    assert pending["jobId"] == "J1"
+    assert pending["attempt"] == 4
+    assert pending["errorMsg"] == "index quota exceeded"
+    worker._submit_index_state_callback.assert_called_once()
+    assert worker._submit_index_state_callback.call_args.kwargs["_event_id"] == pending["eventId"]
+
+
+def test_callback_outbox_claim_retry_and_completion_are_lease_safe():
+    store = _durable_content_store()
+    store.documents.insert_one(
+        {
+            "companyId": "C1",
+            "documentId": "D1",
+            "index": {"jobId": "J1", "callbackPending": _pending_record()},
+        }
+    )
+    at = datetime.now(timezone.utc) + timedelta(seconds=1)
+
+    claimed = store.claim_index_callback(
+        company_id="C1",
+        document_id="D1",
+        event_id="event-1",
+        lease_owner="worker-a",
+        lease_seconds=30,
+        now=at,
+    )
+    assert claimed["eventId"] == "event-1"
+    assert store.claim_index_callback(
+        company_id="C1",
+        document_id="D1",
+        event_id="event-1",
+        lease_owner="worker-b",
+        lease_seconds=30,
+        now=at,
+    ) is None
+
+    retry_at = at + timedelta(seconds=10)
+    assert store.retry_index_callback(
+        company_id="C1",
+        document_id="D1",
+        event_id="event-1",
+        lease_owner="worker-a",
+        next_attempt_at=retry_at,
+        error="server unavailable",
+    ) is True
+    assert store.claim_index_callback(
+        lease_owner="worker-b", lease_seconds=30, now=retry_at - timedelta(seconds=1)
+    ) is None
+    claimed_again = store.claim_index_callback(
+        lease_owner="worker-b", lease_seconds=30, now=retry_at
+    )
+    assert claimed_again["attempts"] == 1
+    assert store.complete_index_callback(
+        company_id="C1",
+        document_id="D1",
+        event_id="event-1",
+        lease_owner="worker-b",
+    ) is True
+    stored = store.documents.find_one({"companyId": "C1", "documentId": "D1"})
+    assert "callbackPending" not in stored["index"]
+
+
+def test_startup_replay_delivers_crash_left_callback():
+    from workers.ingest_worker import IngestWorker
+
+    store = _durable_content_store()
+    store.documents.insert_one(
+        {
+            "companyId": "C1",
+            "documentId": "D1",
+            "index": {"jobId": "J1", "callbackPending": _pending_record()},
+        }
+    )
+    worker = IngestWorker.__new__(IngestWorker)
+    worker.content_store = store
+    worker._callback_lease_owner = "replay-worker"
+    worker._deliver_index_state_callback = MagicMock(return_value=True)
+
+    worker._replay_one_index_state_callback()
+
+    worker._deliver_index_state_callback.assert_called_once()
+    stored = store.documents.find_one({"companyId": "C1", "documentId": "D1"})
+    assert "callbackPending" not in stored["index"]

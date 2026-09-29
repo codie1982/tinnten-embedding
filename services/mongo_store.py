@@ -181,6 +181,89 @@ class MongoStore:
     def get_document(self, doc_id: str) -> Optional[Dict[str, Any]]:
         return self.documents.find_one({"doc_id": doc_id})
 
+    def stage_document_quota_release(
+        self, doc_id: str, *, purpose: str, snapshots: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Persist removal usage before chunks can be destructively deleted."""
+        existing = self.documents.find_one(
+            {"doc_id": str(doc_id)}, {"quota_release_pending": 1}
+        ) or {}
+        pending = existing.get("quota_release_pending")
+        if isinstance(pending, dict) and isinstance(pending.get("snapshots"), list):
+            return pending
+
+        now = datetime.now(timezone.utc)
+        payload = {
+            "purpose": str(purpose),
+            "snapshots": list(snapshots or []),
+            "created_at": now,
+        }
+        self.documents.update_one(
+            {"doc_id": str(doc_id)},
+            {
+                "$set": {"quota_release_pending": payload, "updated_at": now},
+                "$setOnInsert": {
+                    "doc_id": str(doc_id),
+                    "status": "removing",
+                    "created_at": now,
+                },
+            },
+            upsert=True,
+        )
+        current = self.documents.find_one(
+            {"doc_id": str(doc_id)}, {"quota_release_pending": 1}
+        ) or {}
+        return current.get("quota_release_pending") or payload
+
+    def clear_document_quota_release(self, doc_id: str, *, purpose: str) -> bool:
+        result = self.documents.update_one(
+            {
+                "doc_id": str(doc_id),
+                "quota_release_pending.purpose": str(purpose),
+            },
+            {
+                "$unset": {"quota_release_pending": ""},
+                "$set": {"updated_at": datetime.now(timezone.utc)},
+            },
+        )
+        return int(result.modified_count or 0) > 0
+
+    def list_pending_index_quota_documents(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Return a bounded batch of crash-recoverable quota settlement intents."""
+        batch_size = max(1, min(int(limit or 1), 1000))
+        return list(
+            self.documents.find(
+                {
+                    "$or": [
+                        {"quota_swap_pending": {"$exists": True, "$ne": {}}},
+                        {"quota_release_pending": {"$exists": True, "$ne": {}}},
+                    ]
+                },
+                {
+                    "_id": 0,
+                    "doc_id": 1,
+                    "quota_swap_pending": 1,
+                    "quota_release_pending": 1,
+                },
+            )
+            .sort("updated_at", ASCENDING)
+            .limit(batch_size)
+        )
+
+    def touch_pending_index_quota_document(self, doc_id: str) -> bool:
+        """Move a failed retry behind older pending rows to avoid starvation."""
+        result = self.documents.update_one(
+            {
+                "doc_id": str(doc_id),
+                "$or": [
+                    {"quota_swap_pending": {"$exists": True}},
+                    {"quota_release_pending": {"$exists": True}},
+                ],
+            },
+            {"$set": {"updated_at": datetime.now(timezone.utc)}},
+        )
+        return int(result.matched_count or 0) > 0
+
     # ------------------------------------------------------------------
     # Chunk helpers
     # ------------------------------------------------------------------
@@ -216,6 +299,68 @@ class MongoStore:
             query["ingest_version"] = str(ingest_version)
         cursor = self.chunks.find(query).sort("chunk_index", ASCENDING)
         return list(cursor)
+
+    def get_active_chunks_by_doc(self, doc_id: str) -> List[Dict[str, Any]]:
+        """Return only the currently visible version of one document."""
+        document = self.get_document(str(doc_id)) or {}
+        if (
+            str(document.get("status") or "").lower() in {"disabled", "removed"}
+            or document.get("index_quota_released") is True
+        ):
+            return []
+        active_version = document.get("active_ingest_version")
+        return self.get_chunks_by_doc(
+            str(doc_id), ingest_version=str(active_version) if active_version else None
+        )
+
+    @staticmethod
+    def logical_vector_bytes(
+        chunks: Iterable[Dict[str, Any]], *, fallback_dimension: Optional[int] = None
+    ) -> int:
+        """Float32 logical payload size, independent of FAISS file overhead."""
+        total = 0
+        fallback = int(fallback_dimension or 0)
+        for chunk in chunks or []:
+            raw_dimension = (chunk or {}).get("embedding_dimension") or fallback
+            try:
+                dimension = int(raw_dimension)
+            except (TypeError, ValueError):
+                dimension = 0
+            if dimension > 0:
+                total += dimension * 4
+        return total
+
+    def get_company_active_index_usage(
+        self, company_id: str, *, fallback_dimension: Optional[int] = None
+    ) -> Dict[str, int]:
+        """Count active documents and exact logical float32 bytes for bootstrap."""
+        cid = str(company_id or "").strip()
+        if not cid:
+            return {"documents": 0, "vectorBytes": 0}
+        doc_ids = [
+            str(value)
+            for value in self.chunks.distinct("doc_id", self._company_query(cid))
+            if value is not None
+        ]
+        active_versions = self._active_versions_for_doc_ids(doc_ids)
+        documents = 0
+        vector_bytes = 0
+        for doc_id, version in active_versions.items():
+            query: Dict[str, Any] = {
+                "$and": [self._company_query(cid), {"doc_id": doc_id}],
+            }
+            if version:
+                query["ingest_version"] = version
+            chunks = list(
+                self.chunks.find(query, {"embedding_dimension": 1})
+            )
+            if not chunks:
+                continue
+            documents += 1
+            vector_bytes += self.logical_vector_bytes(
+                chunks, fallback_dimension=fallback_dimension
+            )
+        return {"documents": documents, "vectorBytes": vector_bytes}
 
     def get_chunks_page_by_doc(
         self,
@@ -617,19 +762,93 @@ class MongoStore:
         version: str,
         *,
         expected_job_id: Optional[str] = None,
+        quota_pending: Optional[Dict[str, Any]] = None,
         session=None,
     ) -> bool:
         """Dokümanın aktif sürümünü işaretler — arama yalnız bunu görür."""
         query: Dict[str, Any] = {"doc_id": doc_id}
         if expected_job_id is not None:
             query["job_id"] = str(expected_job_id)
+        set_fields: Dict[str, Any] = {
+            "active_ingest_version": version,
+            "index_quota_released": False,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        if quota_pending is not None:
+            set_fields["quota_swap_pending"] = quota_pending
         result = self.documents.update_one(
             query,
-            {"$set": {"active_ingest_version": version, "updated_at": datetime.now(timezone.utc)}},
+            {"$set": set_fields},
             upsert=False,
             session=session,
         )
         return int(result.matched_count or 0) > 0
+
+    def stage_index_quota_swap_pending(
+        self, doc_id: str, context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Persist a pre-activation quota intent before any remote reserve.
+
+        A process may die after the quota HTTP request but before returning to
+        Python. Recording every planned metric first lets the recovery scanner
+        issue the reservation-only cancellation safely for both outcomes.
+        """
+        revision = str((context or {}).get("revision") or "").strip()
+        if not revision:
+            raise ValueError("quota swap revision is required")
+        payload = dict(context or {})
+        payload["phase"] = "reserving"
+        payload["created_at"] = datetime.now(timezone.utc)
+        result = self.documents.update_one(
+            {
+                "doc_id": str(doc_id),
+                "$or": [
+                    {"quota_swap_pending": {"$exists": False}},
+                    {"quota_swap_pending": None},
+                    {"quota_swap_pending.revision": revision},
+                ],
+            },
+            {
+                "$set": {
+                    "quota_swap_pending": payload,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+            upsert=False,
+        )
+        if int(result.matched_count or 0) <= 0:
+            raise RuntimeError(
+                f"could not stage index quota intent doc_id={doc_id} revision={revision}"
+            )
+        current = self.documents.find_one(
+            {"doc_id": str(doc_id)}, {"quota_swap_pending": 1}
+        ) or {}
+        return current.get("quota_swap_pending") or payload
+
+    def mark_document_index_quota_released(self, doc_id: str) -> bool:
+        result = self.documents.update_one(
+            {"doc_id": str(doc_id)},
+            {
+                "$set": {
+                    "index_quota_released": True,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+        return int(result.matched_count or 0) > 0
+
+    def clear_index_quota_swap_pending(self, doc_id: str, revision: str) -> bool:
+        result = self.documents.update_one(
+            {
+                "doc_id": str(doc_id),
+                "quota_swap_pending.revision": str(revision),
+            },
+            {
+                "$unset": {"quota_swap_pending": ""},
+                "$set": {"updated_at": datetime.now(timezone.utc)},
+            },
+        )
+        return int(result.modified_count or 0) > 0
 
     @staticmethod
     def _company_domain_query(company_id: str, domain: str) -> Dict[str, Any]:
@@ -672,10 +891,18 @@ class MongoStore:
             return active_versions
         for document in self.documents.find(
             {"doc_id": {"$in": normalized_ids}},
-            {"doc_id": 1, "active_ingest_version": 1, "status": 1},
+            {
+                "doc_id": 1,
+                "active_ingest_version": 1,
+                "status": 1,
+                "index_quota_released": 1,
+            },
         ):
             doc_id = str(document.get("doc_id") or "")
-            if document.get("status") in {"removed", "disabled"}:
+            if (
+                document.get("status") in {"removed", "disabled"}
+                or document.get("index_quota_released") is True
+            ):
                 active_versions.pop(doc_id, None)
             else:
                 active_versions[doc_id] = document.get("active_ingest_version")

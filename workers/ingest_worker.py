@@ -13,11 +13,12 @@ import threading
 import time
 import traceback
 import gzip
+import hashlib
 import io
 from urllib.parse import unquote, urlparse
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pika
@@ -64,7 +65,13 @@ from services.content_validation import (
 )
 from services.email_queue_events import EmbeddingEmailEvents
 from services.error_logger import EmbeddingErrorLogger
-from services.tinnten_server_client import get_tinnten_server_client
+from services.index_quota import mutate_index_quota
+from services.tinnten_server_client import (
+    QuotaExceededError,
+    QuotaServiceError,
+    get_tinnten_server_client,
+)
+from services.inbound_service_auth import validate_quota_runtime_config
 from init.aws import get_s3_client
 
 
@@ -83,6 +90,12 @@ DEFAULT_BATCH_MAX_MESSAGES = 16
 DEFAULT_BATCH_MAX_WAIT_SECONDS = 5.0
 # tinnten-server bildirim kuyruğu tavanı (bkz. `_submit_index_state_callback`).
 DEFAULT_CALLBACK_QUEUE_SIZE = 2000
+DEFAULT_CALLBACK_OUTBOX_POLL_SECONDS = 1.0
+DEFAULT_CALLBACK_OUTBOX_LEASE_SECONDS = 30
+DEFAULT_CALLBACK_OUTBOX_BACKOFF_SECONDS = 5.0
+DEFAULT_CALLBACK_OUTBOX_MAX_BACKOFF_SECONDS = 900.0
+DEFAULT_INDEX_QUOTA_RECOVERY_BATCH_SIZE = 200
+DEFAULT_INDEX_QUOTA_RECOVERY_INTERVAL_SECONDS = 60.0
 
 # 'auto' chunk stratejisi: metinde ATX markdown başlığı var mı? (Faz 7 / KN3)
 # Yalnız satır başı '#'ler heading sayılır — böylece schema-derived düz metinde
@@ -328,8 +341,23 @@ class IngestWorker:
         )
         self._callback_thread: Optional[threading.Thread] = None
         self._callback_lock = threading.RLock()
+        self._quota_recovery_thread: Optional[threading.Thread] = None
+        self._quota_recovery_lock = threading.RLock()
+        # The callback itself is asynchronous, but its intent is persisted in
+        # contentdocuments.index.callbackPending together with index.state.
+        # `_callback_replay_enabled` is switched on by `start()` so unit-level
+        # worker construction never opens background DB connections.
+        self.callback_outbox_enabled = True
+        self._callback_replay_enabled = False
+        self._callback_lease_owner = f"ingest-callback:{os.getpid()}:{uuid.uuid4()}"
         self.email_events = EmbeddingEmailEvents()
         self.error_logger = EmbeddingErrorLogger(component="worker")
+        self.index_quota_enabled = (
+            os.getenv("INDEX_QUOTA_ENABLED") or "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.quota_fail_open = (
+            os.getenv("QUOTA_FAIL_OPEN") or "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
 
     def _get_store(self) -> MongoStore:
         if self.store is not None:
@@ -445,6 +473,12 @@ class IngestWorker:
     # ------------------------------------------------------------------
     def start(self) -> None:
         log("Starting ingest worker...")
+        # Replay callbacks left by a previous crashed process before/while new
+        # ingest messages are consumed. Claims are lease protected, so several
+        # worker processes may safely run this loop against the same database.
+        self._callback_replay_enabled = True
+        self._ensure_callback_worker()
+        self._ensure_index_quota_recovery_worker()
         log(
             "Config: queues=%s rabbit=%s:%s vhost=%s index_path=%s model=%s",
             self.queue_names,
@@ -504,6 +538,13 @@ class IngestWorker:
                 thread.join(timeout=30)
         except Exception as exc:  # noqa: BLE001
             log(f"WARNING: callback drain failed: {exc}")
+        try:
+            with self._quota_recovery_lock:
+                quota_thread = self._quota_recovery_thread
+            if quota_thread is not None and quota_thread.is_alive():
+                quota_thread.join(timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            log(f"WARNING: quota recovery shutdown failed: {exc}")
         try:
             if self.channel and self.channel.is_open:
                 self.channel.stop_consuming()
@@ -686,9 +727,14 @@ class IngestWorker:
                     payload_job_id = str(
                         payload.get("jobId") or payload.get("job_id") or ""
                     ).strip()
+                    terminal_status = (
+                        "quota_blocked"
+                        if isinstance(exc, QuotaExceededError)
+                        else "failed"
+                    )
                     status_applied = self._get_store().update_document_status(
                         doc_id,
-                        status="failed",
+                        status=terminal_status,
                         error=str(exc),
                         expected_job_id=payload_job_id or None,
                     )
@@ -711,7 +757,7 @@ class IngestWorker:
                     ):
                         self._get_upload_store().update_upload_status(
                             str(upload_id),
-                            index_status="failed",
+                            index_status=terminal_status,
                             is_file_opened=True,
                             file_open_error=str(exc),
                         )
@@ -1085,6 +1131,8 @@ class IngestWorker:
                         "faiss_id": int(faiss_id),
                         "ingest_version": version,
                         "text": chunk.get("text") or "",
+                        "embedding_model": str(getattr(engine, "model_name", "") or ""),
+                        "embedding_dimension": int(embeddings_arr.shape[1]),
                         "char_start": chunk.get("char_start"),
                         "char_end": chunk.get("char_end"),
                         "doc_type": doc_type,
@@ -1101,10 +1149,15 @@ class IngestWorker:
         # yapıyordu; bu sıra adım ortasında patlarsa iki store ayrışır.
         self._swap_in_chunks(
             doc_id=doc_id,
+            company_id=_resolve_company_id(metadata),
             engine=engine,
             embeddings=embeddings_arr,
             build_chunk_docs=build_chunk_docs,
             chunk_count=len(chunks),
+            expected_job_id=(
+                str(payload.get("jobId") or payload.get("job_id") or "").strip()
+                or None
+            ),
         )
         store.update_document_status(doc_id, status="ready", chunk_count=len(chunks))
         if upload_id and owns_upload_lifecycle:
@@ -1425,6 +1478,63 @@ class IngestWorker:
             # Ownership loss is not a terminal content failure. The new owner
             # (or this message after redelivery) must decide final state.
             raise
+        except QuotaExceededError as exc:
+            finished_at = datetime.now(timezone.utc)
+            quota_error_data = getattr(exc, "data", {}) or {}
+            metric = str(
+                quota_error_data.get("metric")
+                or quota_error_data.get("limitType")
+                or quota_error_data.get("resource")
+                or "index"
+            )
+            error_msg = f"quota_exceeded:{metric}"
+            quota_stats = dict(base_stats)
+            quota_stats["failureReason"] = error_msg
+            update_applied = self._safe_update_index_state(
+                context,
+                state="quota_blocked",
+                stats=quota_stats,
+                error=error_msg,
+                extra={"index.finishedAt": finished_at},
+            )
+            if not update_applied:
+                raise RetryableIngestLockError(
+                    f"quota-blocked state was not persisted doc_id={context.document_id}"
+                ) from exc
+            active_chunk_count = len(
+                self._get_store().get_active_chunks_by_doc(context.document_id)
+            )
+            status_applied = self._get_store().update_document_status(
+                context.document_id,
+                status="quota_blocked",
+                chunk_count=active_chunk_count,
+                error=error_msg,
+                expected_job_id=context.job_id,
+            )
+            if status_applied is False:
+                raise RetryableIngestLockError(
+                    f"quota-blocked ownership lost doc_id={context.document_id}"
+                ) from exc
+            if (
+                is_file_backed_source(resolved_source.get("source"))
+                and _owns_upload_lifecycle(context.trigger)
+                and resolved_source.get("upload_id")
+            ):
+                self._get_upload_store().update_upload_status(
+                    str(resolved_source["upload_id"]),
+                    index_status="quota_blocked",
+                    is_file_opened=True,
+                    file_open_error=error_msg,
+                    embedding_doc_id=context.document_id,
+                )
+            self._log_document_event(
+                context,
+                level="warning",
+                message="Index quota exhausted.",
+                state="quota_blocked",
+                details={"metric": metric},
+            )
+            return
         except NonIndexableFileContentError as exc:
             finished_at = datetime.now(timezone.utc)
             failure_stats = dict(base_stats)
@@ -2369,6 +2479,7 @@ class IngestWorker:
         embeddings: "np.ndarray",
         build_chunk_docs,
         chunk_count: int,
+        company_id: Optional[str] = None,
         ownership_guard: Optional[Callable[[], bool]] = None,
         expected_job_id: Optional[str] = None,
     ) -> str:
@@ -2390,12 +2501,24 @@ class IngestWorker:
         Dönen değer: yeni `ingest_version`.
         """
         store = self._get_store()
+        self._recover_pending_index_quota(doc_id)
         version = uuid.uuid4().hex
+        vector_dimension = int(embeddings.shape[1])
+        quota_revision = self._index_quota_revision(
+            embeddings, expected_job_id=expected_job_id
+        )
+        quota_context = self._prepare_index_quota_change(
+            company_id=company_id,
+            doc_id=doc_id,
+            revision=quota_revision,
+            new_chunk_count=chunk_count,
+            new_dimension=vector_dimension,
+        )
         faiss_ids = store.reserve_faiss_ids(chunk_count)
 
-        # 1) Yeni vektörler FAISS'e — eskiyi HENÜZ silmiyoruz.
-        engine.add_embeddings(embeddings, faiss_ids)
         try:
+            # 1) Yeni vektörler FAISS'e — eskiyi HENÜZ silmiyoruz.
+            engine.add_embeddings(embeddings, faiss_ids)
             # 2) Yeni chunk'lar Mongo'ya, yeni sürüm etiketiyle.
             chunk_docs = build_chunk_docs(faiss_ids, version)
             store.insert_chunks(chunk_docs)
@@ -2407,14 +2530,52 @@ class IngestWorker:
                     f"ingest lock ownership lost before activation doc_id={doc_id}"
                 )
             # 3) Görünürlüğü çevir: arama artık yalnız bu sürümü görür.
+            quota_pending = None
+            if quota_context and (
+                quota_context.get("reserved")
+                or any(
+                    int(delta or 0) < 0
+                    for delta in (quota_context.get("deltas") or {}).values()
+                )
+            ):
+                quota_pending = {**quota_context, "phase": "activated"}
             activated = store.set_active_ingest_version(
-                doc_id, version, expected_job_id=expected_job_id
+                doc_id,
+                version,
+                expected_job_id=expected_job_id,
+                quota_pending=quota_pending,
             )
             if activated is False:
                 raise RetryableIngestLockError(
                     f"embedding document ownership lost before activation doc_id={doc_id}"
                 )
         except Exception:
+            # Mongo update acknowledgement can be lost after the active version
+            # and its `phase=activated` intent were actually persisted. Never
+            # cancel quota or delete that version in the ambiguous case; the
+            # bounded recovery scanner will commit the durable intent.
+            try:
+                current = store.get_document(str(doc_id)) or {}
+            except Exception:  # noqa: BLE001
+                current = {}
+            durable_pending = current.get("quota_swap_pending")
+            activation_persisted = (
+                str(current.get("active_ingest_version") or "") == str(version)
+                and isinstance(durable_pending, dict)
+                and str(durable_pending.get("revision") or "")
+                == str((quota_context or {}).get("revision") or "")
+                and str(durable_pending.get("phase") or "") == "activated"
+            )
+            if activation_persisted:
+                raise RetryableIngestLockError(
+                    f"index quota settlement pending after ambiguous activation "
+                    f"doc_id={doc_id}"
+                )
+            cancelled = self._cancel_planned_index_quota_reservations(quota_context)
+            if cancelled and quota_context and quota_context.get("planned"):
+                store.clear_index_quota_swap_pending(
+                    doc_id, str(quota_context.get("revision") or "")
+                )
             # Telafi: yeni sürüm asla aktif olmadı → eski sürüm sağlam. Yeni
             # yazdıklarımızı geri alıp hatayı yukarı bırakıyoruz.
             try:
@@ -2426,6 +2587,21 @@ class IngestWorker:
             except Exception as exc:  # noqa: BLE001
                 log(f"WARNING: compensation delete_chunks failed doc_id={doc_id}: {exc}")
             raise
+
+        # Visibility switched successfully. Commit growth only now; a failed
+        # commit/release leaves a durable recovery context on the document.
+        commit_ok = self._settle_index_quota_reservations(
+            quota_context, action="commit"
+        )
+        shrink_ok = self._release_index_quota_shrink(quota_context)
+        if quota_pending and commit_ok and shrink_ok:
+            store.clear_index_quota_swap_pending(
+                doc_id, str(quota_context.get("revision") or "")
+            )
+        elif quota_pending:
+            raise RetryableIngestLockError(
+                f"index quota settlement pending doc_id={doc_id}"
+            )
 
         # 4) Eski sürümü temizle. Buradaki hata veriyi BOZMAZ (yalnız yetim
         # kayıt bırakır) — aktif sürüm zaten doğru; o yüzden yutup logluyoruz.
@@ -2439,6 +2615,392 @@ class IngestWorker:
         except Exception as exc:  # noqa: BLE001
             log(f"WARNING: stale cleanup failed doc_id={doc_id} version={version}: {exc}")
         return version
+
+    def _recover_pending_index_quota(self, doc_id: str) -> None:
+        """Finish the post-swap ledger step after a crash or transient outage."""
+        store = self._get_store()
+        document = store.get_document(str(doc_id)) or {}
+        context = document.get("quota_swap_pending")
+        if not isinstance(context, dict):
+            return
+        if str(context.get("phase") or "activated") == "reserving":
+            recovered = self._cancel_planned_index_quota_reservations(context)
+        else:
+            commit_ok = self._settle_index_quota_reservations(
+                context, action="commit"
+            )
+            shrink_ok = self._release_index_quota_shrink(context)
+            recovered = commit_ok and shrink_ok
+        if not recovered:
+            raise RetryableIngestLockError(
+                f"index quota recovery pending doc_id={doc_id}"
+            )
+        store.clear_index_quota_swap_pending(
+            str(doc_id), str(context.get("revision") or "")
+        )
+
+    def _recover_pending_document_quota_release(
+        self, document: Dict[str, Any]
+    ) -> bool:
+        """Replay a durable remove/disable release staged by the API process."""
+        store = self._get_store()
+        doc_id = str((document or {}).get("doc_id") or "").strip()
+        pending = (document or {}).get("quota_release_pending")
+        if not doc_id or not isinstance(pending, dict):
+            return True
+        purpose = str(pending.get("purpose") or "remove")
+        snapshots = pending.get("snapshots") or []
+        for snapshot in snapshots:
+            for metric in ("documents", "vectorBytes"):
+                amount = int((snapshot or {}).get(metric) or 0)
+                if amount <= 0:
+                    continue
+                bootstrap = (snapshot or {}).get("bootstrap") or {}
+                try:
+                    mutate_index_quota(
+                        metric=metric,
+                        action="release",
+                        company_id=snapshot["company_id"],
+                        document_id=doc_id,
+                        revision=str(snapshot.get("revision") or purpose),
+                        amount=amount,
+                        bootstrap_used=(
+                            int(bootstrap.get(metric) or 0)
+                            if isinstance(bootstrap, dict) and metric in bootstrap
+                            else None
+                        ),
+                        purpose=purpose,
+                        metadata={"reason": purpose},
+                    )
+                except QuotaServiceError as exc:
+                    log(
+                        "WARNING: pending index quota release failed "
+                        "company=%s doc_id=%s metric=%s err=%s",
+                        snapshot.get("company_id"),
+                        doc_id,
+                        metric,
+                        exc,
+                    )
+                    return False
+
+        if store.mark_document_index_quota_released(doc_id) is False:
+            return False
+        if store.clear_document_quota_release(doc_id, purpose=purpose):
+            return True
+        # Multiple worker processes may replay the same idempotent operation.
+        # A peer clearing the marker first is success, not a retry leak.
+        current = store.get_document(doc_id) or {}
+        return not isinstance(current.get("quota_release_pending"), dict)
+
+    def recover_pending_index_quotas_once(self, limit: Optional[int] = None) -> Dict[str, int]:
+        """Replay a bounded batch of swap and removal settlements."""
+        if not bool(getattr(self, "index_quota_enabled", False)):
+            return {"documents": 0, "swapRecovered": 0, "releaseRecovered": 0, "failed": 0}
+        batch_size = max(
+            1,
+            int(
+                limit
+                or os.getenv("INDEX_QUOTA_RECOVERY_BATCH_SIZE")
+                or DEFAULT_INDEX_QUOTA_RECOVERY_BATCH_SIZE
+            ),
+        )
+        store = self._get_store()
+        documents = store.list_pending_index_quota_documents(batch_size)
+        summary = {
+            "documents": len(documents or []),
+            "swapRecovered": 0,
+            "releaseRecovered": 0,
+            "failed": 0,
+        }
+        for candidate in documents or []:
+            doc_id = str((candidate or {}).get("doc_id") or "").strip()
+            if not doc_id:
+                summary["failed"] += 1
+                continue
+            current = store.get_document(doc_id) or candidate
+            try:
+                if isinstance(current.get("quota_swap_pending"), dict):
+                    self._recover_pending_index_quota(doc_id)
+                    summary["swapRecovered"] += 1
+                    current = store.get_document(doc_id) or current
+                if isinstance(current.get("quota_release_pending"), dict):
+                    if not self._recover_pending_document_quota_release(current):
+                        summary["failed"] += 1
+                        try:
+                            store.touch_pending_index_quota_document(doc_id)
+                        except Exception as touch_exc:  # noqa: BLE001
+                            log(
+                                "WARNING: index quota retry cursor update failed "
+                                "doc_id=%s err=%s",
+                                doc_id,
+                                touch_exc,
+                            )
+                        continue
+                    summary["releaseRecovered"] += 1
+            except Exception as exc:  # noqa: BLE001
+                summary["failed"] += 1
+                try:
+                    store.touch_pending_index_quota_document(doc_id)
+                except Exception as touch_exc:  # noqa: BLE001
+                    log(
+                        "WARNING: index quota retry cursor update failed "
+                        "doc_id=%s err=%s",
+                        doc_id,
+                        touch_exc,
+                    )
+                log(
+                    "WARNING: index quota recovery pending doc_id=%s err=%s",
+                    doc_id,
+                    exc,
+                )
+        return summary
+
+    def _ensure_index_quota_recovery_worker(self) -> None:
+        if not bool(getattr(self, "index_quota_enabled", False)):
+            return
+        with self._quota_recovery_lock:
+            if (
+                self._quota_recovery_thread is not None
+                and self._quota_recovery_thread.is_alive()
+            ):
+                return
+            self._quota_recovery_thread = threading.Thread(
+                target=self._index_quota_recovery_loop,
+                name="IndexQuotaRecovery",
+                daemon=True,
+            )
+            self._quota_recovery_thread.start()
+
+    def _index_quota_recovery_loop(self) -> None:
+        """Run once at startup, then periodically until the worker stops."""
+        interval = max(
+            5.0,
+            float(
+                os.getenv("INDEX_QUOTA_RECOVERY_INTERVAL_SECONDS")
+                or DEFAULT_INDEX_QUOTA_RECOVERY_INTERVAL_SECONDS
+            ),
+        )
+        while not self._stop_event.is_set():
+            try:
+                summary = self.recover_pending_index_quotas_once()
+                if summary["documents"]:
+                    log("Index quota recovery: %s", summary)
+            except Exception as exc:  # noqa: BLE001
+                log("WARNING: index quota recovery pass failed: %s", exc)
+            if self._stop_event.wait(interval):
+                return
+
+    @staticmethod
+    def _index_quota_revision(
+        embeddings: "np.ndarray", *, expected_job_id: Optional[str] = None
+    ) -> str:
+        """Stable business revision for redelivery-safe quota operations."""
+        job_id = str(expected_job_id or "").strip()
+        if job_id:
+            return f"job:{job_id}"
+        contiguous = np.ascontiguousarray(embeddings, dtype=np.float32)
+        digest = hashlib.sha256(contiguous.tobytes(order="C")).hexdigest()
+        return f"vectors:{digest}"
+
+    def _prepare_index_quota_change(
+        self,
+        *,
+        company_id: Optional[str],
+        doc_id: str,
+        revision: str,
+        new_chunk_count: int,
+        new_dimension: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Reserve positive document/vector deltas before an index swap."""
+        cid = str(company_id or "").strip()
+        if not cid or not bool(getattr(self, "index_quota_enabled", False)):
+            return None
+
+        store = self._get_store()
+        old_chunks = store.get_active_chunks_by_doc(doc_id)
+        old_documents = 1 if old_chunks else 0
+        new_documents = 1 if int(new_chunk_count or 0) > 0 else 0
+        old_vector_bytes = store.logical_vector_bytes(
+            old_chunks, fallback_dimension=new_dimension
+        )
+        new_vector_bytes = max(0, int(new_chunk_count)) * max(0, int(new_dimension)) * 4
+        deltas = {
+            "documents": new_documents - old_documents,
+            "vectorBytes": new_vector_bytes - old_vector_bytes,
+        }
+        context = {
+            "company_id": cid,
+            "doc_id": str(doc_id),
+            "revision": str(revision),
+            "deltas": deltas,
+            "reserved": [],
+            "metadata": {
+                "oldDocuments": old_documents,
+                "newDocuments": new_documents,
+                "oldVectorBytes": old_vector_bytes,
+                "newVectorBytes": new_vector_bytes,
+                "vectorDimension": int(new_dimension),
+                "vectorCount": int(new_chunk_count),
+            },
+        }
+        bootstrap = store.get_company_active_index_usage(
+            cid, fallback_dimension=new_dimension
+        )
+        context["bootstrap"] = {
+            "documents": int(bootstrap.get("documents") or 0),
+            "vectorBytes": int(bootstrap.get("vectorBytes") or 0),
+        }
+        positive_metrics = [metric for metric, delta in deltas.items() if delta > 0]
+        if not positive_metrics:
+            return context
+
+        # Persist the complete plan before the first remote call. `planned` is
+        # intentionally broader than the in-memory `reserved` list: an HTTP
+        # request can reach tinnten-server and the worker can die before it has
+        # a chance to append the metric locally.
+        context["phase"] = "reserving"
+        context["planned"] = list(positive_metrics)
+        store.stage_index_quota_swap_pending(str(doc_id), context)
+
+        try:
+            for metric in positive_metrics:
+                mutate_index_quota(
+                    metric=metric,
+                    action="reserve",
+                    company_id=cid,
+                    document_id=str(doc_id),
+                    revision=str(revision),
+                    amount=int(deltas[metric]),
+                    bootstrap_used=int(context["bootstrap"].get(metric) or 0),
+                    metadata=context["metadata"],
+                )
+                context["reserved"].append(metric)
+        except QuotaExceededError:
+            cancelled = self._cancel_planned_index_quota_reservations(context)
+            if cancelled:
+                store.clear_index_quota_swap_pending(
+                    str(doc_id), str(revision)
+                )
+            raise
+        except QuotaServiceError as exc:
+            cancelled = self._cancel_planned_index_quota_reservations(context)
+            if cancelled:
+                store.clear_index_quota_swap_pending(
+                    str(doc_id), str(revision)
+                )
+            if bool(getattr(self, "quota_fail_open", False)):
+                log(
+                    "WARNING: index quota service unavailable; fail-open "
+                    "company=%s doc_id=%s err=%s",
+                    cid,
+                    doc_id,
+                    exc,
+                )
+                return None
+            raise RetryableIngestLockError(
+                f"index quota service unavailable company={cid} doc_id={doc_id}: {exc}"
+            ) from exc
+        return context
+
+    @staticmethod
+    def _cancel_planned_index_quota_reservations(context) -> bool:
+        """Cancel only reservations; never decrement committed usage.
+
+        Missing operations are successful no-ops in the central protocol, so
+        this closes the ambiguous crash window around each reserve request.
+        """
+        if not context:
+            return True
+        ok = True
+        metrics = context.get("planned") or context.get("reserved") or []
+        for metric in metrics:
+            delta = int((context.get("deltas") or {}).get(metric) or 0)
+            if delta <= 0:
+                continue
+            try:
+                mutate_index_quota(
+                    metric=metric,
+                    action="cancel-reservation",
+                    company_id=context["company_id"],
+                    document_id=context["doc_id"],
+                    revision=context["revision"],
+                    amount=delta,
+                    bootstrap_used=(context.get("bootstrap") or {}).get(metric),
+                    metadata=context.get("metadata"),
+                )
+            except QuotaServiceError as exc:
+                ok = False
+                log(
+                    "WARNING: index quota reservation cancel failed company=%s "
+                    "doc_id=%s metric=%s err=%s",
+                    context.get("company_id"),
+                    context.get("doc_id"),
+                    metric,
+                    exc,
+                )
+        return ok
+
+    @staticmethod
+    def _settle_index_quota_reservations(context, *, action: str) -> bool:
+        if not context:
+            return True
+        ok = True
+        for metric in context.get("reserved") or []:
+            try:
+                mutate_index_quota(
+                    metric=metric,
+                    action=action,
+                    company_id=context["company_id"],
+                    document_id=context["doc_id"],
+                    revision=context["revision"],
+                    amount=int(context["deltas"][metric]),
+                    bootstrap_used=(context.get("bootstrap") or {}).get(metric),
+                    metadata=context.get("metadata"),
+                )
+            except QuotaServiceError as exc:
+                ok = False
+                log(
+                    "WARNING: index quota %s failed company=%s doc_id=%s "
+                    "metric=%s err=%s",
+                    action,
+                    context.get("company_id"),
+                    context.get("doc_id"),
+                    metric,
+                    exc,
+                )
+        return ok
+
+    @staticmethod
+    def _release_index_quota_shrink(context) -> bool:
+        if not context:
+            return True
+        ok = True
+        for metric, delta in (context.get("deltas") or {}).items():
+            if int(delta or 0) >= 0:
+                continue
+            try:
+                mutate_index_quota(
+                    metric=metric,
+                    action="release",
+                    company_id=context["company_id"],
+                    document_id=context["doc_id"],
+                    revision=context["revision"],
+                    amount=abs(int(delta)),
+                    bootstrap_used=(context.get("bootstrap") or {}).get(metric),
+                    purpose="swap-shrink",
+                    metadata=context.get("metadata"),
+                )
+            except QuotaServiceError as exc:
+                ok = False
+                log(
+                    "WARNING: index quota shrink release failed company=%s "
+                    "doc_id=%s metric=%s err=%s",
+                    context.get("company_id"),
+                    context.get("doc_id"),
+                    metric,
+                    exc,
+                )
+        return ok
 
     @staticmethod
     def _resolve_chunk_strategy(strategy: str, text: str) -> str:
@@ -2595,6 +3157,7 @@ class IngestWorker:
         # chunk + yetim vektör birikiyordu — canlı bir bug. Artık idempotent.
         self._swap_in_chunks(
             doc_id=doc_id,
+            company_id=company_id,
             engine=engine,
             embeddings=embeddings,
             build_chunk_docs=build_chunk_docs,
@@ -2671,7 +3234,19 @@ class IngestWorker:
         chunk_overlap: int,
         min_chars: int,
     ) -> None:
-        self._get_store().update_document_status(doc_id, status="processing", error=None)
+        store = self._get_store()
+        company_id = _resolve_company_id(metadata)
+        store.create_document(
+            doc_id=doc_id,
+            doc_type=doc_type,
+            source=source,
+            metadata=metadata,
+            company_id=company_id,
+            user_id=_resolve_user_id(metadata),
+            title=str(metadata.get("title") or metadata.get("filename") or "") or None,
+            status="processing",
+        )
+        store.update_document_status(doc_id, status="processing", error=None)
 
         chunks = chunk_text(
             text,
@@ -2687,29 +3262,27 @@ class IngestWorker:
                 min_chars=1,
             )
         if not chunks:
-            self._get_store().update_document_status(doc_id, status="ready", chunk_count=0)
+            store.update_document_status(doc_id, status="ready", chunk_count=0)
             return
 
-        faiss_ids = self._get_store().reserve_faiss_ids(len(chunks))
-        engine = self._engine_for_company(
-            metadata.get("companyId") or metadata.get("company_id")
-        )
+        engine = self._engine_for_company(company_id)
         embeddings = engine.encode([chunk.text for chunk in chunks], batch_size=self.batch_size)
-        engine.add_embeddings(embeddings, faiss_ids)
 
         now = datetime.now(timezone.utc)
-        chunk_docs: List[Dict[str, Any]] = []
-        for chunk, faiss_id in zip(chunks, faiss_ids):
-            chunk_docs.append(
+        def build_chunk_docs(
+            faiss_ids: Sequence[int], version: str
+        ) -> List[Dict[str, Any]]:
+            return [
                 {
                     "chunk_id": str(uuid.uuid4()),
                     "doc_id": doc_id,
                     # Legacy yol da üst seviye company_id yazmalı — aksi halde bu
                     # chunk'lar firma filtreli aramalarda görünmez.
-                    "company_id": _resolve_company_id(metadata),
+                    "company_id": company_id,
                     "user_id": _resolve_user_id(metadata),
                     "chunk_index": chunk.index,
                     "faiss_id": int(faiss_id),
+                    "ingest_version": version,
                     "text": chunk.text,
                     "heading_path": [],
                     "context_header": "",
@@ -2723,10 +3296,19 @@ class IngestWorker:
                     "metadata": metadata,
                     "created_at": now,
                 }
-            )
-        self._get_store().insert_chunks(chunk_docs)
-        self._get_store().update_document_status(doc_id, status="ready", chunk_count=len(chunk_docs))
-        log(f"Processed doc_id={doc_id} chunks={len(chunk_docs)}")
+                for chunk, faiss_id in zip(chunks, faiss_ids)
+            ]
+
+        self._swap_in_chunks(
+            doc_id=doc_id,
+            company_id=company_id,
+            engine=engine,
+            embeddings=embeddings,
+            build_chunk_docs=build_chunk_docs,
+            chunk_count=len(chunks),
+        )
+        store.update_document_status(doc_id, status="ready", chunk_count=len(chunks))
+        log(f"Processed doc_id={doc_id} chunks={len(chunks)}")
 
     def _process_upload_ingest_legacy(
         self,
@@ -2797,6 +3379,23 @@ class IngestWorker:
                 chunk_overlap=chunk_overlap,
                 min_chars=min_chars,
             )
+        except QuotaExceededError as exc:
+            active_chunk_count = len(
+                self._get_store().get_active_chunks_by_doc(doc_id)
+            )
+            self._get_store().update_document_status(
+                doc_id,
+                status="quota_blocked",
+                chunk_count=active_chunk_count,
+                error=str(exc),
+            )
+            self._get_upload_store().update_upload_status(
+                upload_id,
+                index_status="quota_blocked",
+                is_file_opened=True,
+                file_open_error=str(exc),
+            )
+            raise
         except NonIndexableFileContentError as exc:
             self._get_store().update_document_status(
                 doc_id,
@@ -3093,6 +3692,36 @@ class IngestWorker:
         callback_source: Optional[str] = None,
     ) -> bool:
         update_applied = False
+        callback_payload: Optional[Dict[str, Any]] = None
+        callback_states = ("completed", "failed", "indexing", "quota_blocked")
+        if (
+            getattr(self, "callback_outbox_enabled", False)
+            and state in callback_states
+        ):
+            now = datetime.now(timezone.utc)
+            callback_payload = {
+                "eventId": str(uuid.uuid4()),
+                "companyId": context.company_id,
+                "documentId": context.document_id,
+                "jobId": context.job_id,
+                "userId": context.user_id,
+                "trigger": context.trigger,
+                "options": dict(context.options or {}),
+                "attempt": context.attempt,
+                "state": state,
+                "stats": None if stats is UPDATE_UNSET else stats,
+                "errorMsg": None
+                if error is UPDATE_UNSET
+                else (str(error) if error else None),
+                "callbackDomain": callback_domain,
+                "callbackSource": callback_source,
+                "createdAt": now,
+                "nextAttemptAt": now,
+                "attempts": 0,
+                "leaseOwner": None,
+                "leaseUntil": None,
+                "lastError": None,
+            }
         try:
             update_kwargs: Dict[str, Any] = {
                 "company_id": context.company_id,
@@ -3101,7 +3730,15 @@ class IngestWorker:
                 "trigger": context.trigger,
                 "options": context.options,
                 "user_id": context.user_id,
-                "extra_updates": extra,
+                "extra_updates": {
+                    **(extra or {}),
+                    **(
+                        {"index.callbackPending": callback_payload}
+                        if callback_payload is not None
+                        else {}
+                    ),
+                }
+                or None,
             }
             if state is not None:
                 update_kwargs["state"] = state
@@ -3125,7 +3762,7 @@ class IngestWorker:
         # çıkarıldı. Bu bildirim best-effort (hatası zaten yutuluyordu), o yüzden
         # turu bekletmesi gereksizdi; senkronken doküman başına ölçülebilir
         # gecikme ekliyordu. Sıra korunur: tek tüketici thread, FIFO kuyruk.
-        if update_applied and state in ("completed", "failed", "indexing"):
+        if update_applied and state in callback_states:
             self._submit_index_state_callback(
                 context=context,
                 state=state,
@@ -3133,6 +3770,7 @@ class IngestWorker:
                 error_msg=None if error is UPDATE_UNSET else (str(error) if error else None),
                 callback_domain=callback_domain,
                 callback_source=callback_source,
+                _event_id=(callback_payload or {}).get("eventId"),
             )
         return update_applied
 
@@ -3147,17 +3785,134 @@ class IngestWorker:
             self._callback_thread.start()
 
     def _callback_loop(self) -> None:
-        """tinnten-server bildirimlerini sırayla, ana yoldan bağımsız gönderir."""
+        """Deliver live and crash-recovered callbacks outside the ingest path."""
+        poll_seconds = max(
+            0.1,
+            float(
+                os.getenv("INDEX_STATE_CALLBACK_OUTBOX_POLL_SECONDS")
+                or DEFAULT_CALLBACK_OUTBOX_POLL_SECONDS
+            ),
+        )
         while True:
-            item = self._callback_queue.get()
+            item = None
+            from_queue = False
             try:
-                if item is None:  # kapanış sinyali
+                try:
+                    item = self._callback_queue.get(timeout=poll_seconds)
+                    from_queue = True
+                except queue.Empty:
+                    item = None
+                if from_queue and item is None:  # shutdown sentinel
                     return
-                self._deliver_index_state_callback(**item)
+                if item is not None:
+                    self._process_index_state_callback(item)
+                elif getattr(self, "_callback_replay_enabled", False):
+                    self._replay_one_index_state_callback()
             except Exception as exc:  # noqa: BLE001
                 log(f"[callback] delivery failed: {exc}")
             finally:
-                self._callback_queue.task_done()
+                if from_queue:
+                    self._callback_queue.task_done()
+
+    def _context_from_callback_record(self, record: Dict[str, Any]) -> DocumentJobContext:
+        return DocumentJobContext(
+            company_id=str(record.get("companyId") or ""),
+            document_id=str(record.get("documentId") or ""),
+            job_id=str(record.get("jobId") or ""),
+            user_id=record.get("userId"),
+            trigger=record.get("trigger"),
+            options=dict(record.get("options") or {}),
+            attempt=record.get("attempt"),
+        )
+
+    def _claim_index_state_callback(
+        self,
+        *,
+        company_id: Optional[str] = None,
+        document_id: Optional[str] = None,
+        event_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        lease_seconds = max(
+            1,
+            int(
+                os.getenv("INDEX_STATE_CALLBACK_OUTBOX_LEASE_SECONDS")
+                or DEFAULT_CALLBACK_OUTBOX_LEASE_SECONDS
+            ),
+        )
+        return self._get_content_store().claim_index_callback(
+            company_id=company_id,
+            document_id=document_id,
+            event_id=event_id,
+            lease_owner=self._callback_lease_owner,
+            lease_seconds=lease_seconds,
+        )
+
+    def _replay_one_index_state_callback(self) -> None:
+        record = self._claim_index_state_callback()
+        if record:
+            self._deliver_claimed_index_state_callback(record)
+
+    def _process_index_state_callback(self, item: Dict[str, Any]) -> None:
+        event_id = item.pop("_event_id", None)
+        if not event_id:
+            # Compatibility for direct/unit callers. Production callbacks are
+            # always persisted by `_safe_update_index_state` first.
+            self._deliver_index_state_callback(**item)
+            return
+        context = item.get("context")
+        record = self._claim_index_state_callback(
+            company_id=context.company_id,
+            document_id=context.document_id,
+            event_id=event_id,
+        )
+        if record:
+            self._deliver_claimed_index_state_callback(record)
+
+    def _deliver_claimed_index_state_callback(self, record: Dict[str, Any]) -> None:
+        context = self._context_from_callback_record(record)
+        event_id = str(record.get("eventId") or "")
+        delivered = self._deliver_index_state_callback(
+            context=context,
+            state=record.get("state"),
+            stats=record.get("stats"),
+            error_msg=record.get("errorMsg"),
+            callback_domain=record.get("callbackDomain"),
+            callback_source=record.get("callbackSource"),
+        )
+        store = self._get_content_store()
+        if delivered:
+            store.complete_index_callback(
+                company_id=context.company_id,
+                document_id=context.document_id,
+                event_id=event_id,
+                lease_owner=self._callback_lease_owner,
+            )
+            return
+
+        attempts = max(0, int(record.get("attempts") or 0))
+        base = max(
+            0.1,
+            float(
+                os.getenv("INDEX_STATE_CALLBACK_OUTBOX_BACKOFF_SECONDS")
+                or DEFAULT_CALLBACK_OUTBOX_BACKOFF_SECONDS
+            ),
+        )
+        ceiling = max(
+            base,
+            float(
+                os.getenv("INDEX_STATE_CALLBACK_OUTBOX_MAX_BACKOFF_SECONDS")
+                or DEFAULT_CALLBACK_OUTBOX_MAX_BACKOFF_SECONDS
+            ),
+        )
+        delay = min(ceiling, base * (2 ** min(attempts, 20)))
+        store.retry_index_callback(
+            company_id=context.company_id,
+            document_id=context.document_id,
+            event_id=event_id,
+            lease_owner=self._callback_lease_owner,
+            next_attempt_at=datetime.now(timezone.utc) + timedelta(seconds=delay),
+            error="tinnten-server callback rejected or unavailable",
+        )
 
     def _submit_index_state_callback(self, **payload: Any) -> None:
         """Bildirimi arka plana kuyruklar.
@@ -3170,11 +3925,13 @@ class IngestWorker:
         try:
             self._callback_queue.put_nowait(payload)
         except queue.Full:
-            log("WARNING: [callback] kuyruk dolu — senkron gönderiliyor (backend yavaş?)")
-            try:
-                self._deliver_index_state_callback(**payload)
-            except Exception as exc:  # noqa: BLE001
-                log(f"[callback] sync fallback failed: {exc}")
+            # Persisted callbacks need no risky best-effort fallback: the
+            # periodic outbox replay will claim them after capacity returns.
+            if payload.get("_event_id"):
+                log("WARNING: [callback] memory queue full — durable outbox will retry")
+                return
+            log("WARNING: [callback] queue full — synchronously delivering legacy callback")
+            self._deliver_index_state_callback(**payload)
 
     def _deliver_index_state_callback(
         self,
@@ -3185,7 +3942,7 @@ class IngestWorker:
         error_msg: Optional[str],
         callback_domain: Optional[str],
         callback_source: Optional[str],
-    ) -> None:
+    ) -> bool:
         try:
             # A callback may wait in the async queue while a newer ingest is
             # enqueued.  Re-check the document before notifying the server so
@@ -3210,7 +3967,7 @@ class IngestWorker:
                             f"[callback] Skipping stale state for {context.document_id}: "
                             f"callback_job_id={context.job_id} current_job_id={current_job_id}"
                         )
-                        return
+                        return True
             except Exception as freshness_exc:  # noqa: BLE001
                 log(
                     f"WARNING: [callback] could not verify current job for "
@@ -3310,15 +4067,17 @@ class IngestWorker:
                     attempt=context.attempt,
                 )
                 if delivered:
-                    return
+                    return True
                 if attempt < attempts and retry_delay:
                     time.sleep(retry_delay)
             log(
                 f"[callback] Tinnten-server rejected/unavailable after {attempts} "
                 f"attempt(s) for {context.document_id} job_id={context.job_id}"
             )
+            return False
         except Exception as cb_exc:  # noqa: BLE001
             log(f"[callback] Failed to notify tinnten-server for {context.document_id}: {cb_exc}")
+            return False
 
     def _notify_index_failure(
         self,
@@ -3571,6 +4330,7 @@ def _install_signal_handlers(worker: IngestWorker) -> None:
 
 
 def main() -> None:
+    validate_quota_runtime_config(api_process=False)
     worker = IngestWorker()
     _install_signal_handlers(worker)
     worker.start()

@@ -1,4 +1,5 @@
 import json
+import hashlib
 import logging
 import os
 import re
@@ -37,9 +38,17 @@ from services.embedding_engine import EmbeddingEngine
 from services.error_logger import EmbeddingErrorLogger
 from services.mongo_store import MongoStore
 from services.fetcher_store import FetcherStore
+from services.index_quota import mutate_index_quota
+from services.tinnten_server_client import QuotaServiceError
 from constants import FeatureFlags
 from services.rabbit_publisher import RabbitPublisher
 from services.keycloak_service import get_keycloak_service, KeycloakError, KeycloakTokenError
+from services.inbound_service_auth import (
+    ServiceCallerForbidden,
+    authorize_service_claims,
+    service_caller_required,
+    validate_quota_runtime_config,
+)
 from init.db import get_database
 
 load_dotenv()
@@ -141,6 +150,15 @@ ALLOW_UNAUTH_CONTENT_INDEX = (os.getenv("ALLOW_UNAUTH_CONTENT_INDEX") or "false"
 CONTENT_REMOVE_MODE = (os.getenv("CONTENT_REMOVE_MODE") or "soft").strip().lower()
 if CONTENT_REMOVE_MODE not in {"soft", "hard"}:
     CONTENT_REMOVE_MODE = "soft"
+INDEX_QUOTA_ENABLED = (os.getenv("INDEX_QUOTA_ENABLED") or "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+# Identical fail-closed validation under gunicorn/wsgi and direct execution.
+validate_quota_runtime_config(api_process=True)
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -422,7 +440,11 @@ def enforce_keycloak_auth():
         return None
     try:
         token_info = get_keycloak_service().validate_bearer_header(request.headers.get("Authorization"))
+        if service_caller_required():
+            authorize_service_claims(token_info)
         g.token_info = token_info
+    except ServiceCallerForbidden as exc:
+        return jsonify({"error": "forbidden_service_client", "reason": str(exc)}), 403
     except KeycloakTokenError as exc:
         return jsonify({"error": "unauthorized", "reason": str(exc)}), 401
     except KeycloakError as exc:
@@ -2090,6 +2112,177 @@ def _deactivate_index_state(company_id: str | None, document_id: str, state: str
         pass
 
 
+def _snapshot_document_index_quota(
+    document_id: str, fallback_company_id: str | None = None
+) -> list[dict]:
+    """Capture active logical usage before a destructive index transition."""
+    if not INDEX_QUOTA_ENABLED:
+        return []
+    document = chunk_store.get_document(str(document_id)) or {}
+    if str(document.get("status") or "").lower() in {"disabled", "removed"}:
+        return []
+    chunks = chunk_store.get_active_chunks_by_doc(str(document_id))
+    by_company: dict[str, list[dict]] = {}
+    for chunk in chunks:
+        company_id = _chunk_company_id(chunk) or str(fallback_company_id or "").strip()
+        if company_id:
+            by_company.setdefault(company_id, []).append(chunk)
+    snapshots = []
+    for company_id, company_chunks in by_company.items():
+        if not company_chunks:
+            continue
+        active_version = str(document.get("active_ingest_version") or "").strip()
+        if active_version:
+            revision = f"version:{active_version}"
+        else:
+            legacy_identity = "\n".join(
+                sorted(
+                    f"{chunk.get('faiss_id')}:{chunk.get('embedding_dimension')}"
+                    for chunk in company_chunks
+                )
+            )
+            revision = "legacy:" + hashlib.sha256(
+                legacy_identity.encode("utf-8")
+            ).hexdigest()
+        fallback_dimension = None
+        if any(not chunk.get("embedding_dimension") for chunk in company_chunks):
+            try:
+                engine = get_company_chunk_engine(company_id)
+                fallback_dimension = (
+                    engine.index_dimension() or engine.model_dimension()
+                )
+            except Exception:  # noqa: BLE001
+                fallback_dimension = None
+        bootstrap_usage = chunk_store.get_company_active_index_usage(
+            company_id, fallback_dimension=fallback_dimension
+        )
+        snapshots.append(
+            {
+                "company_id": company_id,
+                "revision": revision,
+                "documents": 1,
+                "vectorBytes": chunk_store.logical_vector_bytes(
+                    company_chunks, fallback_dimension=fallback_dimension
+                ),
+                "bootstrap": {
+                    "documents": int(bootstrap_usage.get("documents") or 0),
+                    "vectorBytes": int(bootstrap_usage.get("vectorBytes") or 0),
+                },
+            }
+        )
+    return snapshots
+
+
+def _prepare_document_index_quota_release(
+    document_id: str,
+    fallback_company_id: str | None = None,
+    *,
+    purpose: str,
+) -> dict:
+    """Return an existing retry intent or durably stage the current usage."""
+    if not INDEX_QUOTA_ENABLED:
+        return {"purpose": str(purpose), "snapshots": []}
+    document = chunk_store.get_document(str(document_id)) or {}
+    if not document:
+        virtual_document = chunk_store.get_chunk_document(
+            str(document_id), company_id=fallback_company_id
+        )
+        if virtual_document:
+            chunk_store.create_document(
+                doc_id=str(document_id),
+                source=virtual_document.get("source") or "fetcher_page",
+                metadata=virtual_document.get("metadata") or {},
+                company_id=(
+                    str(fallback_company_id or virtual_document.get("company_id") or "")
+                    or None
+                ),
+                user_id=virtual_document.get("user_id"),
+                title=virtual_document.get("title"),
+                status="ready",
+            )
+            document = chunk_store.get_document(str(document_id)) or {}
+    pending = document.get("quota_release_pending")
+    if isinstance(pending, dict) and isinstance(pending.get("snapshots"), list):
+        return pending
+    snapshots = _snapshot_document_index_quota(document_id, fallback_company_id)
+    if not snapshots:
+        return {"purpose": str(purpose), "snapshots": []}
+    return chunk_store.stage_document_quota_release(
+        str(document_id), purpose=str(purpose), snapshots=snapshots
+    )
+
+
+def _release_document_index_quota(
+    document_id: str,
+    intent: dict,
+) -> dict:
+    """Release a staged intent; keep it durable until every metric succeeds."""
+    intent = intent if isinstance(intent, dict) else {}
+    purpose = str(intent.get("purpose") or "remove")
+    snapshots = intent.get("snapshots") or []
+    failures = []
+    released = 0
+    for snapshot in snapshots:
+        for metric in ("documents", "vectorBytes"):
+            amount = int(snapshot.get(metric) or 0)
+            if amount <= 0:
+                continue
+            bootstrap = snapshot.get("bootstrap") or {}
+            bootstrap_used = (
+                int(bootstrap.get(metric) or 0)
+                if isinstance(bootstrap, dict) and metric in bootstrap
+                else None
+            )
+            try:
+                mutate_index_quota(
+                    metric=metric,
+                    action="release",
+                    company_id=snapshot["company_id"],
+                    document_id=str(document_id),
+                    revision=str(snapshot.get("revision") or purpose),
+                    amount=amount,
+                    bootstrap_used=bootstrap_used,
+                    purpose=purpose,
+                    metadata={"reason": purpose},
+                )
+                released += 1
+            except QuotaServiceError as exc:
+                failures.append(
+                    {
+                        "companyId": snapshot.get("company_id"),
+                        "metric": metric,
+                        "amount": amount,
+                        "error": str(exc),
+                    }
+                )
+                app.logger.error(
+                    "index quota release failed companyId=%s documentId=%s "
+                    "metric=%s amount=%s err=%s",
+                    snapshot.get("company_id"),
+                    document_id,
+                    metric,
+                    amount,
+                    exc,
+                )
+    if not failures and snapshots:
+        try:
+            marked = chunk_store.mark_document_index_quota_released(str(document_id))
+            if marked is False:
+                failures.append({"error": "quota_release_marker_not_persisted"})
+            else:
+                chunk_store.clear_document_quota_release(
+                    str(document_id), purpose=purpose
+                )
+        except Exception as exc:  # noqa: BLE001
+            failures.append({"error": f"quota_release_marker_failed:{exc}"})
+    return {
+        "ok": not failures,
+        "purpose": purpose,
+        "released": released,
+        "failed": failures,
+    }
+
+
 @app.route("/", methods=["GET"])
 @app.route("/healthz", methods=["GET"])
 def root():
@@ -3255,6 +3448,11 @@ def deactivate_document():
     if not document_id:
         return jsonify({"error": "documentId is required"}), 400
 
+    quota_intent = _prepare_document_index_quota_release(
+        str(document_id),
+        str(company_id) if company_id else None,
+        purpose="deactivate",
+    )
     # Mark embedding_documents as disabled
     try:
         updated = chunk_store.update_document_status(str(document_id), status="disabled")
@@ -3284,6 +3482,15 @@ def deactivate_document():
         return jsonify({"error": f"failed to update document status: {exc}"}), 500
 
     _deactivate_index_state(company_id, str(document_id), state="disabled")
+    quota_release = _release_document_index_quota(str(document_id), quota_intent)
+    if not quota_release.get("ok"):
+        return jsonify({
+            "error": "index_quota_release_failed",
+            "documentId": str(document_id),
+            "state": "disabled",
+            "retryable": True,
+            "details": quota_release.get("failed"),
+        }), 502
     return jsonify({"documentId": str(document_id), "state": "disabled"})
 
 
@@ -3390,8 +3597,22 @@ def remove_document():
     remove_mode = str(raw_mode or "").strip().lower()
     if remove_mode not in {"soft", "deactivate", "hard"}:
         return jsonify({"error": "mode must be one of: soft, deactivate, hard"}), 400
+    if INDEX_QUOTA_ENABLED and remove_mode == "soft":
+        # Soft delete drops the chunk→FAISS id map but leaves physical vectors
+        # behind. Releasing vectorBytes after that would make exact quota usage
+        # lower than the real index and the orphan could only be fixed by a full
+        # rebuild, so quota-enabled deployments must use deactivate or hard.
+        return jsonify({
+            "error": "soft_remove_disabled_with_index_quota",
+            "allowedModes": ["deactivate", "hard"],
+        }), 409
 
     doc_id_str = str(document_id)
+    quota_intent = _prepare_document_index_quota_release(
+        doc_id_str,
+        str(company_id) if company_id else None,
+        purpose="remove",
+    )
     chunks = chunk_store.get_chunks_by_doc(doc_id_str)
     faiss_ids = sorted({int(c["faiss_id"]) for c in chunks if "faiss_id" in c})
 
@@ -3430,23 +3651,29 @@ def remove_document():
             len(faiss_ids),
         )
 
+    # Keep chunk metadata until the central release succeeds. If the quota
+    # service is temporarily unavailable, the durable intent plus these rows
+    # make the same DELETE safely retryable instead of leaking used quota.
     deleted_chunks = 0
+    chunk_store.update_document_status(doc_id_str, status="removed", error=None)
+
+    _deactivate_index_state(company_id, doc_id_str, state="removed")
+    quota_release = _release_document_index_quota(doc_id_str, quota_intent)
+    if not quota_release.get("ok"):
+        return jsonify({
+            "error": "index_quota_release_failed",
+            "documentId": doc_id_str,
+            "state": "removed",
+            "retryable": True,
+            "details": quota_release.get("failed"),
+        }), 502
+
     if should_delete_chunks:
-        # soft/hard: chunk metadata is wiped so the doc disappears from
-        # downstream consumers that scan the chunks collection directly.
+        # soft/hard: chunk metadata is wiped only after quota settlement.
         deleted_chunks = chunk_store.delete_chunks_by_doc(doc_id_str)
         chunk_store.update_document_status(
             doc_id_str, status="removed", chunk_count=0, error=None
         )
-    else:
-        # deactivate: keep chunk rows for audit. We still flip the document
-        # status so admin tooling/dashboards can show "removed" without
-        # losing the underlying text.
-        chunk_store.update_document_status(
-            doc_id_str, status="removed", error=None
-        )
-
-    _deactivate_index_state(company_id, doc_id_str, state="removed")
 
     return jsonify(
         {
@@ -3491,10 +3718,21 @@ def remove_domain_index():
     remove_mode = str(payload.get("mode") or "hard").lower()
     if remove_mode not in {"soft", "deactivate", "hard"}:
         return jsonify({"error": "mode must be one of: soft, deactivate, hard"}), 400
+    if INDEX_QUOTA_ENABLED and remove_mode == "soft":
+        return jsonify({
+            "error": "soft_remove_disabled_with_index_quota",
+            "allowedModes": ["deactivate", "hard"],
+        }), 409
 
     info = chunk_store.get_chunk_index_by_company_domain(company_id, domain)
     faiss_ids = info["faiss_ids"]
     doc_ids = info["doc_ids"]
+    quota_intents = {
+        str(doc_id): _prepare_document_index_quota_release(
+            str(doc_id), str(company_id), purpose="remove-domain"
+        )
+        for doc_id in doc_ids
+    }
 
     should_remove_faiss = remove_mode in {"hard", "deactivate"}
     should_delete_chunks = remove_mode in {"soft", "hard"}
@@ -3513,13 +3751,31 @@ def remove_domain_index():
             )
             return jsonify({"error": f"failed to remove from FAISS: {exc}"}), 500
 
-    deleted_chunks = 0
-    if should_delete_chunks:
-        deleted_chunks = chunk_store.delete_chunks_by_company_domain(company_id, domain)
-
+    quota_failures = []
     for did in doc_ids:
         chunk_store.update_document_status(did, status="removed", error=None)
         _deactivate_index_state(company_id, did, state="removed")
+        quota_release = _release_document_index_quota(
+            str(did), quota_intents.get(str(did)) or {}
+        )
+        if not quota_release.get("ok"):
+            quota_failures.append(
+                {"documentId": str(did), "details": quota_release.get("failed")}
+            )
+
+    if quota_failures:
+        return jsonify({
+            "error": "index_quota_release_failed",
+            "companyId": company_id,
+            "domain": domain,
+            "state": "removed",
+            "retryable": True,
+            "details": quota_failures,
+        }), 502
+
+    deleted_chunks = 0
+    if should_delete_chunks:
+        deleted_chunks = chunk_store.delete_chunks_by_company_domain(company_id, domain)
 
     return jsonify(
         {

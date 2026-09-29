@@ -5,6 +5,19 @@ import requests
 from services.keycloak_service import KeycloakConfigError, get_keycloak_service
 
 
+class QuotaServiceError(RuntimeError):
+    """The central quota service could not complete a mutation."""
+
+
+class QuotaExceededError(QuotaServiceError):
+    """A reserve request was rejected because the account limit is exhausted."""
+
+    def __init__(self, message, *, data=None, status_code=None):
+        super().__init__(message)
+        self.data = data if isinstance(data, dict) else {}
+        self.status_code = status_code
+
+
 class TinntenServerClient:
     def __init__(self):
         self.base_url = (os.getenv("TINNTEN_SERVER_BASE_URL") or "").rstrip("/")
@@ -44,7 +57,10 @@ class TinntenServerClient:
                 f"Tinnten server internal request failed ({response.status_code}): {response.text}"
             )
 
-        payload = response.json() if response.content else {}
+        try:
+            payload = response.json() if response.content else {}
+        except ValueError:
+            payload = {}
         if not isinstance(payload, dict):
             return None
         if payload.get("success") is False:
@@ -53,6 +69,143 @@ class TinntenServerClient:
         if not isinstance(data, dict):
             return None
         return data
+
+    def mutate_quota(
+        self,
+        *,
+        section,
+        metric,
+        action,
+        company_id,
+        operation_key,
+        amount,
+        bootstrap_used=None,
+        owner_type=None,
+        owner_id=None,
+        metadata=None,
+    ):
+        """Drive one idempotent reserve/commit/release ledger operation."""
+        normalized_action = str(action or "").strip().lower()
+        if normalized_action not in {
+            "reserve",
+            "commit",
+            "release",
+            "cancel-reservation",
+        }:
+            raise ValueError(
+                "quota action must be reserve, commit, release or cancel-reservation"
+            )
+        company_id = str(company_id or "").strip()
+        operation_key = str(operation_key or "").strip()
+        if not company_id or not operation_key:
+            raise ValueError("company_id and operation_key are required")
+        try:
+            normalized_amount = int(amount)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("quota amount must be an integer") from exc
+        if normalized_amount <= 0:
+            raise ValueError("quota amount must be greater than zero")
+        if not self.base_url:
+            raise QuotaServiceError("TINNTEN_SERVER_BASE_URL is not configured.")
+
+        body = {
+            "companyId": company_id,
+            "operationKey": operation_key,
+            "amount": normalized_amount,
+        }
+        if bootstrap_used is not None:
+            body["bootstrapUsed"] = max(0, int(bootstrap_used))
+        if owner_type:
+            body["ownerType"] = str(owner_type)
+        if owner_id:
+            body["ownerId"] = str(owner_id)
+        if isinstance(metadata, dict) and metadata:
+            body["metadata"] = metadata
+
+        url = (
+            f"{self.base_url}/api/v10/internal/quotas/"
+            f"{section}/{metric}/{normalized_action}"
+        )
+        try:
+            response = requests.post(
+                url,
+                json=body,
+                headers=self._build_headers(),
+                timeout=self.timeout,
+            )
+        except Exception as exc:
+            raise QuotaServiceError(f"Tinnten quota request failed: {exc}") from exc
+
+        try:
+            payload = response.json() if response.content else {}
+        except ValueError:
+            payload = {}
+        data = payload.get("data") if isinstance(payload, dict) else None
+        error_code = ""
+        if isinstance(data, dict):
+            error_code = str(data.get("code") or "").strip().lower()
+        if not error_code and isinstance(payload, dict):
+            error_code = str(payload.get("code") or "").strip().lower()
+        is_account_limit = error_code in {
+            "account_resource_limit_exceeded",
+            "account_limit_exceeded",
+        }
+        if (
+            response.status_code in {403, 409}
+            and normalized_action == "reserve"
+            and is_account_limit
+        ):
+            message = (
+                (payload or {}).get("message")
+                if isinstance(payload, dict)
+                else None
+            ) or "quota_exceeded"
+            raise QuotaExceededError(
+                message,
+                data=data,
+                status_code=response.status_code,
+            )
+        if response.status_code >= 400 or (
+            isinstance(payload, dict) and payload.get("success") is False
+        ):
+            message = (
+                (payload or {}).get("message")
+                if isinstance(payload, dict)
+                else None
+            ) or response.text or "quota mutation failed"
+            raise QuotaServiceError(
+                f"Tinnten quota request failed ({response.status_code}): {message}"
+            )
+        return data if isinstance(data, dict) else (payload or {})
+
+    def get_quota_usage(self, *, section, metric, company_id):
+        company_id = str(company_id or "").strip()
+        if not company_id:
+            raise ValueError("company_id is required")
+        if not self.base_url:
+            raise QuotaServiceError("TINNTEN_SERVER_BASE_URL is not configured.")
+        url = f"{self.base_url}/api/v10/internal/quotas/{section}/{metric}/usage"
+        try:
+            response = requests.get(
+                url,
+                params={"companyId": company_id},
+                headers=self._build_headers(),
+                timeout=self.timeout,
+            )
+        except Exception as exc:
+            raise QuotaServiceError(f"Tinnten quota usage request failed: {exc}") from exc
+        try:
+            payload = response.json() if response.content else {}
+        except ValueError:
+            payload = {}
+        if response.status_code >= 400 or (
+            isinstance(payload, dict) and payload.get("success") is False
+        ):
+            raise QuotaServiceError(
+                f"Tinnten quota usage request failed ({response.status_code}): {response.text}"
+            )
+        data = payload.get("data") if isinstance(payload, dict) else None
+        return data if isinstance(data, dict) else (payload or {})
 
     def update_document_index_state(
         self,

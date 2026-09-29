@@ -336,6 +336,38 @@ def test_remove_response_separates_requested_from_removed(client, mocker, mode):
         assert data["faissOrphaned"] == 3
 
 
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (
+            "/api/v10/content/index/remove",
+            {"documentId": "d1", "companyId": "CID", "mode": "soft"},
+        ),
+        (
+            "/api/v10/content/index/remove/domain",
+            {"companyId": "CID", "domain": "example.com", "mode": "soft"},
+        ),
+    ],
+)
+def test_soft_remove_is_rejected_when_index_quota_is_enabled(
+    client, mocker, path, payload
+):
+    """Soft mode cannot release exact bytes because it orphans FAISS vectors."""
+    mocker.patch("app.INDEX_QUOTA_ENABLED", True)
+    get_chunks = mocker.patch("app.chunk_store.get_chunks_by_doc")
+    get_domain = mocker.patch("app.chunk_store.get_chunk_index_by_company_domain")
+
+    resp = client.post(path, json=payload)
+
+    assert resp.status_code == 409
+    assert resp.get_json() == {
+        "error": "soft_remove_disabled_with_index_quota",
+        "allowedModes": ["deactivate", "hard"],
+    }
+    get_chunks.assert_not_called()
+    get_domain.assert_not_called()
+
+
 def test_remove_without_company_id_still_targets_company_index(client, mocker):
     """
     `companyId` OPSİYONEL ve tinnten-server her zaman göndermiyor.

@@ -179,6 +179,16 @@ class ContentDocumentStore:
             },
         )
         self.documents.create_index([("index.state", ASCENDING)], name="index_state_idx")
+        self.documents.create_index(
+            [
+                ("index.callbackPending.nextAttemptAt", ASCENDING),
+                ("index.callbackPending.leaseUntil", ASCENDING),
+            ],
+            name="content_index_callback_outbox_due",
+            partialFilterExpression={
+                "index.callbackPending.eventId": {"$exists": True}
+            },
+        )
         self.logs.create_index(
             [("companyId", ASCENDING), ("documentId", ASCENDING), ("createdAt", ASCENDING)],
             name="document_log_idx",
@@ -279,6 +289,116 @@ class ContentDocumentStore:
             return_document=ReturnDocument.AFTER,
             session=session,
         )
+
+    # ------------------------------------------------------------------
+    # Durable tinnten-server callback outbox
+    #
+    # The latest callback is stored inside the same content document and in
+    # the SAME atomic update as index.state.  A process crash can therefore no
+    # longer leave the local state terminal while losing the HTTP notification
+    # that mirrors it to tinnten-server.  One pending value per document is
+    # intentional: a newer state supersedes an older state and is the only
+    # state the remote mirror ultimately needs.
+    # ------------------------------------------------------------------
+    def claim_index_callback(
+        self,
+        *,
+        lease_owner: str,
+        lease_seconds: int,
+        company_id: Optional[str] = None,
+        document_id: Optional[str] = None,
+        event_id: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> Optional[Dict[str, Any]]:
+        at = now or datetime.now(timezone.utc)
+        lease_until = at + timedelta(seconds=max(1, int(lease_seconds)))
+        clauses: List[Dict[str, Any]] = [
+            {"index.callbackPending.eventId": {"$exists": True, "$ne": None}},
+            {
+                "$or": [
+                    {"index.callbackPending.nextAttemptAt": {"$exists": False}},
+                    {"index.callbackPending.nextAttemptAt": None},
+                    {"index.callbackPending.nextAttemptAt": {"$lte": at}},
+                ]
+            },
+            {
+                "$or": [
+                    {"index.callbackPending.leaseUntil": {"$exists": False}},
+                    {"index.callbackPending.leaseUntil": None},
+                    {"index.callbackPending.leaseUntil": {"$lte": at}},
+                ]
+            },
+        ]
+        if company_id is not None and document_id is not None:
+            clauses.append(self._document_selector(company_id, document_id))
+        if event_id:
+            clauses.append({"index.callbackPending.eventId": str(event_id)})
+        document = self.documents.find_one_and_update(
+            {"$and": clauses},
+            {
+                "$set": {
+                    "index.callbackPending.leaseOwner": str(lease_owner),
+                    "index.callbackPending.leaseUntil": lease_until,
+                    "index.callbackPending.lastAttemptAt": at,
+                }
+            },
+            sort=[("index.callbackPending.nextAttemptAt", ASCENDING), ("_id", ASCENDING)],
+            return_document=ReturnDocument.AFTER,
+        )
+        pending = ((document or {}).get("index") or {}).get("callbackPending")
+        return dict(pending) if isinstance(pending, dict) else None
+
+    def complete_index_callback(
+        self,
+        *,
+        company_id: Optional[str],
+        document_id: str,
+        event_id: str,
+        lease_owner: str,
+    ) -> bool:
+        query = {
+            "$and": [
+                self._document_selector(company_id, document_id),
+                {"index.callbackPending.eventId": str(event_id)},
+                {"index.callbackPending.leaseOwner": str(lease_owner)},
+            ]
+        }
+        result = self.documents.update_one(
+            query,
+            {"$unset": {"index.callbackPending": ""}},
+        )
+        return result.modified_count == 1
+
+    def retry_index_callback(
+        self,
+        *,
+        company_id: Optional[str],
+        document_id: str,
+        event_id: str,
+        lease_owner: str,
+        next_attempt_at: datetime,
+        error: str,
+    ) -> bool:
+        query = {
+            "$and": [
+                self._document_selector(company_id, document_id),
+                {"index.callbackPending.eventId": str(event_id)},
+                {"index.callbackPending.leaseOwner": str(lease_owner)},
+            ]
+        }
+        result = self.documents.update_one(
+            query,
+            {
+                "$set": {
+                    "index.callbackPending.nextAttemptAt": next_attempt_at,
+                    "index.callbackPending.leaseOwner": None,
+                    "index.callbackPending.leaseUntil": None,
+                    "index.callbackPending.lastError": str(error or "callback failed")[:1000],
+                },
+                "$inc": {"index.callbackPending.attempts": 1},
+            },
+        )
+        return result.modified_count == 1
 
     def reset_index_error(
         self,

@@ -3,6 +3,7 @@ import threading
 import time
 
 from workers.ingest_worker import IngestWorker
+from services.inbound_service_auth import validate_quota_runtime_config
 
 logger = logging.getLogger("tinnten.embedding.worker")
 
@@ -57,6 +58,7 @@ def _watchdog_loop() -> None:
 
 def start_all_workers() -> None:
     global _worker_thread
+    validate_quota_runtime_config(api_process=False)
     with _worker_lock:
         if _worker_thread is not None and _worker_thread.is_alive():
             logger.info("Ingest worker is already running.")
