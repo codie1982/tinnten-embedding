@@ -550,26 +550,7 @@ class MongoStore:
                  "job_id": 1, "updated_at": 1},
             )
         }
-        active_version_clauses: List[Dict[str, Any]] = []
-        for doc_id in candidate_doc_ids:
-            stored = stored_documents.get(doc_id)
-            version = stored.get("active_ingest_version") if stored else None
-            clause: Dict[str, Any] = {"doc_id": doc_id}
-            if version:
-                clause["ingest_version"] = version
-            active_version_clauses.append(clause)
-        clauses.append({"$or": active_version_clauses})
-
         requested_state = str(state or "").strip().lower()
-        document_company_query = {
-            "$or": [
-                {"company_id": str(company_id)},
-                {"metadata.companyId": str(company_id)},
-            ]
-        }
-        status_query: Dict[str, Any] = {
-            "$and": [{"doc_id": {"$exists": True}}, document_company_query]
-        }
         state_aliases = {
             "disabled": ["disabled", "removed"],
             "error": ["error", "failed"],
@@ -579,28 +560,27 @@ class MongoStore:
             "not_indexed": ["not_indexed"],
         }
         if requested_state in state_aliases:
-            status_query["$and"].append({"status": {"$in": state_aliases[requested_state]}})
-            allowed_doc_ids = [str(row.get("doc_id")) for row in self.documents.find(status_query, {"doc_id": 1})]
-            if not allowed_doc_ids:
+            allowed_states = set(state_aliases[requested_state])
+            candidate_doc_ids = [
+                doc_id
+                for doc_id in candidate_doc_ids
+                if str((stored_documents.get(doc_id) or {}).get("status") or "") in allowed_states
+            ]
+            if not candidate_doc_ids:
                 return {"documents": [], "total": 0, "page": safe_page, "limit": safe_limit, "total_pages": 1, "domains": []}
-            clauses.append({"doc_id": {"$in": allowed_doc_ids}})
         elif requested_state and requested_state not in {"all", "indexed", "ready", "completed"}:
             return {"documents": [], "total": 0, "page": safe_page, "limit": safe_limit, "total_pages": 1, "domains": []}
         elif requested_state in {"indexed", "ready", "completed"}:
-            disabled_doc_ids = [
-                str(row.get("doc_id"))
-                for row in self.documents.find(
-                    {"$and": [
-                        document_company_query,
-                        {"status": {"$nin": ["ready", "indexed", "completed"]}},
-                    ]},
-                    {"doc_id": 1},
-                )
+            indexed_states = {"ready", "indexed", "completed"}
+            candidate_doc_ids = [
+                doc_id
+                for doc_id in candidate_doc_ids
+                if not stored_documents.get(doc_id)
+                or str(stored_documents[doc_id].get("status") or "") in indexed_states
             ]
-            if disabled_doc_ids:
-                clauses.append({"doc_id": {"$nin": disabled_doc_ids}})
+            if not candidate_doc_ids:
+                return {"documents": [], "total": 0, "page": safe_page, "limit": safe_limit, "total_pages": 1, "domains": []}
 
-        match = {"$and": clauses}
         group_stage = {
             "$group": {
                 "_id": "$doc_id",
@@ -623,19 +603,47 @@ class MongoStore:
                 "resolvedChunkStrategy": {"$first": "$resolved_chunk_strategy"},
             }
         }
+
+        # Binlerce aktif dokümanı tek bir `$or` içine koymak Mongo query planner'ını
+        # dakikalarca meşgul edebiliyor. Büyük domainlerde dashboard isteği bu
+        # nedenle 30 saniyelik HTTP timeout'a düşüyordu. Aynı aktif-sürüm
+        # semantiğini koruyup doc_id/version koşullarını küçük partiler halinde
+        # çalıştırıyoruz; `chunk_doc_version_idx` her partiyi doğrudan karşılar.
+        version_batch_size = 500
+        grouped_rows: List[Dict[str, Any]] = []
+        for offset in range(0, len(candidate_doc_ids), version_batch_size):
+            version_clauses: List[Dict[str, Any]] = []
+            for doc_id in candidate_doc_ids[offset:offset + version_batch_size]:
+                stored = stored_documents.get(doc_id)
+                version = stored.get("active_ingest_version") if stored else None
+                version_clause: Dict[str, Any] = {"doc_id": doc_id}
+                if version:
+                    version_clause["ingest_version"] = version
+                version_clauses.append(version_clause)
+            batch_pipeline = [
+                {"$match": {"$and": [*clauses, {"$or": version_clauses}]}},
+                group_stage,
+            ]
+            grouped_rows.extend(
+                self.chunks.aggregate(batch_pipeline, allowDiskUse=True)
+            )
+
+        def sortable_time(value: Any) -> float:
+            if isinstance(value, datetime):
+                return value.timestamp()
+            if isinstance(value, str):
+                try:
+                    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    return 0.0
+            return 0.0
+
+        grouped_rows.sort(
+            key=lambda row: (-sortable_time(row.get("lastRunAt")), str(row.get("_id") or ""))
+        )
         skip = (safe_page - 1) * safe_limit
-        pipeline = [
-            {"$match": match},
-            group_stage,
-            {"$sort": {"lastRunAt": -1, "_id": 1}},
-            {"$facet": {
-                "documents": [{"$skip": skip}, {"$limit": safe_limit}],
-                "total": [{"$count": "value"}],
-                "domains": [{"$group": {"_id": "$domain"}}, {"$sort": {"_id": 1}}],
-            }},
-        ]
-        result = next(iter(self.chunks.aggregate(pipeline, allowDiskUse=True)), {})
-        rows = result.get("documents") or []
+        total = len(grouped_rows)
+        rows = grouped_rows[skip:skip + safe_limit]
         doc_ids = [str(row.get("_id")) for row in rows]
         states = {
             doc_id: stored_documents[doc_id]
@@ -651,14 +659,13 @@ class MongoStore:
             row["jobId"] = state_doc.get("job_id") or row.get("jobId")
             row["lastRunAt"] = state_doc.get("updated_at") or row.get("lastRunAt")
             documents.append(row)
-        total = int(((result.get("total") or [{}])[0]).get("value") or 0)
         return {
             "documents": documents,
             "total": total,
             "page": safe_page,
             "limit": safe_limit,
             "total_pages": max(1, (total + safe_limit - 1) // safe_limit),
-            "domains": [str(item.get("_id")) for item in (result.get("domains") or []) if item.get("_id")],
+            "domains": sorted({str(row.get("domain")) for row in grouped_rows if row.get("domain")}),
         }
 
     def get_chunk_document(self, doc_id: str, *, company_id: Optional[str] = None) -> Optional[Dict[str, Any]]:

@@ -171,6 +171,61 @@ def test_chunk_inventory_and_detail_only_count_active_ingest_version():
     assert store.count_active_chunks_by_company_domain("company-1", "tinten.ai") == 2
 
 
+def test_chunk_inventory_batches_large_active_version_predicates():
+    store = _store()
+    now = datetime.now(timezone.utc)
+    total = 501
+    for index in range(total):
+        doc_id = f"versioned-{index}"
+        store.documents.insert_one({
+            "doc_id": doc_id,
+            "company_id": "company-1",
+            "status": "ready",
+            "active_ingest_version": "v2",
+            "updated_at": now,
+        })
+        store.chunks.insert_one({
+            "company_id": "company-1",
+            "doc_id": doc_id,
+            "ingest_version": "v2",
+            "chunk_index": 0,
+            "text": f"icerik-{index}",
+            "created_at": now,
+            "metadata": {
+                "companyId": "company-1",
+                "domain": "tinten.ai",
+                "source": "fetcher_page",
+                "url": f"https://tinten.ai/tr/document/{index}",
+            },
+        })
+
+    original_aggregate = store.chunks.aggregate
+    batch_sizes = []
+
+    def aggregate_spy(pipeline, *args, **kwargs):
+        match_clauses = pipeline[0]["$match"]["$and"]
+        version_clause = next(
+            clause["$or"]
+            for clause in reversed(match_clauses)
+            if "$or" in clause and clause["$or"]
+            and all("doc_id" in branch for branch in clause["$or"])
+        )
+        batch_sizes.append(len(version_clause))
+        return original_aggregate(pipeline, *args, **kwargs)
+
+    store.chunks.aggregate = aggregate_spy
+    inventory = store.list_chunk_documents(
+        company_id="company-1",
+        domains=["tinten.ai"],
+        page=1,
+        limit=10,
+    )
+
+    assert inventory["total"] == total
+    assert len(inventory["documents"]) == 10
+    assert batch_sizes == [500, 1]
+
+
 def test_company_active_count_and_rebuild_ids_keep_parentless_legacy_chunks():
     store = _store()
     now = datetime.now(timezone.utc)
