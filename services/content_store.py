@@ -708,17 +708,24 @@ class ContentDocumentStore:
             "createdAt": now,
         }
 
-        uses_legacy_schema = (
-            isinstance(existing_doc, dict)
-            and "_id" in existing_doc
-            and "documentId" not in existing_doc
-            and "companyId" not in existing_doc
-        )
-        if uses_legacy_schema:
+        if isinstance(existing_doc, dict) and "_id" in existing_doc:
+            # Mongoose stores null canonical identifiers on personal files.
+            # Always update the row resolved by the scoped lookup. A failed CAS
+            # must not insert a second row outside the partial unique index.
             query: Dict[str, Any] = {"_id": existing_doc["_id"]}
             if "companyid" in existing_doc:
                 query["companyid"] = existing_doc["companyid"]
             upsert = False
+            current_version = existing_doc.get("currentVersionId")
+            if current_version:
+                requested_version = (metadata or {}).get("versionId")
+                if requested_version and str(requested_version) != str(current_version):
+                    raise IndexJobConflictError(
+                        document_id, existing_index.get("jobId"), current_attempt
+                    )
+                # Cover a head change between admission and the actual write,
+                # including requests which carry a larger attempt number.
+                query["currentVersionId"] = current_version
         else:
             query = {
                 "companyId": company_id,
